@@ -9,7 +9,7 @@
 //! threshold.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -390,12 +390,14 @@ async fn query_replication_lag_ms<S: AsyncRead + AsyncWrite + Unpin + Send>(
 }
 
 /// Parses a PostgreSQL LSN text representation (e.g. `"16/B374D848"`) into
-/// a `u64`.
+/// a `u64`. Returns `None` for unparseable input or the zero LSN (`0/0`),
+/// which is the extension GUC's initial/unset value.
 pub fn parse_lsn(text: &str) -> Option<u64> {
     let (hi, lo) = text.split_once('/')?;
     let hi = u64::from_str_radix(hi, 16).ok()?;
     let lo = u64::from_str_radix(lo, 16).ok()?;
-    Some((hi << 32) | lo)
+    let lsn = (hi << 32) | lo;
+    if lsn == 0 { None } else { Some(lsn) }
 }
 
 // ---------------------------------------------------------------------
@@ -415,7 +417,7 @@ struct TrackedNode {
 /// Health checker: manages the health state and LSN/lag snapshots of a
 /// set of backend nodes.
 pub struct HealthChecker<P: HealthProbe> {
-    probes: HashMap<String, Arc<P>>,
+    probes: RwLock<HashMap<String, Arc<P>>>,
     max_replication_lag_ms: u64,
     nodes: Mutex<HashMap<String, TrackedNode>>,
     check_timeout: Duration,
@@ -459,7 +461,7 @@ impl<P: HealthProbe> HealthChecker<P> {
             })
             .collect();
         HealthChecker {
-            probes,
+            probes: RwLock::new(probes),
             max_replication_lag_ms,
             nodes: Mutex::new(nodes),
             check_timeout,
@@ -477,7 +479,10 @@ impl<P: HealthProbe> HealthChecker<P> {
             let nodes = self.nodes.lock().expect("nodes lock poisoned");
             nodes.get(node_id)?.node_type
         };
-        let probe = self.probes.get(node_id)?;
+        let probe = {
+            let probes = self.probes.read().expect("probes lock poisoned");
+            probes.get(node_id)?.clone()
+        };
 
         let result = match timeout(self.check_timeout, probe.probe(node_type)).await {
             Ok(result) => result,
@@ -537,7 +542,8 @@ impl<P: HealthProbe> HealthChecker<P> {
     {
         let checks: Vec<_> = {
             let nodes = self.nodes.lock().expect("nodes lock poisoned");
-            self.probes
+            let probes = self.probes.read().expect("probes lock poisoned");
+            probes
                 .iter()
                 .filter_map(|(node_id, probe)| {
                     nodes
@@ -618,6 +624,74 @@ impl<P: HealthProbe> HealthChecker<P> {
     /// hot path.
     pub fn snapshot(&self) -> Vec<BackendNodeSnapshot> {
         (**self.cached_snapshot.load()).clone()
+    }
+
+    /// Dynamically adds a new node to the health checker at runtime.
+    /// The node starts in unhealthy state until the first successful probe.
+    /// Returns `false` if a node with the same `node_id` already exists.
+    pub fn add_node(&self, node_id: String, node_type: NodeType, weight: u32, probe: P) -> bool {
+        let mut nodes = self.nodes.lock().expect("nodes lock poisoned");
+        if nodes.contains_key(&node_id) {
+            return false;
+        }
+        nodes.insert(
+            node_id.clone(),
+            TrackedNode {
+                node_type,
+                weight,
+                state: HealthStateMachine::new(false),
+                last_replay_lsn: 0,
+                last_replication_lag_ms: None,
+            },
+        );
+        drop(nodes);
+
+        let mut probes = self.probes.write().expect("probes lock poisoned");
+        probes.insert(node_id.clone(), Arc::new(probe));
+        drop(probes);
+
+        self.refresh_cached_snapshot();
+        tracing::info!(node_id = %node_id, "dynamically added node to health checker");
+        true
+    }
+
+    /// Dynamically removes a node from the health checker at runtime.
+    /// Returns `false` if the node does not exist.
+    /// If `prevent_last_writer` is true, refuses to remove the node if it
+    /// is the only remaining Writer.
+    pub fn remove_node(&self, node_id: &str) -> bool {
+        self.remove_node_checked(node_id, false).is_ok()
+    }
+
+    /// Removes a node with an optional last-writer safety check.
+    /// Returns `Err(reason)` if the node cannot be removed.
+    pub fn remove_node_checked(&self, node_id: &str, prevent_last_writer: bool) -> Result<(), &'static str> {
+        let mut nodes = self.nodes.lock().expect("nodes lock poisoned");
+
+        if !nodes.contains_key(node_id) {
+            return Err("node does not exist");
+        }
+
+        if prevent_last_writer {
+            let target_type = nodes.get(node_id).map(|n| n.node_type);
+            if target_type == Some(NodeType::Writer) {
+                let writer_count = nodes.values().filter(|n| n.node_type == NodeType::Writer).count();
+                if writer_count <= 1 {
+                    return Err("cannot remove the last writer node");
+                }
+            }
+        }
+
+        nodes.remove(node_id);
+        drop(nodes);
+
+        let mut probes = self.probes.write().expect("probes lock poisoned");
+        probes.remove(node_id);
+        drop(probes);
+
+        self.refresh_cached_snapshot();
+        tracing::info!(node_id, "dynamically removed node from health checker");
+        Ok(())
     }
 }
 
@@ -732,7 +806,8 @@ mod tests {
     #[test]
     fn lsn_parsing_handles_typical_format() {
         assert_eq!(parse_lsn("16/B374D848"), Some((0x16u64 << 32) | 0xB374D848));
-        assert_eq!(parse_lsn("0/0"), Some(0));
+        assert_eq!(parse_lsn("0/0"), None); // zero LSN is treated as unset
+        assert_eq!(parse_lsn("0/1"), Some(1)); // non-zero is valid
         assert_eq!(parse_lsn("not-an-lsn"), None);
     }
 

@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use crate::balancer::{LoadBalancer, NodeCandidate};
 use crate::config::{ConsistencyLevel, NodeType};
 use crate::health::BackendNodeSnapshot;
-use crate::parser::classifier::{contains_multiple_statements, Classifier};
+use crate::parser::classifier::{contains_multiple_statements, multi_statement_all_readable, Classifier};
 use crate::parser::hint::{HintParser, RouteHint};
 use crate::router::consistency::ConsistencyChecker;
 use crate::router::cost::CostEstimator;
@@ -305,14 +305,17 @@ where
         // is called concurrently by another task partway through.
         let settings = self.settings.load();
 
-        // A Simple Query frame may contain multiple SQL statements. Routing
-        // from only the first keyword can send `SELECT ...; INSERT ...` to a
-        // Reader, so multi-statement batches conservatively stay on Writer.
-        // This safety rule intentionally takes precedence over Reader hints.
+        // A Simple Query frame may contain multiple SQL statements. If ALL
+        // statements are read-only, allow routing to Reader. Otherwise
+        // conservatively route to Writer. This safety rule intentionally
+        // takes precedence over Reader hints for mixed-intent batches.
         if contains_multiple_statements(sql) {
-            return Ok(RouteDecision::writer(
-                "multiple statements in one simple-query message",
-            ));
+            if !multi_statement_all_readable(&self.classifier, sql) {
+                return Ok(RouteDecision::writer(
+                    "multiple statements with write intent in one simple-query message",
+                ));
+            }
+            // All statements are read-only — fall through to normal routing
         }
 
         // Step 1: Hint parsing (Requirements 2.1-2.5). A forced-route hint
@@ -416,7 +419,14 @@ where
 
         // Step 5: Cost-based routing to Analytics (Requirements 10.1-10.5).
         if settings.enable_cost_routing {
-            let cost = self.cost_estimator.estimate_cost(sql).await?;
+            // Cost estimation failure (e.g. unsupported SQL syntax, connection
+            // issues) is non-fatal: treat as cost=0 (below threshold) and let
+            // the query proceed to a Reader via the normal consistency path.
+            let cost = self.cost_estimator.estimate_cost(sql).await.unwrap_or_else(|e| {
+                let truncated: String = sql.chars().take(80).collect();
+                tracing::debug!(error = %e, sql = %truncated, "cost estimation failed, skipping cost routing");
+                0.0
+            });
             if cost > settings.cost_threshold {
                 let node_id = self.select_all_candidates(analytics_nodes);
                 return Ok(RouteDecision::selected(

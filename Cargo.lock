@@ -1945,6 +1945,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "stringprep",
+ "subtle",
  "testcontainers",
  "thiserror 1.0.69",
  "tokio",

@@ -8,6 +8,9 @@
 //! maintained by this module into the final snapshot.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use crate::health::BackendNodeSnapshot;
 use crate::pool::pool::ConnectionPool;
@@ -16,7 +19,7 @@ use crate::pool::pool::ConnectionPool;
 pub trait PoolManager: Send + Sync {
     /// Looks up the connection pool for a node by name; returns `None` if
     /// the node does not exist.
-    fn pool_for(&self, node_id: &str) -> Option<&dyn ConnectionPool>;
+    fn pool_for(&self, node_id: &str) -> Option<Arc<dyn ConnectionPool>>;
 
     /// Aggregates the `BackendNodeSnapshot` for every node (including the
     /// health state, replay LSN, and replication lag produced by the
@@ -27,11 +30,10 @@ pub trait PoolManager: Send + Sync {
 
 /// Default `PoolManager` implementation based on an in-memory `HashMap`.
 ///
-/// Stores each node's pool as a type-erased `Box<dyn ConnectionPool>`,
-/// allowing different nodes to use different concrete `ConnFactory`/
-/// `ConnCleaner` implementation types.
+/// Stores each node's pool as an `Arc<dyn ConnectionPool>`, allowing
+/// dynamic addition/removal of nodes at runtime via atomic swap.
 pub struct InMemoryPoolManager {
-    pools: HashMap<String, Box<dyn ConnectionPool>>,
+    pools: ArcSwap<HashMap<String, Arc<dyn ConnectionPool>>>,
     /// The data source providing the latest health-check snapshot
     /// (excluding `active_connections`); typically a closure wrapping
     /// `health::HealthChecker::snapshot`.
@@ -43,23 +45,67 @@ impl InMemoryPoolManager {
         pools: HashMap<String, Box<dyn ConnectionPool>>,
         health_snapshots: impl Fn() -> Vec<BackendNodeSnapshot> + Send + Sync + 'static,
     ) -> Self {
+        let arc_pools: HashMap<String, Arc<dyn ConnectionPool>> = pools
+            .into_iter()
+            .map(|(k, v)| (k, Arc::from(v)))
+            .collect();
         InMemoryPoolManager {
-            pools,
+            pools: ArcSwap::new(Arc::new(arc_pools)),
             health_snapshots: Box::new(health_snapshots),
         }
+    }
+
+    /// Dynamically adds a new pool for a node. Returns `false` if the
+    /// node already has a pool registered.
+    pub fn add_pool(&self, node_id: String, pool: Box<dyn ConnectionPool>) -> bool {
+        let pool_arc: Arc<dyn ConnectionPool> = Arc::from(pool);
+        let mut added = false;
+        self.pools.rcu(|current| {
+            if current.contains_key(&node_id) {
+                added = false;
+                Arc::clone(current)
+            } else {
+                added = true;
+                let mut new_pools = (**current).clone();
+                new_pools.insert(node_id.clone(), Arc::clone(&pool_arc));
+                Arc::new(new_pools)
+            }
+        });
+        added
+    }
+
+    /// Dynamically removes a node's pool. Returns `false` if the node
+    /// does not exist. The pool (and its connections) remain alive until
+    /// all existing Arc references are dropped.
+    pub fn remove_pool(&self, node_id: &str) -> bool {
+        let mut removed = false;
+        self.pools.rcu(|current| {
+            if !current.contains_key(node_id) {
+                removed = false;
+                Arc::clone(current)
+            } else {
+                removed = true;
+                let mut new_pools = (**current).clone();
+                new_pools.remove(node_id);
+                Arc::new(new_pools)
+            }
+        });
+        removed
     }
 }
 
 impl PoolManager for InMemoryPoolManager {
-    fn pool_for(&self, node_id: &str) -> Option<&dyn ConnectionPool> {
-        self.pools.get(node_id).map(|b| b.as_ref())
+    fn pool_for(&self, node_id: &str) -> Option<Arc<dyn ConnectionPool>> {
+        let pools = self.pools.load();
+        pools.get(node_id).cloned()
     }
 
     fn snapshot(&self) -> Vec<BackendNodeSnapshot> {
+        let pools = self.pools.load();
         (self.health_snapshots)()
             .into_iter()
             .map(|mut snap| {
-                if let Some(pool) = self.pools.get(&snap.node_id) {
+                if let Some(pool) = pools.get(&snap.node_id) {
                     snap.active_connections = pool.active_connections();
                 }
                 snap

@@ -272,9 +272,24 @@ lsn_tracking:
 | Mode | Requirements | Overhead | Description |
 |------|-------------|----------|-------------|
 | `pipeline` | None (works with any PostgreSQL) | ~tens of μs per write | Appends internal `SELECT pg_current_wal_lsn()` in same write batch |
-| `extension` | Custom LSN-reporting extension on backend | Zero | Reads LSN from `ParameterStatus` GUC report |
+| `extension` | `pg_lsn_track` extension on backend | Zero | Reads LSN from `ParameterStatus` GUC report |
 | `auto` | None | Same as pipeline until extension detected | Starts as pipeline; switches to extension if GUC report observed |
 | `aurora_write_forwarding` | Aurora with Write Forwarding enabled; `pool.mode: session`; ≥1 reader node | N/A | No LSN tracking; all SQL goes to one pinned Reader; writes forwarded by Aurora |
+
+### Extension Mode Setup (`pg_lsn_track`)
+
+1. Install the `pg_lsn_track` extension on all Writer nodes:
+   ```
+   shared_preload_libraries = 'pg_lsn_track'
+   ```
+2. Configure Trident:
+   ```yaml
+   lsn_tracking:
+     mode: extension      # or 'auto' for graceful fallback
+     extension:
+       guc_name: "pg_lsn_track.last_commit_lsn"
+   ```
+3. The extension reports the commit LSN via a GUC (`pg_lsn_track.last_commit_lsn`) that emits a `ParameterStatus` message after each committed write transaction. Trident captures this value, suppresses it from the client, and uses it for session/global consistency checks — zero overhead compared to the pipeline approach.
 
 ### Choosing a Mode
 

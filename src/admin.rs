@@ -65,11 +65,26 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::config::{LsnTrackingConfig, NodeType, PoolMode, RoutingConfig};
+use crate::config::{LsnTrackingConfig, NodeConfig, NodeType, PoolMode, RoutingConfig, SslMode};
 use crate::health::BackendNodeSnapshot;
 use crate::proxy::client_stats::ClientStats;
 use crate::reload::{reload_from_file, RoutingReloadTarget};
 use crate::router::custom_rules::{CustomRoutingRules, RuleTargetKind};
+
+/// Trait for dynamically adding/removing backend nodes at runtime.
+/// Implemented by the wiring layer in `main.rs` that coordinates the
+/// HealthChecker, PoolManager, and node_addresses map.
+#[async_trait::async_trait]
+pub trait NodeManager: Send + Sync {
+    /// Adds a new backend node. Returns `Ok(())` on success, `Err(msg)`
+    /// if validation fails or the node already exists.
+    async fn add_node(&self, config: NodeConfig) -> Result<(), String>;
+
+    /// Removes a backend node by name. Returns `Ok(())` on success,
+    /// `Err(msg)` if the node does not exist or cannot be removed (e.g.
+    /// it is the last writer).
+    fn remove_node(&self, node_id: &str) -> Result<(), String>;
+}
 
 #[derive(Embed)]
 #[folder = "console/"]
@@ -273,6 +288,42 @@ struct AdminState {
     pool_max_idle_time: String,
     pool_connection_timeout: String,
     pool_max_lifetime: String,
+    /// Dynamic node management (add/remove at runtime).
+    node_manager: Option<Arc<dyn NodeManager>>,
+    /// Bearer token for admin API authentication. `None` = no auth required.
+    auth_token: Option<String>,
+}
+
+/// Bearer token authentication middleware. Checks the `Authorization`
+/// header against the configured token. Returns 401 if missing/invalid.
+/// Uses constant-time comparison to prevent timing side-channel attacks.
+async fn auth_middleware(
+    state: Arc<AdminState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let expected = state.auth_token.as_deref().unwrap_or("");
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    // Constant-time comparison to prevent timing attacks
+    use subtle::ConstantTimeEq;
+    let matches = expected.as_bytes().ct_eq(provided.as_bytes());
+
+    if !bool::from(matches) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            r#"{"status":"error","message":"unauthorized: invalid or missing Bearer token"}"#,
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
 
 /// Builds the admin `axum::Router` (routes only; binding/serving is done
@@ -294,6 +345,8 @@ fn build_router(
     pool_max_idle_time: String,
     pool_connection_timeout: String,
     pool_max_lifetime: String,
+    node_manager: Option<Arc<dyn NodeManager>>,
+    auth_token: Option<String>,
 ) -> Router {
     let state = Arc::new(AdminState {
         prometheus_handle,
@@ -311,11 +364,18 @@ fn build_router(
         pool_max_idle_time,
         pool_connection_timeout,
         pool_max_lifetime,
+        node_manager,
+        auth_token,
     });
 
-    Router::new()
+    // Public routes: always accessible (Prometheus scraper, k8s probes, console UI)
+    let public_routes = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(healthz_handler))
+        .fallback(get(static_handler));
+
+    // Protected routes: require auth token when configured
+    let protected_routes = Router::new()
         .route("/reload", post(reload_handler))
         .route(
             "/custom-rules",
@@ -325,12 +385,29 @@ fn build_router(
         )
         .route("/client-stats", get(client_stats_handler))
         .route("/api/overview", get(overview_handler))
-        .route("/api/nodes", get(nodes_handler))
+        .route("/api/nodes", get(nodes_handler).post(add_node_handler).delete(remove_node_handler))
         .route("/api/slow-queries", get(slow_queries_handler))
         .route("/api/config", get(config_get_handler).put(config_put_handler))
-        .route("/ws/logs", get(ws_logs_handler))
-        .fallback(get(static_handler))
-        .with_state(state)
+        .route("/ws/logs", get(ws_logs_handler));
+
+    let app = if state.auth_token.is_some() {
+        let auth_state = state.clone();
+        let protected_routes = protected_routes.layer(
+            axum::middleware::from_fn(move |req, next| {
+                let state = auth_state.clone();
+                auth_middleware(state, req, next)
+            }),
+        );
+        public_routes
+            .merge(protected_routes)
+            .with_state(state)
+    } else {
+        public_routes
+            .merge(protected_routes)
+            .with_state(state)
+    };
+
+    app
 }
 
 async fn metrics_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -546,6 +623,131 @@ async fn nodes_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespons
         pool_mode: format!("{:?}", state.pool_mode).to_lowercase(),
     })
     .into_response()
+}
+
+// --- Dynamic node management (POST /api/nodes, DELETE /api/nodes) ---
+
+#[derive(Deserialize)]
+struct AddNodeRequest {
+    name: String,
+    host: String,
+    port: Option<u16>,
+    #[serde(rename = "type")]
+    node_type: String,
+    weight: Option<u32>,
+    database: String,
+    username: String,
+    password: Option<String>,
+    ssl_mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoveNodeRequest {
+    name: String,
+}
+
+async fn add_node_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<AddNodeRequest>,
+) -> impl IntoResponse {
+    let Some(ref nm) = state.node_manager else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"status": "error", "message": "node management not available"})),
+        ).into_response();
+    };
+
+    let node_type = match body.node_type.as_str() {
+        "writer" => NodeType::Writer,
+        "reader" => NodeType::Reader,
+        "analytics" => NodeType::Analytics,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "message": format!("invalid node type: '{other}'. Must be writer, reader, or analytics")})),
+            ).into_response();
+        }
+    };
+
+    // Input validation: node name must be non-empty, alphanumeric + hyphens/underscores, max 64 chars
+    if body.name.is_empty() || body.name.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status": "error", "message": "node name must be 1-64 characters"})),
+        ).into_response();
+    }
+    if !body.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status": "error", "message": "node name must contain only alphanumeric characters, hyphens, and underscores"})),
+        ).into_response();
+    }
+
+    // Host validation: must not be empty, no whitespace or control characters
+    if body.host.is_empty() || body.host.len() > 253 || body.host.chars().any(|c| c.is_control() || c == ' ') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status": "error", "message": "invalid host: must be 1-253 characters, no whitespace or control characters"})),
+        ).into_response();
+    }
+
+    let ssl_mode = match body.ssl_mode.as_deref().unwrap_or("disable") {
+        "disable" => SslMode::Disable,
+        "prefer" => SslMode::Prefer,
+        "require" => SslMode::Require,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "error", "message": format!("invalid ssl_mode: '{other}'. Must be disable, prefer, or require")})),
+            ).into_response();
+        }
+    };
+
+    let config = NodeConfig {
+        name: body.name.clone(),
+        host: body.host,
+        port: body.port.unwrap_or(5432),
+        node_type,
+        weight: body.weight.unwrap_or(1),
+        database: body.database,
+        username: body.username,
+        password: body.password,
+        ssl_mode,
+    };
+
+    match nm.add_node(config).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "node": body.name})),
+        ).into_response(),
+        Err(msg) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"status": "error", "message": msg})),
+        ).into_response(),
+    }
+}
+
+async fn remove_node_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<RemoveNodeRequest>,
+) -> impl IntoResponse {
+    let Some(ref nm) = state.node_manager else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"status": "error", "message": "node management not available"})),
+        ).into_response();
+    };
+
+    match nm.remove_node(&body.name) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "node": body.name})),
+        ).into_response(),
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status": "error", "message": msg})),
+        ).into_response(),
+    }
 }
 
 async fn slow_queries_handler(
@@ -838,6 +1040,8 @@ pub async fn run(
     pool_max_idle_time: String,
     pool_connection_timeout: String,
     pool_max_lifetime: String,
+    node_manager: Option<Arc<dyn NodeManager>>,
+    auth_token: Option<String>,
 ) -> Result<(), AdminError> {
     let app = build_router(
         prometheus_handle,
@@ -855,6 +1059,8 @@ pub async fn run(
         pool_max_idle_time,
         pool_connection_timeout,
         pool_max_lifetime,
+        node_manager,
+        auth_token,
     );
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
@@ -984,6 +1190,8 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
+            None, // node_manager
+            None, // auth_token
         )
     }
 
@@ -1087,6 +1295,8 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
+            None, // node_manager
+            None, // auth_token
         );
 
         let response = app
@@ -1126,6 +1336,8 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
+            None, // node_manager
+            None, // auth_token
         );
 
         let response = app
@@ -1167,6 +1379,8 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
+            None, // node_manager
+            None, // auth_token
         )
     }
 
@@ -1294,6 +1508,8 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
+            None, // node_manager
+            None, // auth_token
         )
     }
 

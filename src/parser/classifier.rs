@@ -257,6 +257,155 @@ pub fn contains_multiple_statements(sql: &str) -> bool {
     completed_statements + u32::from(statement_has_content) > 1
 }
 
+/// Splits a multi-statement SQL string into individual statements using
+/// quote/comment-aware semicolon detection. Returns `None` if the SQL
+/// contains only one statement (fast path: no allocation). Only splits at
+/// top-level semicolons (not inside parentheses, strings, dollar-quotes,
+/// or comments).
+pub fn split_statements(sql: &str) -> Option<Vec<&str>> {
+    // Fast path: no semicolons at all → single statement
+    if !sql.contains(';') {
+        return None;
+    }
+
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut paren_depth = 0u32;
+    let mut splits: Vec<&str> = Vec::new();
+    let mut stmt_start = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => {
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' if index + 1 < bytes.len() => index += 2,
+                        b'\'' if index + 1 < bytes.len() && bytes[index + 1] == b'\'' => {
+                            index += 2;
+                        }
+                        b'\'' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'"' {
+                        if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                            index += 2;
+                        } else {
+                            index += 1;
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'-' if index + 1 < bytes.len() && bytes[index + 1] == b'-' => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+                index += 2;
+                let mut comment_depth = 1u32;
+                while index < bytes.len() && comment_depth > 0 {
+                    if index + 1 < bytes.len()
+                        && bytes[index] == b'/'
+                        && bytes[index + 1] == b'*'
+                    {
+                        comment_depth += 1;
+                        index += 2;
+                    } else if index + 1 < bytes.len()
+                        && bytes[index] == b'*'
+                        && bytes[index + 1] == b'/'
+                    {
+                        comment_depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'$' => {
+                let tag_end = (index + 1..bytes.len()).find(|&position| bytes[position] == b'$');
+                let delimiter_len = tag_end.and_then(|end| {
+                    let tag = &bytes[index + 1..end];
+                    let valid = tag.is_empty()
+                        || ((tag[0].is_ascii_alphabetic() || tag[0] == b'_')
+                            && tag[1..]
+                                .iter()
+                                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_'));
+                    valid.then_some(end - index + 1)
+                });
+
+                if let Some(delimiter_len) = delimiter_len {
+                    let delimiter = &bytes[index..index + delimiter_len];
+                    index += delimiter_len;
+                    while index + delimiter_len <= bytes.len() {
+                        if &bytes[index..index + delimiter_len] == delimiter {
+                            index += delimiter_len;
+                            break;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            b'(' => {
+                paren_depth += 1;
+                index += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                index += 1;
+            }
+            b';' if paren_depth == 0 => {
+                let stmt = &sql[stmt_start..index];
+                if !stmt.trim().is_empty() {
+                    splits.push(stmt.trim());
+                }
+                stmt_start = index + 1;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    // Last statement (after final semicolon or no trailing semicolon)
+    let last = &sql[stmt_start..];
+    if !last.trim().is_empty() {
+        splits.push(last.trim());
+    }
+
+    if splits.len() <= 1 {
+        None
+    } else {
+        Some(splits)
+    }
+}
+
+/// Determines whether ALL statements in a multi-statement SQL string are
+/// read-only (can be routed to Reader). Returns `true` only if every
+/// individual statement classifies as readable.
+pub fn multi_statement_all_readable(classifier: &impl Classifier, sql: &str) -> bool {
+    let Some(statements) = split_statements(sql) else {
+        return false; // single statement, caller should use normal classify path
+    };
+    statements.iter().all(|stmt| {
+        let kind = classifier.classify(stmt);
+        kind.readable() && !classifier.has_write_function_call(stmt)
+    })
+}
+
 impl Classifier for KeywordClassifier {
     fn classify(&self, sql: &str) -> SqlKind {
         let body = skip_leading_comments_and_whitespace(sql);

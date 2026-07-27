@@ -118,6 +118,9 @@ tr:last-child td{border-bottom:none}
     <div class="nav-group-title">Logs</div>
     <div class="nav-item" data-page="logs">Live Logs</div>
   </div>
+  <div style="margin-top:auto;padding:0.75rem 1rem;border-top:1px solid var(--border)">
+    <button id="btn-logout" class="btn btn-danger btn-sm" style="width:100%;display:none">Logout</button>
+  </div>
 </nav>
 
 <div class="main">
@@ -159,8 +162,29 @@ tr:last-child td{border-bottom:none}
 <!-- Nodes -->
 <div class="page" id="page-nodes">
   <h1 class="page-title">Backend Nodes</h1>
+  <div class="config-section" id="add-node-form" style="margin-bottom:1rem">
+    <h3>Add Node</h3>
+    <div class="form-row">
+      <label>Name</label><input id="node-name" placeholder="reader-3" style="width:120px">
+      <label>Host</label><input id="node-host" placeholder="10.0.1.13" style="width:200px">
+      <label>Port</label><input id="node-port" type="number" value="5432" style="width:70px">
+    </div>
+    <div class="form-row">
+      <label>Type</label>
+      <select id="node-type"><option value="reader">Reader</option><option value="writer">Writer</option><option value="analytics">Analytics</option></select>
+      <label>Weight</label><input id="node-weight" type="number" value="5" style="width:60px">
+      <label>Database</label><input id="node-database" placeholder="postgres" style="width:120px">
+    </div>
+    <div class="form-row">
+      <label>Username</label><input id="node-username" placeholder="proxy_user" style="width:120px">
+      <label>Password</label><input id="node-password" type="password" placeholder="" style="width:140px">
+      <label>SSL Mode</label>
+      <select id="node-ssl"><option value="disable">disable</option><option value="prefer">prefer</option><option value="require">require</option></select>
+      <button class="btn btn-primary btn-sm" id="btn-add-node" style="margin-left:1rem">Add Node</button>
+    </div>
+  </div>
   <div class="cards" id="nodes-cards"></div>
-  <div class="table-container"><table id="nodes-table"><thead><tr><th>Node</th><th>Type</th><th>Health</th><th>Connections</th><th>Pool Max</th><th>Replication Lag</th><th>Replay LSN</th></tr></thead><tbody></tbody></table></div>
+  <div class="table-container"><table id="nodes-table"><thead><tr><th>Node</th><th>Type</th><th>Health</th><th>Connections</th><th>Pool Max</th><th>Replication Lag</th><th>Replay LSN</th><th>Action</th></tr></thead><tbody></tbody></table></div>
 </div>
 
 <!-- Config: Routing -->
@@ -214,6 +238,17 @@ tr:last-child td{border-bottom:none}
 
 </div><!-- /main -->
 
+<!-- Auth Login Overlay -->
+<div id="auth-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:10000;display:flex;align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:2rem;width:360px;text-align:center">
+    <h2 style="color:var(--accent);margin-bottom:0.5rem">🔱 Trident Console</h2>
+    <p style="color:var(--muted);font-size:0.85rem;margin-bottom:1.5rem">Enter admin token to continue</p>
+    <input id="auth-token-input" type="password" placeholder="Bearer Token" style="width:100%;padding:0.6rem;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;font-size:0.9rem;margin-bottom:1rem">
+    <button id="auth-login-btn" class="btn btn-primary" style="width:100%;padding:0.6rem">Login</button>
+    <p id="auth-error" style="color:var(--red);font-size:0.8rem;margin-top:0.75rem;display:none">Invalid token</p>
+  </div>
+</div>
+
 <script>
 const API = '';
 let routingChart, latencyChart;
@@ -254,8 +289,88 @@ function toast(msg, type='success') {
 }
 
 // Fetch helpers
-async function api(path, opts) {
-  const res = await fetch(API + path, opts);
+// --- Auth ---
+const AUTH_KEY = 'trident_admin_token';
+let authToken = localStorage.getItem(AUTH_KEY) || '';
+const authOverlay = document.getElementById('auth-overlay');
+
+function showLogin() {
+  authOverlay.style.display = 'flex';
+}
+function hideLogin() {
+  authOverlay.style.display = 'none';
+}
+
+document.getElementById('auth-login-btn').addEventListener('click', tryLogin);
+document.getElementById('auth-token-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') tryLogin();
+});
+
+async function tryLogin() {
+  const token = document.getElementById('auth-token-input').value.trim();
+  const errorEl = document.getElementById('auth-error');
+  try {
+    const res = await fetch(API + '/api/overview', {
+      headers: token ? {'Authorization': 'Bearer ' + token} : {}
+    });
+    if (res.status === 401) {
+      errorEl.style.display = 'block';
+      errorEl.textContent = 'Invalid token';
+      return;
+    }
+    // Success (200) or no auth required
+    authToken = token;
+    if (token) localStorage.setItem(AUTH_KEY, token);
+    else localStorage.removeItem(AUTH_KEY);
+    hideLogin();
+    errorEl.style.display = 'none';
+    startPolling();
+  } catch(e) {
+    errorEl.style.display = 'block';
+    errorEl.textContent = 'Connection error: ' + e.message;
+  }
+}
+
+// Check if auth is needed on page load
+async function checkAuth() {
+  try {
+    const res = await fetch(API + '/api/overview', {
+      headers: authToken ? {'Authorization': 'Bearer ' + authToken} : {}
+    });
+    if (res.status === 401) {
+      authToken = '';
+      localStorage.removeItem(AUTH_KEY);
+      showLogin();
+      document.getElementById('btn-logout').style.display = 'none';
+    } else {
+      hideLogin();
+      // Show logout button only when token auth is active
+      if (authToken) document.getElementById('btn-logout').style.display = 'block';
+      startPolling();
+    }
+  } catch(e) {
+    // Server unreachable — just start anyway
+    hideLogin();
+    startPolling();
+  }
+}
+
+// Logout
+document.getElementById('btn-logout').addEventListener('click', () => {
+  authToken = '';
+  localStorage.removeItem(AUTH_KEY);
+  document.getElementById('btn-logout').style.display = 'none';
+  showLogin();
+});
+
+async function api(path, opts = {}) {
+  const headers = {...(opts.headers || {})};
+  if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+  const res = await fetch(API + path, {...opts, headers});
+  if (res.status === 401) {
+    showLogin();
+    throw new Error('unauthorized');
+  }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -360,15 +475,79 @@ async function fetchNodes() {
     const data = await api('/api/nodes');
     const tbody = document.querySelector('#nodes-table tbody');
     tbody.innerHTML = data.nodes.map(n => `<tr>
-      <td>${n.node_id}</td>
-      <td><span class="badge badge-${n.node_type}">${n.node_type}</span></td>
+      <td>${esc(n.node_id)}</td>
+      <td><span class="badge badge-${esc(n.node_type)}">${esc(n.node_type)}</span></td>
       <td><span class="badge badge-${n.healthy?'healthy':'unhealthy'}">${n.healthy?'Healthy':'Unhealthy'}</span></td>
       <td>${n.active_connections}</td>
       <td>${data.max_pool_size}</td>
       <td>${n.replication_lag_ms !== null ? n.replication_lag_ms + 'ms' : '-'}</td>
       <td>${n.replay_lsn > 0 ? '0x'+n.replay_lsn.toString(16).toUpperCase() : '-'}</td>
+      <td><button class="btn btn-danger btn-sm" data-node="${esc(n.node_id)}">Remove</button></td>
     </tr>`).join('');
+    // Bind remove buttons via event delegation (avoids inline onclick XSS)
+    tbody.querySelectorAll('[data-node]').forEach(btn => {
+      btn.addEventListener('click', () => removeNode(btn.dataset.node));
+    });
   } catch(e) { console.error(e); }
+}
+
+// Add Node
+document.getElementById('btn-add-node').addEventListener('click', async () => {
+  const name = document.getElementById('node-name').value.trim();
+  const host = document.getElementById('node-host').value.trim();
+  const port = parseInt(document.getElementById('node-port').value) || 5432;
+  const node_type = document.getElementById('node-type').value;
+  const weight = parseInt(document.getElementById('node-weight').value) || 1;
+  const database = document.getElementById('node-database').value.trim();
+  const username = document.getElementById('node-username').value.trim();
+  const password = document.getElementById('node-password').value;
+  const ssl_mode = document.getElementById('node-ssl').value;
+
+  if (!name || !host || !database || !username) {
+    toast('Name, Host, Database and Username are required', 'error');
+    return;
+  }
+
+  try {
+    const hdrs = {'content-type': 'application/json'};
+    if (authToken) hdrs['Authorization'] = 'Bearer ' + authToken;
+    const res = await fetch('/api/nodes', {
+      method: 'POST',
+      headers: hdrs,
+      body: JSON.stringify({name, host, port, type: node_type, weight, database, username, password: password || undefined, ssl_mode})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(`Node '${name}' added successfully`);
+      document.getElementById('node-name').value = '';
+      document.getElementById('node-host').value = '';
+      document.getElementById('node-password').value = '';
+      fetchNodes();
+    } else {
+      toast(data.message || 'Failed to add node', 'error');
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
+});
+
+// Remove Node
+async function removeNode(nodeId) {
+  if (!confirm(`Remove node '${nodeId}'? Active connections will be drained.`)) return;
+  try {
+    const hdrs = {'content-type': 'application/json'};
+    if (authToken) hdrs['Authorization'] = 'Bearer ' + authToken;
+    const res = await fetch('/api/nodes', {
+      method: 'DELETE',
+      headers: hdrs,
+      body: JSON.stringify({name: nodeId})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      toast(`Node '${nodeId}' removed`);
+      fetchNodes();
+    } else {
+      toast(data.message || 'Failed to remove node', 'error');
+    }
+  } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 
 // Config: Routing
@@ -543,14 +722,20 @@ document.getElementById('log-level-filter').addEventListener('change', () => { l
 document.getElementById('log-search').addEventListener('input', () => { logViewEnd = 0; renderLogs(); });
 document.getElementById('btn-clear-logs').addEventListener('click', () => { logBuffer.length = 0; logViewStart = 0; logViewEnd = 0; renderLogs(); });
 
-// Auto-refresh
-setInterval(() => {
-  const active = document.querySelector('.nav-item.active');
-  if (active) onPageShow(active.dataset.page);
-}, 5000);
+// Auto-refresh and initial load — gated by auth check
+let pollingStarted = false;
+function startPolling() {
+  if (pollingStarted) return;
+  pollingStarted = true;
+  setInterval(() => {
+    const active = document.querySelector('.nav-item.active');
+    if (active) onPageShow(active.dataset.page);
+  }, 5000);
+  fetchOverview();
+}
 
-// Initial load
-fetchOverview();
+// Entry point: check auth then start
+checkAuth();
 </script>
 </body>
 </html>

@@ -88,6 +88,102 @@ impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
     }
 }
 
+/// Coordinates dynamic node addition/removal across the HealthChecker,
+/// PoolManager, and ConnectionRegistry at runtime.
+struct LiveNodeManager {
+    health_checker: Arc<HealthChecker<WireProtocolHealthProbe>>,
+    pool_manager: Arc<InMemoryPoolManager>,
+    connection_registry: Arc<ConnectionRegistry>,
+    pool_mode: trident::config::PoolMode,
+    max_pool_size: u32,
+    pool_settings: NodePoolSettings,
+}
+
+#[async_trait::async_trait]
+impl admin::NodeManager for LiveNodeManager {
+    async fn add_node(&self, config: trident::config::NodeConfig) -> Result<(), String> {
+        // Validate: check connectivity first
+        let probe = WireProtocolHealthProbe {
+            target: ProbeTarget {
+                host: config.host.clone(),
+                port: config.port,
+                database: config.database.clone(),
+                username: config.username.clone(),
+                password: config.password.clone(),
+                ssl_mode: config.ssl_mode,
+            },
+        };
+
+        // Add to health checker (starts as unhealthy)
+        if !self.health_checker.add_node(
+            config.name.clone(),
+            config.node_type,
+            config.weight,
+            probe,
+        ) {
+            return Err(format!("node '{}' already exists", config.name));
+        }
+
+        // Create and warm up the connection pool
+        let target = ConnectTarget {
+            host: config.host.clone(),
+            port: config.port,
+            database: config.database.clone(),
+            username: config.username.clone(),
+            password: config.password.clone(),
+            ssl_mode: config.ssl_mode,
+        };
+        let factory = LiveConnFactory {
+            target,
+            registry: self.connection_registry.clone(),
+        };
+        let cleaner = DiscardAllCleaner {
+            registry: self.connection_registry.clone(),
+        };
+        let pool = NodePool::with_settings(
+            config.name.clone(),
+            self.pool_mode,
+            self.max_pool_size,
+            self.pool_settings,
+            factory,
+            cleaner,
+        );
+
+        if let Err(e) = pool.warm_up().await {
+            // Rollback: remove from health checker
+            self.health_checker.remove_node(&config.name);
+            return Err(format!("failed to warm up pool for '{}': {}", config.name, e));
+        }
+
+        // Add pool to manager
+        if !self.pool_manager.add_pool(config.name.clone(), Box::new(pool)) {
+            // Should not happen since we checked health_checker first,
+            // but handle gracefully
+            self.health_checker.remove_node(&config.name);
+            return Err(format!("node '{}' pool already exists", config.name));
+        }
+
+        tracing::info!(node = %config.name, node_type = ?config.node_type, host = %config.host, "dynamically added backend node");
+        Ok(())
+    }
+
+    fn remove_node(&self, node_id: &str) -> Result<(), String> {
+        // Atomically check last-writer protection and remove under the
+        // health checker's internal lock — prevents concurrent removes
+        // from both passing the writer count check.
+        self.health_checker
+            .remove_node_checked(node_id, true)
+            .map_err(|e| e.to_string())?;
+
+        // Remove from pool manager (existing connections drain naturally
+        // as Arc references are dropped by in-flight handlers)
+        self.pool_manager.remove_pool(node_id);
+
+        tracing::info!(node = %node_id, "dynamically removed backend node");
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Install the ring crypto provider for rustls (required for backend TLS).
@@ -360,7 +456,7 @@ async fn run(
         router: router.clone(),
         pool_manager: pool_manager.clone(),
         lsn_tracker,
-        connection_registry: registry,
+        connection_registry: registry.clone(),
         cancel_registry,
         node_addresses,
         default_consistency: default_consistency.clone(),
@@ -418,6 +514,14 @@ async fn run(
     // health-check snapshot the router/pool manager use; `/reload`
     // reuses the same hot-reload target `SIGHUP` uses above.
     if let Some(admin_listen_addr) = admin_listen_addr {
+        let node_manager: Arc<dyn admin::NodeManager> = Arc::new(LiveNodeManager {
+            health_checker: health_checker.clone(),
+            pool_manager: pool_manager.clone(),
+            connection_registry: registry.clone(),
+            pool_mode: config.pool.mode,
+            max_pool_size: config.pool.max_pool_size,
+            pool_settings: pool_settings.clone(),
+        });
         let admin_snapshot_source = pool_manager.clone();
         let config_path_for_admin = config_path.clone();
         let custom_rules_for_admin = custom_rules.clone();
@@ -450,6 +554,8 @@ async fn run(
                 pool_max_idle_admin,
                 pool_conn_timeout_admin,
                 pool_max_lifetime_admin,
+                Some(node_manager),
+                config.admin.auth_token.clone(),
             )
             .await
             {

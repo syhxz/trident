@@ -96,7 +96,7 @@ impl Default for ExtensionLsnConfig {
 }
 
 fn default_lsn_guc_name() -> String {
-    "lsn_tracker.last_lsn".to_string()
+    "pg_lsn_track.last_commit_lsn".to_string()
 }
 
 /// LSN tracking configuration. Every field defaults so existing YAML files
@@ -290,6 +290,12 @@ pub struct AdminConfig {
     pub enabled: bool,
     #[serde(default = "default_admin_listen_addr")]
     pub listen_addr: String,
+    /// Optional Bearer token for admin API authentication. If set, all
+    /// requests (except GET /metrics and GET /healthz) must include an
+    /// `Authorization: Bearer <token>` header. Supports `${ENV_VAR}`
+    /// placeholders (same as node passwords).
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for AdminConfig {
@@ -297,6 +303,7 @@ impl Default for AdminConfig {
         AdminConfig {
             enabled: false,
             listen_addr: default_admin_listen_addr(),
+            auth_token: None,
         }
     }
 }
@@ -880,7 +887,7 @@ mod tests {
         );
         assert_eq!(
             parsed.lsn_tracking.extension.guc_name,
-            "lsn_tracker.last_lsn"
+            "pg_lsn_track.last_commit_lsn"
         );
     }
 

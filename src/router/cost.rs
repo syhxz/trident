@@ -118,9 +118,9 @@ impl ExplainRunner for PoolExplainRunner {
         }
 
         let stream = guard.as_mut().unwrap();
-        let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
 
-        // Run with timeout to avoid blocking routing
+        // Try standard EXPLAIN first
+        let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
         let result = tokio::time::timeout(
             self.timeout,
             run_explain_query(stream, &explain_sql),
@@ -128,11 +128,34 @@ impl ExplainRunner for PoolExplainRunner {
         .await;
 
         match result {
-            Ok(Ok(cost)) => Ok(cost),
-            Ok(Err(e)) => {
-                // Connection may be in a bad state, drop it
+            Ok(Ok(cost)) => return Ok(cost),
+            Ok(Err(_)) => {
+                // Standard EXPLAIN failed (e.g. parameterized query with $1).
+                // Reconnect and try GENERIC_PLAN (PostgreSQL 16+).
                 *guard = None;
-                Err(e)
+                if let Err(e) = self.get_or_connect(&mut guard).await {
+                    *guard = None;
+                    return Err(e);
+                }
+                let stream = guard.as_mut().unwrap();
+                let generic_sql = format!("EXPLAIN (GENERIC_PLAN, FORMAT JSON) {sql}");
+                let result = tokio::time::timeout(
+                    self.timeout,
+                    run_explain_query(stream, &generic_sql),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(cost)) => Ok(cost),
+                    Ok(Err(e)) => {
+                        *guard = None;
+                        Err(e)
+                    }
+                    Err(_timeout) => {
+                        *guard = None;
+                        Err(CostEstimationError::ExplainFailed("EXPLAIN GENERIC_PLAN timed out".into()))
+                    }
+                }
             }
             Err(_timeout) => {
                 *guard = None;

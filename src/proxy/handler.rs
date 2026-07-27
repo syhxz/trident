@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::balancer::LoadBalancer;
 use crate::config::{ConsistencyLevel, LsnTrackingConfig, LsnTrackingMode, NodeType, PoolMode};
 use crate::parser::classifier::{
-    contains_multiple_statements, requires_writer, Classifier, KeywordClassifier,
+    contains_multiple_statements, multi_statement_all_readable, requires_writer, Classifier, KeywordClassifier,
 };
 use crate::parser::hint::HintParser;
 use crate::pool::conn::PooledConnection;
@@ -897,6 +897,13 @@ where
         let mut had_error = false;
         let mut write_detected = false;
         let mut commit_tag_seen = false;
+        let mut reported_lsn: Option<u64> = None;
+        let extension_guc_name = match self.lsn_tracking.mode {
+            LsnTrackingMode::Extension | LsnTrackingMode::Auto => {
+                Some(self.lsn_tracking.extension.guc_name.as_str())
+            }
+            _ => None,
+        };
         let tx_status = loop {
             let (tag, body) = match read_tagged_frame(&mut backend_socket).await {
                 Ok(frame) => frame,
@@ -962,6 +969,18 @@ where
                         return Err(ProxyError::Protocol(e));
                     }
                 }
+                b'S' if extension_guc_name.is_some() => {
+                    // ParameterStatus: check if it's the extension LSN GUC.
+                    // Capture the LSN value and suppress the message from
+                    // reaching the client (it's an internal implementation
+                    // detail of the pg_lsn_track extension).
+                    let (name, value) = extract_two_cstrings_from_body(&body);
+                    if Some(name.as_str()) == extension_guc_name {
+                        reported_lsn = crate::health::parse_lsn(&value);
+                    } else {
+                        write_raw_frame_to(client_stream, tag, &body).await?;
+                    }
+                }
                 _ => {
                     // Everything else (ParseComplete, BindComplete, DataRow,
                     // RowDescription, NoData, ParameterDescription,
@@ -992,6 +1011,18 @@ where
             && (write_detected || (session.tx_has_writes && commit_tag_seen));
         if committed_write && session.state.consistency != ConsistencyLevel::Eventual {
             session.pending_write = true;
+        }
+        // Extension LSN capture: if the extension GUC reported an LSN during
+        // this batch, apply it to the session's LSN tracker immediately
+        // (same behavior as the simple-query path). This avoids the
+        // pending_write fallback pipeline query on the next read.
+        if let Some(lsn) = reported_lsn {
+            if committed_write {
+                self.lsn_tracker
+                    .record_write(&session.state.id, lsn);
+                session.pending_write = false;
+                session.extension_detected = true;
+            }
         }
         if write_detected && !had_error && tx_status == TransactionStatus::InTransaction {
             session.tx_has_writes = true;
@@ -1061,6 +1092,13 @@ where
         let mut had_error = false;
         let mut write_detected = false;
         let mut commit_tag_seen = false;
+        let mut reported_lsn: Option<u64> = None;
+        let extension_guc_name = match self.lsn_tracking.mode {
+            LsnTrackingMode::Extension | LsnTrackingMode::Auto => {
+                Some(self.lsn_tracking.extension.guc_name.as_str())
+            }
+            _ => None,
+        };
         let tx_status = loop {
             let (tag, body) = match read_tagged_frame(&mut held.socket).await {
                 Ok(frame) => frame,
@@ -1123,6 +1161,16 @@ where
                         return Err(ProxyError::Protocol(e));
                     }
                 }
+                b'S' if extension_guc_name.is_some() => {
+                    // ParameterStatus: capture extension LSN GUC, suppress
+                    // from client (same as simple-query and non-held extended path).
+                    let (name, value) = extract_two_cstrings_from_body(&body);
+                    if Some(name.as_str()) == extension_guc_name {
+                        reported_lsn = crate::health::parse_lsn(&value);
+                    } else {
+                        write_raw_frame_to(client_stream, tag, &body).await?;
+                    }
+                }
                 _ => {
                     write_raw_frame_to(client_stream, tag, &body).await?;
                 }
@@ -1165,6 +1213,15 @@ where
             && (write_detected || (session.tx_has_writes && commit_tag_seen));
         if committed_write && session.state.consistency != ConsistencyLevel::Eventual {
             session.pending_write = true;
+        }
+        // Extension LSN capture (same as non-held path).
+        if let Some(lsn) = reported_lsn {
+            if committed_write {
+                self.lsn_tracker
+                    .record_write(&session.state.id, lsn);
+                session.pending_write = false;
+                session.extension_detected = true;
+            }
         }
         if write_detected && !had_error && tx_status == TransactionStatus::InTransaction {
             session.tx_has_writes = true;
@@ -2373,6 +2430,21 @@ fn extract_cstring_from_body(body: &[u8]) -> String {
     String::from_utf8_lossy(&body[..end]).into_owned()
 }
 
+/// Extracts two consecutive C-strings from a ParameterStatus message body
+/// (name + value, each NUL-terminated).
+fn extract_two_cstrings_from_body(body: &[u8]) -> (String, String) {
+    let first_end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+    let first = String::from_utf8_lossy(&body[..first_end]).into_owned();
+    let rest = if first_end + 1 < body.len() {
+        &body[first_end + 1..]
+    } else {
+        &[]
+    };
+    let second_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let second = String::from_utf8_lossy(&rest[..second_end]).into_owned();
+    (first, second)
+}
+
 /// True when the frame is a Parse ('P') message that creates a *named*
 /// prepared statement (first body byte is not the NUL terminator of an
 /// empty name).
@@ -2458,7 +2530,9 @@ fn query_has_write_intent(sql: &str) -> bool {
         return false;
     }
     if contains_multiple_statements(sql) {
-        return true;
+        // Multi-statement: if ALL statements are read-only, allow routing
+        // to Reader. Otherwise conservatively route to Writer.
+        return !multi_statement_all_readable(&KeywordClassifier, sql);
     }
 
     let classifier = KeywordClassifier;
@@ -2648,7 +2722,11 @@ mod tests {
     fn write_intent_is_conservative_for_multi_statement_batches() {
         assert!(query_has_write_intent("INSERT INTO t VALUES (1)"));
         assert!(query_has_write_intent("CREATE TABLE t (id int)"));
-        assert!(query_has_write_intent("SELECT 1; SELECT 2"));
+        // Multi-statement with all SELECTs → no write intent (can go to reader)
+        assert!(!query_has_write_intent("SELECT 1; SELECT 2"));
+        // Multi-statement with a write → write intent
+        assert!(query_has_write_intent("SELECT 1; INSERT INTO t VALUES (1)"));
+        assert!(query_has_write_intent("SELECT 1; DROP TABLE t"));
         assert!(query_has_write_intent(
             "WITH inserted AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM inserted"
         ));
@@ -2934,7 +3012,7 @@ mod tests {
                         backend
                             .write_all(&encode_backend_message(
                                 &BackendMessage::ParameterStatus {
-                                    name: "lsn_tracker.last_lsn".to_string(),
+                                    name: "pg_lsn_track.last_commit_lsn".to_string(),
                                     value: "16/B374D848".to_string(),
                                 },
                             ))
@@ -4719,7 +4797,7 @@ mod tests {
         let router = make_router();
         struct EmptyPoolManager;
         impl PoolManager for EmptyPoolManager {
-            fn pool_for(&self, _node_id: &str) -> Option<&dyn crate::pool::pool::ConnectionPool> {
+            fn pool_for(&self, _node_id: &str) -> Option<std::sync::Arc<dyn crate::pool::pool::ConnectionPool>> {
                 None
             }
             fn snapshot(&self) -> Vec<BackendNodeSnapshot> {

@@ -108,7 +108,7 @@ lsn_tracking:
     internal_query_timeout_ms: 100
     lazy_fallback: true
   extension:
-    guc_name: "lsn_tracker.last_lsn"
+    guc_name: "pg_lsn_track.last_commit_lsn"
 
 pool:
   mode: transaction
