@@ -1,0 +1,64 @@
+# Local development / smoke-test compose file.
+#
+# Brings up a single Writer + single Reader PostgreSQL instance and one
+# Trident instance in front of them, so you can point psql at
+# localhost:6432 and see read/write splitting working end to end without
+# any real infrastructure.
+#
+# This is NOT a multi-instance HA topology -- it is meant for local
+# iteration only. For real deployments see DEPLOYMENT.md and the
+# `deploy/systemd` / `deploy/k8s` directories.
+#
+# Usage:
+#   docker compose up --build
+#   psql "host=localhost port=6432 dbname=mydb user=proxy_user password=proxy_pass"
+
+services:
+  writer:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: proxy_user
+      POSTGRES_PASSWORD: proxy_pass
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxy_user -d mydb"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  reader:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: proxy_user
+      POSTGRES_PASSWORD: proxy_pass
+    ports:
+      - "15433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proxy_user -d mydb"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+
+  trident:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      writer:
+        condition: service_healthy
+      reader:
+        condition: service_healthy
+    ports:
+      - "6432:6432"
+    environment:
+      TRIDENT_CONFIG: /app/config.yaml
+      RUST_LOG: info
+    volumes:
+      # Overrides the fallback config baked into the image with one that
+      # points at the two Postgres services above (see
+      # deploy/docker-compose/config.yaml).
+      - ./deploy/docker-compose/config.yaml:/app/config.yaml:ro
+    restart: unless-stopped

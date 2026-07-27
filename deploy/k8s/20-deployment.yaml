@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trident
+  namespace: trident
+  labels:
+    app: trident
+spec:
+  # replicas > 1 puts you in the "multi-instance" scenario documented in
+  # DEPLOYMENT.md section 8: ConsistencyLevel::Global is NOT correct across
+  # replicas (each pod has its own in-memory LsnTracker), and CANCEL
+  # requests can silently fail to be forwarded if a client's cancel
+  # connection lands on a different pod than its original query. Read
+  # DEPLOYMENT.md before scaling this beyond 1. If you do scale beyond 1,
+  # make sure routing.default_consistency is "session" or "eventual" (not
+  # "global") and that the Service below keeps ClientIP session affinity.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trident
+  template:
+    metadata:
+      labels:
+        app: trident
+    spec:
+      containers:
+        - name: trident
+          image: trident:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: pg-proxy
+              containerPort: 6432
+            - name: admin
+              containerPort: 9090
+          env:
+            - name: TRIDENT_CONFIG
+              value: /etc/trident/config.yaml
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: config
+              mountPath: /etc/trident
+              readOnly: true
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          # Requires `admin.enabled: true` and `admin.listen_addr:
+          # "0.0.0.0:9090"` in config.yaml (see DEPLOYMENT.md 第 4 节) --
+          # the admin endpoint is unauthenticated by design, so it is only
+          # ever reachable from inside the pod network here (no Service
+          # exposes it), never from outside the cluster.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: pg-proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: config
+          secret:
+            secretName: trident-config

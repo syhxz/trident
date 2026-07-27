@@ -1,0 +1,1061 @@
+//! Single-node connection pool (`pool`)
+//!
+//! Implements the `ConnectionPool` trait:
+//! - Session mode: `acquire` always returns the same bound backend
+//!   connection for the same session (`session_id`), until that session
+//!   calls `release_session`.
+//! - Transaction mode: `acquire` borrows a connection from the idle queue
+//!   (creating a new one if the queue is empty and `max_pool_size` has not
+//!   been reached); `release` returns an unpinned connection (cleaning it
+//!   first if dirty).
+//!
+//! Note: `PooledConnection` is only the connection's logical metadata (it
+//! does not hold the actual socket -- see `conn.rs`), so this module
+//! decouples from external I/O via an injected `ConnFactory` (establishes
+//! new connections) and `ConnCleaner` (cleans dirty connections, e.g.
+//! `DISCARD ALL`), letting the core pooling logic be verified entirely
+//! without a real network in unit/property tests.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use tokio::time::timeout;
+
+use crate::config::PoolMode;
+use crate::pool::conn::PooledConnection;
+
+/// Connection pool error
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PoolError {
+    #[error("connection pool for node '{0}' is exhausted (max_pool_size reached)")]
+    Exhausted(String),
+
+    #[error("failed to establish new backend connection: {0}")]
+    ConnectFailed(String),
+
+    #[error("timed out after {timeout_ms} ms establishing a backend connection for node '{node_id}'")]
+    ConnectTimeout { node_id: String, timeout_ms: u128 },
+
+    #[error("failed to clean dirty connection before returning to pool: {0}")]
+    CleanupFailed(String),
+
+    #[error("released connection does not belong to this pool (node mismatch)")]
+    NodeMismatch,
+}
+
+/// Abstract factory for establishing new backend connections, called by
+/// `NodePool` whenever a new connection is needed. Production
+/// implementations should call `conn::establish_connection`; tests can
+/// inject an I/O-free mock.
+pub trait ConnFactory: Send + Sync {
+    fn create(
+        &self,
+        node_id: &str,
+    ) -> impl std::future::Future<Output = Result<PooledConnection, PoolError>> + Send;
+}
+
+/// Abstract interface for cleaning a "dirty" connection (equivalent to
+/// `DISCARD ALL` or a precise-reset combination).
+pub trait ConnCleaner: Send + Sync {
+    fn clean(
+        &self,
+        conn: &PooledConnection,
+    ) -> impl std::future::Future<Output = Result<(), PoolError>> + Send;
+
+    /// Permanently drops any external resource associated with a pooled
+    /// connection (notably its socket in `ConnectionRegistry`). The
+    /// default is suitable for metadata-only test pools.
+    fn discard(&self, _conn: &PooledConnection) {}
+}
+
+/// `DISCARD ALL`: the brute-force reset approach, completing all cleanup
+/// in a single statement.
+pub const DISCARD_ALL_STATEMENT: &str = "DISCARD ALL";
+
+/// Precise reset combination: reduces unnecessary round trips by only
+/// resetting state that actually changed. The order follows design.md
+/// section 7.5: reset parameters first, then release statements/cursors/
+/// listeners, and finally reset the role.
+pub const PRECISE_RESET_STATEMENTS: &[&str] = &[
+    "RESET ALL",
+    "DEALLOCATE ALL",
+    "CLOSE ALL",
+    "UNLISTEN *",
+    "SET SESSION AUTHORIZATION DEFAULT",
+];
+
+/// Asynchronous connection pool interface.
+///
+/// Uses `#[async_trait]` rather than a native `impl Future` return, so
+/// this trait remains object-safe and can be returned by
+/// `PoolManager::pool_for` as `&dyn ConnectionPool` (see design.md's
+/// `PoolManager` interface).
+#[async_trait]
+pub trait ConnectionPool: Send + Sync {
+    /// Returns the pool mode (Transaction or Session) for this pool.
+    fn mode(&self) -> PoolMode;
+
+    /// Acquires a usable connection.
+    ///
+    /// - Session mode: `session_id` identifies the client connection; for
+    ///   the same `session_id`, repeated calls (before `release_session`)
+    ///   always return the same `node_id` + `backend_pid`.
+    /// - Transaction mode: `session_id` is only used to track pinned
+    ///   connections per session for a later `pin` call; each `acquire`
+    ///   may return any idle connection in the pool.
+    async fn acquire(&self, session_id: &str) -> Result<PooledConnection, PoolError>;
+
+    /// Called when a transaction/statement ends in Transaction mode; if
+    /// `conn.pinned = true`, the connection is not actually returned to
+    /// the pool. In Session mode this is a no-op (the connection remains
+    /// bound until `release_session`).
+    async fn release(&self, session_id: &str, conn: PooledConnection) -> Result<(), PoolError>;
+
+    /// Marks the connection as pinned and records the session it belongs
+    /// to, for `release_session` to release later. After this, no
+    /// `release(session_id, conn)` call will place it back in the
+    /// reusable queue.
+    fn pin(&self, session_id: &str, conn: &mut PooledConnection);
+
+    /// Permanently removes a broken/unknown-state connection from the
+    /// pool and frees its capacity slot. Unlike `release`, this never
+    /// cleans or returns the connection to the idle queue.
+    fn discard(&self, conn: PooledConnection) -> Result<(), PoolError>;
+
+    /// Called when a session ends. Removes and returns every connection
+    /// still recorded for the session so the handler can remove the
+    /// corresponding sockets from its registry before dropping them.
+    fn release_session(&self, session_id: &str) -> Vec<PooledConnection>;
+
+    /// The current number of active connections (used for load balancing
+    /// and capacity monitoring).
+    fn active_connections(&self) -> i64;
+}
+
+/// Runtime controls for a single node pool. Durations are applied lazily
+/// when a connection is created or removed from the reusable idle queue;
+/// checked-out and pinned connections are never interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodePoolSettings {
+    pub min_pool_size: u32,
+    pub connection_timeout: Duration,
+    pub max_idle_time: Duration,
+    pub max_lifetime: Duration,
+}
+
+impl Default for NodePoolSettings {
+    fn default() -> Self {
+        NodePoolSettings {
+            min_pool_size: 0,
+            connection_timeout: Duration::from_secs(5),
+            max_idle_time: Duration::from_secs(5 * 60),
+            max_lifetime: Duration::from_secs(30 * 60),
+        }
+    }
+}
+
+/// Default `ConnectionPool` implementation: manages the connection pool
+/// for a single backend node.
+pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
+    node_id: String,
+    mode: PoolMode,
+    max_pool_size: u32,
+    settings: NodePoolSettings,
+    factory: F,
+    cleaner: C,
+
+    idle: Mutex<VecDeque<PooledConnection>>,
+    active_connections: AtomicU32,
+    /// Backend PIDs currently owned by this pool. This makes `discard`
+    /// idempotent with respect to slot accounting and prevents a stale
+    /// metadata clone from underflowing `active_connections`.
+    known_connections: Mutex<HashSet<i32>>,
+
+    /// Session mode: session ID -> bound connection (always returns the
+    /// same physical connection identity).
+    session_bindings: Mutex<HashMap<String, PooledConnection>>,
+    /// Serializes the first connection acquisition per session. Without
+    /// this, concurrent acquires can both observe no binding and either
+    /// spuriously exhaust a size-1 pool or create duplicate sockets.
+    session_acquire_locks:
+        Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Transaction mode: session ID -> the set of connections that
+    /// session has pinned and not yet released.
+    pinned_by_session: Mutex<HashMap<String, Vec<PooledConnection>>>,
+}
+
+impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
+    pub fn new(
+        node_id: impl Into<String>,
+        mode: PoolMode,
+        max_pool_size: u32,
+        factory: F,
+        cleaner: C,
+    ) -> Self {
+        Self::with_settings(
+            node_id,
+            mode,
+            max_pool_size,
+            NodePoolSettings::default(),
+            factory,
+            cleaner,
+        )
+    }
+
+    pub fn with_settings(
+        node_id: impl Into<String>,
+        mode: PoolMode,
+        max_pool_size: u32,
+        settings: NodePoolSettings,
+        factory: F,
+        cleaner: C,
+    ) -> Self {
+        NodePool {
+            node_id: node_id.into(),
+            mode,
+            max_pool_size,
+            settings,
+            factory,
+            cleaner,
+            idle: Mutex::new(VecDeque::new()),
+            active_connections: AtomicU32::new(0),
+            known_connections: Mutex::new(HashSet::new()),
+            session_bindings: Mutex::new(HashMap::new()),
+            session_acquire_locks: Mutex::new(HashMap::new()),
+            pinned_by_session: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Atomically attempts to "reserve a slot" for a new connection: only
+    /// when `active_connections < max_pool_size` does it increment the
+    /// counter and return `true`; otherwise leaves state unchanged and
+    /// returns `false`.
+    ///
+    /// Uses a CAS loop to guarantee Requirement 5.5 (active connections
+    /// never exceed max_pool_size) holds even under concurrency.
+    fn try_reserve_slot(&self) -> bool {
+        let mut current = self.active_connections.load(Ordering::SeqCst);
+        loop {
+            if current >= self.max_pool_size {
+                return false;
+            }
+            match self.active_connections.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_slot(&self) {
+        self.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn register_connection(&self, conn: &PooledConnection) {
+        self.known_connections
+            .lock()
+            .insert(conn.backend_pid);
+    }
+
+    async fn create_reserved_connection(&self) -> Result<PooledConnection, PoolError> {
+        match timeout(
+            self.settings.connection_timeout,
+            self.factory.create(&self.node_id),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => {
+                self.register_connection(&conn);
+                Ok(conn)
+            }
+            Ok(Err(error)) => {
+                self.release_slot();
+                Err(error)
+            }
+            Err(_) => {
+                self.release_slot();
+                Err(PoolError::ConnectTimeout {
+                    node_id: self.node_id.clone(),
+                    timeout_ms: self.settings.connection_timeout.as_millis(),
+                })
+            }
+        }
+    }
+
+    fn is_expired(&self, conn: &PooledConnection, now: Instant) -> bool {
+        now.saturating_duration_since(conn.created_at) >= self.settings.max_lifetime
+            || conn.idle_since.is_some_and(|idle_since| {
+                now.saturating_duration_since(idle_since) >= self.settings.max_idle_time
+            })
+    }
+
+    /// Returns the next non-expired idle connection. Expired metadata and
+    /// its registered socket are permanently discarded before trying the
+    /// next entry.
+    fn take_reusable_idle(&self) -> Option<PooledConnection> {
+        loop {
+            let candidate = self
+                .idle
+                .lock()
+                .pop_front();
+            let mut conn = candidate?;
+            if self.is_expired(&conn, Instant::now()) {
+                self.cleaner.discard(&conn);
+                self.release_known_slot(&conn);
+                continue;
+            }
+            conn.idle_since = None;
+            return Some(conn);
+        }
+    }
+
+    /// Establishes reusable idle connections up to `min_pool_size`.
+    /// Production calls this before accepting clients, so startup honors the
+    /// configured floor rather than waiting for the first query burst.
+    pub async fn warm_up(&self) -> Result<(), PoolError> {
+        while self.active_connections.load(Ordering::SeqCst) < self.settings.min_pool_size {
+            if !self.try_reserve_slot() {
+                return Err(PoolError::Exhausted(self.node_id.clone()));
+            }
+            let mut conn = self.create_reserved_connection().await?;
+            conn.idle_since = Some(Instant::now());
+            self.idle
+                .lock()
+                .push_back(conn);
+        }
+        Ok(())
+    }
+
+    fn release_known_slot(&self, conn: &PooledConnection) -> bool {
+        let removed = self
+            .known_connections
+            .lock()
+            .remove(&conn.backend_pid);
+        if removed {
+            self.release_slot();
+        }
+        removed
+    }
+
+    fn forget_metadata(&self, conn: &PooledConnection) {
+        self.idle
+            .lock()
+            .retain(|candidate| candidate.backend_pid != conn.backend_pid);
+        self.session_bindings
+            .lock()
+            .retain(|_, candidate| candidate.backend_pid != conn.backend_pid);
+        let mut pinned = self
+            .pinned_by_session
+            .lock();
+        pinned.retain(|_, connections| {
+            connections.retain(|candidate| candidate.backend_pid != conn.backend_pid);
+            !connections.is_empty()
+        });
+    }
+
+    async fn acquire_session_mode(&self, session_id: &str) -> Result<PooledConnection, PoolError> {
+        {
+            let bindings = self.session_bindings.lock();
+            if let Some(conn) = bindings.get(session_id) {
+                return Ok(conn.clone());
+            }
+        }
+
+        let acquire_lock = {
+            let mut locks = self
+                .session_acquire_locks
+                .lock();
+            locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _acquire_guard = acquire_lock.lock().await;
+
+        // Another task for this session may have established the binding
+        // while this task waited. Recheck before reserving pool capacity.
+        {
+            let bindings = self.session_bindings.lock();
+            if let Some(conn) = bindings.get(session_id) {
+                return Ok(conn.clone());
+            }
+        }
+
+        let conn = if let Some(conn) = self.take_reusable_idle() {
+            conn
+        } else {
+            if !self.try_reserve_slot() {
+                return Err(PoolError::Exhausted(self.node_id.clone()));
+            }
+            self.create_reserved_connection().await?
+        };
+
+        self.session_bindings
+            .lock()
+            .insert(session_id.to_string(), conn.clone());
+        Ok(conn)
+    }
+
+    async fn acquire_transaction_mode(&self, session_id: &str) -> Result<PooledConnection, PoolError> {
+        {
+            let mut pinned = self.pinned_by_session.lock();
+            let mut remove_entry = false;
+            let connection = pinned.get_mut(session_id).and_then(|connections| {
+                let connection = connections.pop();
+                remove_entry = connections.is_empty();
+                connection
+            });
+            if remove_entry {
+                pinned.remove(session_id);
+            }
+            if let Some(connection) = connection {
+                return Ok(connection);
+            }
+        }
+        if let Some(conn) = self.take_reusable_idle() {
+            return Ok(conn);
+        }
+
+        if !self.try_reserve_slot() {
+            return Err(PoolError::Exhausted(self.node_id.clone()));
+        }
+        self.create_reserved_connection().await
+    }
+
+    async fn release_transaction_mode(
+        &self,
+        session_id: &str,
+        mut conn: PooledConnection,
+    ) -> Result<(), PoolError> {
+        if conn.node_id != self.node_id {
+            return Err(PoolError::NodeMismatch);
+        }
+
+        if conn.pinned {
+            let mut pinned = self.pinned_by_session.lock();
+            pinned.entry(session_id.to_string()).or_default().push(conn);
+            return Ok(());
+        }
+
+        if conn.dirty {
+            match self.cleaner.clean(&conn).await {
+                Ok(()) => {
+                    conn.dirty = false;
+                }
+                Err(e) => {
+                    // Cleanup failed: for safety, discard this connection
+                    // rather than returning one that may still be in an
+                    // unknown state, freeing its slot for a future new
+                    // connection.
+                    self.cleaner.discard(&conn);
+                    self.release_known_slot(&conn);
+                    return Err(e);
+                }
+            }
+        }
+
+        conn.idle_since = Some(Instant::now());
+        let mut idle = self.idle.lock();
+        idle.push_back(conn);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
+    fn mode(&self) -> PoolMode {
+        self.mode
+    }
+
+    async fn acquire(&self, session_id: &str) -> Result<PooledConnection, PoolError> {
+        match self.mode {
+            PoolMode::Session => self.acquire_session_mode(session_id).await,
+            PoolMode::Transaction => self.acquire_transaction_mode(session_id).await,
+        }
+    }
+
+    async fn release(&self, session_id: &str, conn: PooledConnection) -> Result<(), PoolError> {
+        match self.mode {
+            // Session mode: the connection always stays bound; it is not
+            // returned at the end of a statement/transaction, only
+            // actually released via `release_session`.
+            PoolMode::Session => Ok(()),
+            PoolMode::Transaction => self.release_transaction_mode(session_id, conn).await,
+        }
+    }
+
+    fn pin(&self, session_id: &str, conn: &mut PooledConnection) {
+        conn.pinned = true;
+        if self.mode == PoolMode::Session {
+            // In Session mode the connection is already bound to the
+            // session; keep the binding record's pinned flag in sync
+            // (mainly for consistent status reporting; does not affect
+            // release behavior).
+            let mut bindings = self.session_bindings.lock();
+            if let Some(bound) = bindings.get_mut(session_id) {
+                bound.pinned = true;
+            }
+        }
+    }
+
+    fn discard(&self, conn: PooledConnection) -> Result<(), PoolError> {
+        if conn.node_id != self.node_id {
+            return Err(PoolError::NodeMismatch);
+        }
+        self.forget_metadata(&conn);
+        self.cleaner.discard(&conn);
+        self.release_known_slot(&conn);
+        Ok(())
+    }
+
+    fn release_session(&self, session_id: &str) -> Vec<PooledConnection> {
+        let connections = match self.mode {
+            PoolMode::Session => {
+                let mut bindings = self.session_bindings.lock();
+                bindings.remove(session_id).into_iter().collect()
+            }
+            PoolMode::Transaction => {
+                let mut pinned = self.pinned_by_session.lock();
+                pinned.remove(session_id).unwrap_or_default()
+            }
+        };
+        for connection in &connections {
+            self.release_known_slot(connection);
+        }
+        self.session_acquire_locks
+            .lock()
+            .remove(session_id);
+        connections
+    }
+
+    fn active_connections(&self) -> i64 {
+        self.active_connections.load(Ordering::SeqCst) as i64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicI32, AtomicU32 as StdAtomicU32};
+    use std::sync::Arc;
+
+    /// An I/O-free test connection factory: each call produces an
+    /// incrementing `backend_pid`.
+    struct CountingFactory {
+        next_pid: AtomicI32,
+        fail: bool,
+    }
+
+    impl CountingFactory {
+        fn new() -> Self {
+            CountingFactory {
+                next_pid: AtomicI32::new(1),
+                fail: false,
+            }
+        }
+    }
+
+    impl ConnFactory for CountingFactory {
+        async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+            if self.fail {
+                return Err(PoolError::ConnectFailed("mock failure".into()));
+            }
+            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            Ok(PooledConnection::new(node_id, pid, pid * 1000))
+        }
+    }
+
+    /// A test cleaner that records the number of times it was invoked.
+    #[derive(Clone)]
+    struct CountingCleaner {
+        clean_calls: Arc<StdAtomicU32>,
+        discard_calls: Arc<StdAtomicU32>,
+    }
+
+    impl CountingCleaner {
+        fn new() -> Self {
+            CountingCleaner {
+                clean_calls: Arc::new(StdAtomicU32::new(0)),
+                discard_calls: Arc::new(StdAtomicU32::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.clean_calls.load(Ordering::SeqCst)
+        }
+
+        fn discard_count(&self) -> u32 {
+            self.discard_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ConnCleaner for CountingCleaner {
+        async fn clean(&self, _conn: &PooledConnection) -> Result<(), PoolError> {
+            self.clean_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn discard(&self, _conn: &PooledConnection) {
+            self.discard_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn session_pool(max: u32) -> NodePool<CountingFactory, CountingCleaner> {
+        NodePool::new("writer", PoolMode::Session, max, CountingFactory::new(), CountingCleaner::new())
+    }
+
+    fn transaction_pool(max: u32) -> NodePool<CountingFactory, CountingCleaner> {
+        NodePool::new("writer", PoolMode::Transaction, max, CountingFactory::new(), CountingCleaner::new())
+    }
+
+    // -----------------------------------------------------------------
+    // Property 24: in Session mode, the same client connection always
+    // reuses the same backend connection
+    // Validates: Requirements 5.1
+    // -----------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn property_24_session_mode_reuses_same_connection(acquire_count in 1usize..20) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let pool = session_pool(10);
+                let first = pool.acquire("session-1").await.unwrap();
+                for _ in 0..acquire_count {
+                    let again = pool.acquire("session-1").await.unwrap();
+                    prop_assert_eq!(&again.node_id, &first.node_id);
+                    prop_assert_eq!(again.backend_pid, first.backend_pid);
+                }
+                Ok(())
+            })?;
+        }
+
+        // -----------------------------------------------------------------
+        // Property 25: in Transaction mode, an unpinned connection can be
+        // reused after being released
+        // Validates: Requirements 5.2
+        // -----------------------------------------------------------------
+        #[test]
+        fn property_25_transaction_mode_reuses_unpinned_connection(_unused in 0..1) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let pool = transaction_pool(10);
+                let conn = pool.acquire("session-1").await.unwrap();
+                let pid = conn.backend_pid;
+                pool.release("session-1", conn).await.unwrap();
+
+                let reacquired = pool.acquire("session-2").await.unwrap();
+                prop_assert_eq!(reacquired.backend_pid, pid);
+                Ok(())
+            })?;
+        }
+
+        // -----------------------------------------------------------------
+        // Property 26: after a connection is released, its dirty state is
+        // correctly reset, and cleanup runs only when necessary
+        // Validates: Requirements 5.3, 5.4
+        // -----------------------------------------------------------------
+        #[test]
+        fn property_26_dirty_reset_and_conditional_cleanup(was_dirty in any::<bool>()) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let cleaner = CountingCleaner::new();
+                let pool = NodePool::new(
+                    "writer",
+                    PoolMode::Transaction,
+                    10,
+                    CountingFactory::new(),
+                    cleaner.clone(),
+                );
+
+                let mut conn = pool.acquire("s1").await.unwrap();
+                conn.dirty = was_dirty;
+                pool.release("s1", conn).await.unwrap();
+
+                let reacquired = pool.acquire("s2").await.unwrap();
+                prop_assert!(!reacquired.dirty);
+
+                if was_dirty {
+                    prop_assert_eq!(cleaner.call_count(), 1);
+                } else {
+                    prop_assert_eq!(cleaner.call_count(), 0);
+                }
+                Ok(())
+            })?;
+        }
+
+        // -----------------------------------------------------------------
+        // Property 27: the number of active connections never exceeds a
+        // node's configured max pool size
+        // Validates: Requirements 5.5
+        // -----------------------------------------------------------------
+        #[test]
+        fn property_27_active_connections_never_exceed_max(
+            max_pool_size in 1u32..10,
+            acquire_attempts in 1usize..30,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let pool = transaction_pool(max_pool_size);
+                let mut held = Vec::new();
+                for i in 0..acquire_attempts {
+                    match pool.acquire(&format!("s{i}")).await {
+                        Ok(conn) => held.push(conn),
+                        Err(PoolError::Exhausted(_)) => {}
+                        Err(e) => return Err(TestCaseError::fail(format!("unexpected error: {e}"))),
+                    }
+                    prop_assert!(pool.active_connections() as u32 <= max_pool_size);
+                }
+                Ok(())
+            })?;
+        }
+
+        // -----------------------------------------------------------------
+        // Property 29: a pinned connection never enters the reusable
+        // queue when released
+        // Validates: Requirements 6.2
+        // -----------------------------------------------------------------
+        #[test]
+        fn property_29_pinned_connection_never_reused(num_extra_acquires in 1usize..10) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let pool = transaction_pool(100);
+                let mut conn = pool.acquire("s1").await.unwrap();
+                let pinned_pid = conn.backend_pid;
+                pool.pin("s1", &mut conn);
+                pool.release("s1", conn).await.unwrap();
+
+                // No matter how many acquire/release cycles happen
+                // afterward, the pinned connection's backend_pid should
+                // never reappear in any acquire result.
+                for i in 0..num_extra_acquires {
+                    let session_id = format!("s-extra-{i}");
+                    let c = pool.acquire(&session_id).await.unwrap();
+                    prop_assert_ne!(c.backend_pid, pinned_pid);
+                    pool.release(&session_id, c).await.unwrap();
+                }
+                Ok(())
+            })?;
+        }
+
+        // -----------------------------------------------------------------
+        // Property 30: a pinned connection is reacquired only by its owner,
+        // and ending that session releases it.
+        // Validates: Requirements 6.2, 6.3
+        // -----------------------------------------------------------------
+        #[test]
+        fn property_30_session_reacquires_then_releases_pinned_connection(
+            reacquire_count in 1usize..8,
+        ) {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let pool = transaction_pool(10);
+                let mut conn = pool.acquire("s1").await.unwrap();
+                let pinned_pid = conn.backend_pid;
+                pool.pin("s1", &mut conn);
+                pool.release("s1", conn).await.unwrap();
+
+                for _ in 0..reacquire_count {
+                    let conn = pool.acquire("s1").await.unwrap();
+                    prop_assert_eq!(conn.backend_pid, pinned_pid);
+                    pool.release("s1", conn).await.unwrap();
+                }
+                prop_assert_eq!(pool.active_connections(), 1);
+
+                let released = pool.release_session("s1");
+                prop_assert_eq!(released.len(), 1);
+                prop_assert_eq!(released[0].backend_pid, pinned_pid);
+                prop_assert_eq!(pool.active_connections(), 0);
+                Ok(())
+            })?;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 11.7 Unit tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn discard_all_statement_is_correct() {
+        assert_eq!(DISCARD_ALL_STATEMENT, "DISCARD ALL");
+    }
+
+    #[test]
+    fn precise_reset_statements_cover_expected_operations() {
+        assert!(PRECISE_RESET_STATEMENTS.contains(&"RESET ALL"));
+        assert!(PRECISE_RESET_STATEMENTS.contains(&"DEALLOCATE ALL"));
+        assert!(PRECISE_RESET_STATEMENTS.contains(&"CLOSE ALL"));
+        assert!(PRECISE_RESET_STATEMENTS.contains(&"UNLISTEN *"));
+        assert!(PRECISE_RESET_STATEMENTS.contains(&"SET SESSION AUTHORIZATION DEFAULT"));
+    }
+
+    #[tokio::test]
+    async fn acquire_returns_exhausted_error_when_pool_is_full() {
+        let pool = transaction_pool(2);
+        let _c1 = pool.acquire("s1").await.unwrap();
+        let _c2 = pool.acquire("s2").await.unwrap();
+        let result = pool.acquire("s3").await;
+        assert!(matches!(result, Err(PoolError::Exhausted(ref n)) if n == "writer"));
+    }
+
+    #[tokio::test]
+    async fn session_mode_release_is_noop_until_session_ends() {
+        let pool = session_pool(1);
+        let conn = pool.acquire("s1").await.unwrap();
+        pool.release("s1", conn).await.unwrap();
+        // The connection should still be bound to s1 (release is a no-op).
+        let again = pool.acquire("s1").await.unwrap();
+        assert_eq!(again.backend_pid, 1);
+        assert_eq!(pool.active_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_acquires_wait_for_and_reuse_one_binding() {
+        struct SlowFactory {
+            next_pid: AtomicI32,
+        }
+
+        impl ConnFactory for SlowFactory {
+            async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+                // Keep the first acquire in flight long enough for the second
+                // one to observe the same session before the binding exists.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+                Ok(PooledConnection::new(node_id, pid, pid * 1000))
+            }
+        }
+
+        let cleaner = CountingCleaner::new();
+        let pool = Arc::new(NodePool::new(
+            "writer",
+            PoolMode::Session,
+            1,
+            SlowFactory {
+                next_pid: AtomicI32::new(1),
+            },
+            cleaner.clone(),
+        ));
+
+        let first_pool = pool.clone();
+        let second_pool = pool.clone();
+        let (first, second) = tokio::join!(
+            async move { first_pool.acquire("same-session").await.unwrap() },
+            async move { second_pool.acquire("same-session").await.unwrap() }
+        );
+
+        assert_eq!(first.backend_pid, second.backend_pid);
+        assert_eq!(pool.session_bindings.lock().len(), 1);
+        assert_eq!(cleaner.discard_count(), 0, "no duplicate socket should be created");
+        assert_eq!(pool.active_connections(), 1);
+
+        let released = pool.release_session("same-session");
+        assert_eq!(released.len(), 1);
+        assert_eq!(pool.active_connections(), 0);
+        assert!(!pool.session_acquire_locks.lock().contains_key("same-session"));
+    }
+
+    #[tokio::test]
+    async fn release_session_frees_session_mode_slot() {
+        let pool = session_pool(1);
+        let _conn = pool.acquire("s1").await.unwrap();
+        assert_eq!(pool.active_connections(), 1);
+        let released = pool.release_session("s1");
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].backend_pid, 1);
+        assert_eq!(pool.active_connections(), 0);
+
+        // Once the slot is freed, a new connection can be established for
+        // a new session.
+        let conn2 = pool.acquire("s2").await.unwrap();
+        assert_eq!(conn2.backend_pid, 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_connection_not_returned_to_idle_queue() {
+        let pool = transaction_pool(5);
+        let mut conn = pool.acquire("s1").await.unwrap();
+        pool.pin("s1", &mut conn);
+        assert!(conn.pinned);
+        pool.release("s1", conn).await.unwrap();
+
+        // No reusable idle connection in the pool (the pinned connection
+        // was never enqueued), so a new connection must be established.
+        let next = pool.acquire("s2").await.unwrap();
+        assert_eq!(next.backend_pid, 2); // not the pinned pid=1
+    }
+
+    #[tokio::test]
+    async fn release_session_frees_pinned_transaction_connections() {
+        let pool = transaction_pool(2);
+        let mut conn = pool.acquire("s1").await.unwrap();
+        pool.pin("s1", &mut conn);
+        pool.release("s1", conn).await.unwrap();
+        assert_eq!(pool.active_connections(), 1);
+
+        let released = pool.release_session("s1");
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].backend_pid, 1);
+        assert_eq!(pool.active_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn discard_frees_slot_and_never_returns_connection_to_idle_queue() {
+        let pool = transaction_pool(1);
+        let conn = pool.acquire("s1").await.unwrap();
+        let stale_clone = conn.clone();
+        pool.discard(conn).unwrap();
+        assert_eq!(pool.active_connections(), 0);
+
+        // A stale duplicate discard must not underflow slot accounting.
+        pool.discard(stale_clone).unwrap();
+        assert_eq!(pool.active_connections(), 0);
+
+        let replacement = pool.acquire("s2").await.unwrap();
+        assert_eq!(replacement.backend_pid, 2);
+    }
+
+    #[tokio::test]
+    async fn connection_creation_timeout_frees_reserved_slot() {
+        struct SlowFactory;
+        impl ConnFactory for SlowFactory {
+            async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(PooledConnection::new(node_id, 1, 1000))
+            }
+        }
+
+        let pool = NodePool::with_settings(
+            "writer",
+            PoolMode::Transaction,
+            1,
+            NodePoolSettings {
+                connection_timeout: Duration::from_millis(5),
+                ..NodePoolSettings::default()
+            },
+            SlowFactory,
+            CountingCleaner::new(),
+        );
+
+        let result = pool.acquire("s1").await;
+        assert!(matches!(
+            result,
+            Err(PoolError::ConnectTimeout {
+                ref node_id,
+                timeout_ms: 5
+            }) if node_id == "writer"
+        ));
+        assert_eq!(pool.active_connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn warm_up_creates_configured_minimum_idle_connections() {
+        let pool = NodePool::with_settings(
+            "writer",
+            PoolMode::Transaction,
+            5,
+            NodePoolSettings {
+                min_pool_size: 3,
+                ..NodePoolSettings::default()
+            },
+            CountingFactory::new(),
+            CountingCleaner::new(),
+        );
+
+        pool.warm_up().await.unwrap();
+        assert_eq!(pool.active_connections(), 3);
+        assert_eq!(pool.idle.lock().len(), 3);
+
+        let first = pool.acquire("s1").await.unwrap();
+        let second = pool.acquire("s2").await.unwrap();
+        let third = pool.acquire("s3").await.unwrap();
+        assert_eq!(
+            [first.backend_pid, second.backend_pid, third.backend_pid],
+            [1, 2, 3]
+        );
+        assert_eq!(pool.active_connections(), 3);
+    }
+
+    #[tokio::test]
+    async fn expired_idle_connection_is_discarded_before_reuse() {
+        let cleaner = CountingCleaner::new();
+        let pool = NodePool::with_settings(
+            "writer",
+            PoolMode::Transaction,
+            2,
+            NodePoolSettings {
+                max_idle_time: Duration::from_secs(1),
+                max_lifetime: Duration::from_secs(60),
+                ..NodePoolSettings::default()
+            },
+            CountingFactory::new(),
+            cleaner.clone(),
+        );
+
+        let conn = pool.acquire("s1").await.unwrap();
+        pool.release("s1", conn).await.unwrap();
+        pool.idle.lock().front_mut().unwrap().idle_since =
+            Some(Instant::now() - Duration::from_secs(2));
+
+        let replacement = pool.acquire("s2").await.unwrap();
+        assert_eq!(replacement.backend_pid, 2);
+        assert_eq!(cleaner.discard_count(), 1);
+        assert_eq!(pool.active_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn over_lifetime_idle_connection_is_discarded_before_reuse() {
+        let cleaner = CountingCleaner::new();
+        let pool = NodePool::with_settings(
+            "writer",
+            PoolMode::Transaction,
+            2,
+            NodePoolSettings {
+                max_idle_time: Duration::from_secs(60),
+                max_lifetime: Duration::from_secs(1),
+                ..NodePoolSettings::default()
+            },
+            CountingFactory::new(),
+            cleaner.clone(),
+        );
+
+        let mut conn = pool.acquire("s1").await.unwrap();
+        conn.created_at = Instant::now() - Duration::from_secs(2);
+        pool.release("s1", conn).await.unwrap();
+
+        let replacement = pool.acquire("s2").await.unwrap();
+        assert_eq!(replacement.backend_pid, 2);
+        assert_eq!(cleaner.discard_count(), 1);
+        assert_eq!(pool.active_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_drops_connection_and_frees_slot() {
+        struct FailingCleaner;
+        impl ConnCleaner for FailingCleaner {
+            async fn clean(&self, _conn: &PooledConnection) -> Result<(), PoolError> {
+                Err(PoolError::CleanupFailed("boom".into()))
+            }
+        }
+
+        let pool = NodePool::new(
+            "writer",
+            PoolMode::Transaction,
+            5,
+            CountingFactory::new(),
+            FailingCleaner,
+        );
+        let mut conn = pool.acquire("s1").await.unwrap();
+        conn.dirty = true;
+        let result = pool.release("s1", conn).await;
+        assert!(matches!(result, Err(PoolError::CleanupFailed(_))));
+        assert_eq!(pool.active_connections(), 0); // the slot was freed and the connection was discarded
+    }
+}

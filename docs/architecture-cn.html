@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trident - 架构与路由流程</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg: #f8f9fa;
+  --card-bg: #ffffff;
+  --border: #e2e8f0;
+  --text: #1a202c;
+  --muted: #64748b;
+  --accent: #2563eb;
+  --accent-light: #eff6ff;
+  --writer: #dc2626;
+  --reader: #16a34a;
+  --analytics: #9333ea;
+  --aurora: #ea580c;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  padding: 2rem;
+}
+h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; border-bottom: 2px solid var(--accent); padding-bottom: 0.3rem; }
+h3 { font-size: 1.15rem; margin: 1.5rem 0 0.5rem; color: var(--accent); }
+.subtitle { color: var(--muted); margin-bottom: 2rem; }
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.card-title { font-weight: 600; margin-bottom: 0.75rem; }
+.mermaid { margin: 1rem 0; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
+th, td { border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; }
+th { background: var(--accent-light); font-weight: 600; }
+tr:nth-child(even) { background: #f1f5f9; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #fff;
+}
+.badge-writer { background: var(--writer); }
+.badge-reader { background: var(--reader); }
+.badge-analytics { background: var(--analytics); }
+.badge-aurora { background: var(--aurora); }
+code {
+  background: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.85em;
+}
+.note {
+  background: #fffbeb;
+  border-left: 4px solid #f59e0b;
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9rem;
+}
+.toc { margin: 1rem 0 2rem; }
+.toc a { color: var(--accent); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.toc ul { list-style: none; padding-left: 1rem; }
+.toc > ul { padding-left: 0; }
+.toc li { margin: 0.25rem 0; }
+@media (max-width: 768px) {
+  body { padding: 1rem; }
+  h1 { font-size: 1.5rem; }
+}
+</style>
+</head>
+<body>
+
+<h1>Trident 架构与路由流程</h1>
+<p class="subtitle">PostgreSQL 智能读写分离代理 - 内部技术文档</p>
+
+<nav class="toc card">
+<p class="card-title">目录</p>
+<ul>
+  <li><a href="#arch">1. 整体架构</a></li>
+  <li><a href="#components">2. 核心组件</a></li>
+  <li><a href="#routing">3. 路由决策流程</a></li>
+  <li><a href="#lsn">4. LSN 跟踪模式</a>
+    <ul>
+      <li><a href="#pipeline">4.1 Pipeline 模式</a></li>
+      <li><a href="#extension">4.2 Extension 模式</a></li>
+      <li><a href="#aurora">4.3 Aurora Write Forwarding 模式</a></li>
+      <li><a href="#auto">4.4 Auto 模式</a></li>
+    </ul>
+  </li>
+  <li><a href="#txsplit">5. 事务拆分状态机</a></li>
+  <li><a href="#lifecycle">6. 连接生命周期</a></li>
+  <li><a href="#comparison">7. 模式对比</a></li>
+</ul>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="arch">1. 整体架构</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<div class="mermaid">
+graph TB
+    subgraph Clients["客户端"]
+        C1[App 1]
+        C2[App 2]
+        C3[App N]
+    end
+
+    subgraph Trident["Trident Proxy"]
+        direction TB
+        Listener["TCP Listener<br/><code>proxy.listen_addr</code>"]
+        Handler["Connection Handler<br/>(per session)"]
+        Router["Router<br/>SQL分类 + Hint + Cost + 一致性"]
+        Pool["Pool Manager<br/>(per node)"]
+        Health["Health Checker<br/>(周期性探活)"]
+        LSN["LSN Tracker<br/>(Session/Global)"]
+        Admin["Admin HTTP<br/>/metrics /healthz"]
+    end
+
+    subgraph Backends["PostgreSQL 后端"]
+        W[(Writer<br/>Primary)]
+        R1[(Reader 1)]
+        R2[(Reader 2)]
+        A[(Analytics)]
+    end
+
+    C1 & C2 & C3 -->|"PG Wire Protocol<br/>(Simple Query)"| Listener
+    Listener --> Handler
+    Handler --> Router
+    Handler --> Pool
+    Router -.->|"snapshot"| Health
+    Pool -->|"acquire/release"| W & R1 & R2 & A
+    Health -->|"SELECT 1 / LSN / lag"| W & R1 & R2 & A
+    Handler -->|"record_write"| LSN
+    Admin -.->|"Prometheus metrics"| Health
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="components">2. 核心组件</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<table>
+<tr><th>组件</th><th>职责</th><th>关键接口</th></tr>
+<tr><td><strong>ConnectionHandler</strong></td><td>单客户端会话全生命周期：Startup → 消息循环 → 清理</td><td><code>handle()</code></td></tr>
+<tr><td><strong>Router</strong></td><td>串联 Hint → 事务状态 → SQL分类 → Cost → 一致性检查 → 负载均衡</td><td><code>route(sql, ctx, readers, analytics)</code></td></tr>
+<tr><td><strong>PoolManager</strong></td><td>按节点管理连接池，Session/Transaction 两种模式</td><td><code>pool_for(node_id)</code>, <code>snapshot()</code></td></tr>
+<tr><td><strong>HealthChecker</strong></td><td>周期性并发探活，连续3次规则触发状态翻转</td><td><code>check_once()</code>, <code>run()</code></td></tr>
+<tr><td><strong>LsnTracker</strong></td><td>Session 级 + Global 级 WAL 水位单调维护</td><td><code>record_write()</code>, <code>session_write_lsn()</code></td></tr>
+<tr><td><strong>Forwarder</strong></td><td>流式消息转发，Pipeline LSN 获取，Extension GUC 捕获</td><td><code>forward_simple_query_with_options()</code></td></tr>
+<tr><td><strong>CancelRegistry</strong></td><td>CANCEL 请求的 key→session→backend 映射</td><td><code>resolve_cancel_target()</code></td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="routing">3. 路由决策流程</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<p class="card-title">Router.route() 完整决策链</p>
+<div class="mermaid">
+flowchart TD
+    Start([收到 Simple Query]) --> Multi{包含多条语句?}
+    Multi -->|Yes| WR1[<span class='badge badge-writer'>Writer</span><br/>多语句保守路由]
+    Multi -->|No| Hint{解析 Hint 注释}
+
+    Hint -->|ROUTE_TO_WRITER| WR2[<span class='badge badge-writer'>Writer</span>]
+    Hint -->|ROUTE_TO_READER| RD1[<span class='badge badge-reader'>Reader</span><br/>直接选择]
+    Hint -->|ROUTE_TO_ANALYTICS| AN1[<span class='badge badge-analytics'>Analytics</span>]
+    Hint -->|CONSISTENCY hint| SetC[覆盖会话一致性] --> TxCheck
+    Hint -->|No hint| TxCheck
+
+    TxCheck{显式事务中?}
+    TxCheck -->|Yes| Split[事务拆分状态机<br/>见第5节]
+    TxCheck -->|No| Classify
+
+    Classify{SQL 分类}
+    Classify -->|"Write / DDL / FOR UPDATE<br/>写函数调用"| WR3[<span class='badge badge-writer'>Writer</span>]
+    Classify -->|"SELECT / SHOW / EXPLAIN"| CustomRule
+
+    CustomRule{自定义路由规则?}
+    CustomRule -->|匹配 writer-only 规则| WR4[<span class='badge badge-writer'>Writer</span>]
+    CustomRule -->|无匹配或 reader 规则| Cost
+
+    Cost{Cost-based<br/>路由启用?}
+    Cost -->|"cost > threshold"| AN2[<span class='badge badge-analytics'>Analytics</span>]
+    Cost -->|"cost <= threshold"| Consist
+
+    Consist{一致性检查<br/>Session/Global}
+    Consist -->|有合格 Reader| Balance[负载均衡选择]
+    Consist -->|无合格 Reader| Fallback{writer_readable?}
+
+    Balance --> RD2[<span class='badge badge-reader'>Reader</span>]
+    Fallback -->|true| WR5[<span class='badge badge-writer'>Writer</span><br/>fallback]
+    Fallback -->|false| ERR[返回 SQLSTATE 57P03]
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="lsn">4. LSN 跟踪模式</h2>
+<!-- ============================================================ -->
+
+<h3 id="pipeline">4.1 Pipeline 模式</h3>
+
+<div class="card">
+<p class="card-title">双 Query Frame — 零额外网络往返</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer)
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    Note over T: 检测到自提交写语句<br/>pipeline_safe_sql = true
+
+    T->>B: [TCP write_all]<br/>Query Frame 1: INSERT INTO t VALUES (1)<br/>Query Frame 2: SELECT pg_current_wal_lsn()
+
+    Note over B: 处理 Frame 1<br/>执行 INSERT (autocommit)
+
+    B->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+    B->>T: ReadyForQuery(Idle)
+    Note over T: 暂存 RFQ，不转发
+
+    Note over B: 处理 Frame 2<br/>此时 INSERT 已提交
+
+    B->>T: DataRow("16/B374D848")
+    B->>T: CommandComplete("SELECT 1")
+    B->>T: ReadyForQuery(Idle)
+    Note over T: 解析 LSN = 0x16B374D848<br/>record_write(session, lsn)<br/>吞掉内部响应
+
+    T->>C: ReadyForQuery(Idle)
+    Note over C: 收到完整正常响应<br/>不感知内部 LSN 查询
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Pipeline COMMIT 路径（显式事务）</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer)
+
+    Note over T: 事务中已有写操作<br/>tx_has_writes = true
+
+    C->>T: Query("COMMIT")
+    Note over T: commit_attempt = true<br/>pipeline_safe_sql("COMMIT") = true
+
+    T->>B: [write_all]<br/>Query("COMMIT") + Query("SELECT pg_current_wal_lsn()")
+
+    B->>T: CommandComplete("COMMIT")
+    T->>C: CommandComplete("COMMIT")
+    B->>T: ReadyForQuery(Idle)
+
+    B->>T: DataRow("16/B374D848")
+    B->>T: CommandComplete("SELECT 1")
+    B->>T: ReadyForQuery(Idle)
+    Note over T: LSN captured, pending_write = false
+
+    T->>C: ReadyForQuery(Idle)
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Pipeline Timeout / 降级路径</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer)
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    T->>B: Query("INSERT...") + Query("SELECT pg_current_wal_lsn()")
+
+    B->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+    B->>T: ReadyForQuery(Idle)
+
+    Note over T: 等待内部 LSN 响应...<br/>internal_query_timeout_ms = 100
+
+    Note over T,B: TIMEOUT! 100ms 无响应
+
+    Note over T: connection_reusable = false<br/>pending_write = true<br/>discard 后端连接
+
+    T->>C: ReadyForQuery(Idle)
+    Note over C: 用户写成功不受影响
+
+    Note over T: 下次路由到 Reader 前<br/>Lazy Fetch 补取 LSN
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Lazy Fallback 补水位</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant W as Writer Pool
+    participant R as Reader
+
+    Note over T: pending_write = true<br/>Router 决策 → Reader
+
+    T->>W: acquire() → 获取 Writer 连接
+    T->>W: SELECT pg_current_wal_lsn()
+    W->>T: DataRow("16/B374D848")
+    Note over T: record_write(session, lsn)<br/>pending_write = false
+
+    T->>W: release() → 归还 Writer
+
+    Note over T: 重新执行 Router.route()<br/>使用刷新后的 session_write_lsn
+
+    T->>R: Query("SELECT ...")（路由到 Reader）
+    R->>T: RowDescription + DataRow + ...
+    T->>C: 流式转发结果
+</div>
+</div>
+
+<h3 id="extension">4.2 Extension 模式</h3>
+
+<div class="card">
+<p class="card-title">ParameterStatus GUC 上报 — 零额外查询</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer + Extension)
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    T->>B: Query("INSERT INTO t VALUES (1)")
+
+    B->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+
+    B->>T: ParameterStatus("lsn_tracker.last_lsn", "16/B374D848")
+    Note over T: 匹配 extension.guc_name<br/>解析 LSN = 0x16B374D848<br/>record_write(session, lsn)<br/>不转发给客户端
+
+    B->>T: ReadyForQuery(Idle)
+    T->>C: ReadyForQuery(Idle)
+
+    Note over C: 完全无感知<br/>零额外开销
+</div>
+</div>
+
+<h3 id="aurora">4.3 Aurora Write Forwarding 模式</h3>
+
+<div class="card">
+<p class="card-title">所有 SQL 发往固定 Reader，Aurora 内核管理一致性</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant R as Aurora Reader (固定)
+    participant W as Aurora Writer
+
+    Note over T: 首次请求: 选择健康 Reader<br/>aurora_node_id = "reader-1"
+
+    T->>R: SET apg_write_forward.consistency_mode = 'SESSION'
+    R->>T: CommandComplete("SET")
+    Note over T: aurora_initialized_backend_pid = PID
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    T->>R: Query("INSERT INTO t VALUES (1)")
+    Note over R: Aurora 内核检测到写语句<br/>转发到 Writer
+    R->>W: (内部转发 INSERT)
+    W->>R: (返回结果)
+    R->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+    R->>T: ReadyForQuery(Idle)
+    T->>C: ReadyForQuery(Idle)
+
+    C->>T: Query("SELECT * FROM t WHERE id = 1")
+    T->>R: Query("SELECT ...")
+    Note over R: Aurora SESSION 一致性<br/>等待本 session 的写可见后执行
+    R->>T: RowDescription + DataRow + CommandComplete
+    T->>C: 流式转发
+
+    Note over T: 不追踪 LSN<br/>不做读写路由判断<br/>不使用 Router
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Aurora 模式动态一致性切换</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant R as Aurora Reader (固定)
+
+    C->>T: Query("SET trident.consistency = 'global'")
+    Note over T: 拦截并翻译
+
+    T->>R: Query("SET apg_write_forward.consistency_mode = 'GLOBAL'")
+    R->>T: CommandComplete("SET")
+    T->>C: CommandComplete("SET")
+    R->>T: ReadyForQuery(Idle)
+    T->>C: ReadyForQuery(Idle)
+
+    Note over T: session.consistency = Global<br/>后续查询使用 GLOBAL 一致性
+</div>
+</div>
+
+<h3 id="auto">4.4 Auto 模式（默认）</h3>
+
+<div class="card">
+<p class="card-title">Auto 检测逻辑：Pipeline → Extension 自动切换</p>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Pipeline: 会话开始
+
+    Pipeline --> Pipeline: 写语句 (无 ParameterStatus)
+    Pipeline --> Extension: 观察到 guc_name<br/>的 ParameterStatus
+
+    Extension --> Extension: 后续所有写语句<br/>不再追加内部查询
+
+    Note right of Pipeline: 初始使用双 Query Frame<br/>获取 commit-time LSN
+    Note right of Extension: 切换后零额外开销<br/>按 session 粒度，不可回退
+</div>
+
+<div class="note">
+<strong>注意</strong>：Auto 模式永远不会自动选择 Aurora Write Forwarding。
+原因是 <code>SHOW apg_write_forward.consistency_mode</code> 能返回值不代表 Write Forwarding 真的已启用——
+可靠检测需要查 AWS 控制面 API，SQL 层面无法判定。Aurora 模式必须由运维显式配置。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="txsplit">5. 事务拆分状态机</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<p class="card-title">Transaction Split 路由决策</p>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Pending: BEGIN (客户端)<br/>Trident 合成 BEGIN 响应<br/>不占用后端连接
+
+    Pending --> TX_READING: 首条语句是 READ<br/>且一致性检查通过
+    Pending --> TX_WRITING: 首条语句是 WRITE<br/>或一致性检查失败<br/>或 RR/SERIALIZABLE
+
+    TX_READING --> TX_READING: 后续 READ
+    TX_READING --> Upgrading: 遇到 WRITE 语句
+
+    Upgrading --> TX_WRITING: ROLLBACK Reader<br/>discard Reader 连接<br/>BEGIN on Writer<br/>执行 WRITE
+
+    TX_WRITING --> TX_WRITING: 后续所有语句<br/>(不回退)
+
+    TX_READING --> [*]: COMMIT / ROLLBACK
+    TX_WRITING --> [*]: COMMIT / ROLLBACK
+    Pending --> [*]: COMMIT / ROLLBACK<br/>(本地合成，无需后端)
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">事务拆分 + LSN Pipeline 完整流程</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant R as Reader
+    participant W as Writer
+
+    C->>T: BEGIN
+    Note over T: 合成响应，不占用后端
+    T->>C: CommandComplete("BEGIN") + RFQ(T)
+
+    C->>T: SELECT * FROM orders
+    Note over T: 路由决策 → Reader<br/>延迟的 BEGIN 与首语句<br/>pipeline 合并为一次往返
+    T->>R: BEGIN READ COMMITTED
+    T->>R: SELECT * FROM orders
+    R->>T: 结果集
+    T->>C: 流式转发
+
+    C->>T: UPDATE orders SET status = 'paid'
+    Note over T: 写语句！触发升级
+
+    T->>R: ROLLBACK
+    Note over T: discard Reader 连接
+
+    T->>W: BEGIN READ COMMITTED
+    T->>W: UPDATE orders SET status = 'paid'
+    W->>T: CommandComplete("UPDATE 1")
+    T->>C: CommandComplete("UPDATE 1") + RFQ(T)
+    Note over T: tx_has_writes = true
+
+    C->>T: COMMIT
+    Note over T: commit_attempt = true<br/>追加 LSN Pipeline
+
+    T->>W: Query("COMMIT") + Query("SELECT pg_current_wal_lsn()")
+    W->>T: CommandComplete("COMMIT") + RFQ(I)
+    T->>C: CommandComplete("COMMIT")
+    W->>T: DataRow("16/B374D848") + RFQ(I)
+    Note over T: record_write(session, lsn)
+    T->>C: ReadyForQuery(Idle)
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="lifecycle">6. 连接生命周期</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<p class="card-title">单客户端连接完整生命周期</p>
+<div class="mermaid">
+flowchart TD
+    Accept[TCP Accept] --> SSL{SSLRequest?}
+    SSL -->|Yes| RejectSSL["回复 'N'"] --> SSL
+    SSL -->|No / GssEnc| Startup{StartupMessage?}
+
+    Startup -->|CancelRequest| Cancel[handle_cancel_request<br/>查找映射 → 转发/忽略] --> Close
+
+    Startup -->|StartupMessage| Auth[Trust Authentication<br/>发送 AuthOk + Params + KeyData + RFQ]
+
+    Auth --> Loop{消息循环}
+
+    Loop -->|Query| Route[路由决策 + 获取连接]
+    Loop -->|Terminate| Cleanup
+    Loop -->|Parse/Bind/Describe/<br/>Execute/Close| Batch["加入 extended_batch<br/>(上限 4096 条)"]
+    Loop -->|Sync| HasBatch{batch 非空?}
+
+    Batch --> Loop
+    HasBatch -->|No| SyncRFQ[返回 ReadyForQuery]
+    HasBatch -->|Yes| RouteExt[handle_extended_query_batch<br/>按首个 Parse 的 SQL 分类路由<br/>/ 已记录的 named statement 路由<br/>/ 已持有连接]
+
+    Route --> Forward[forward_simple_query_with_options]
+    Forward --> LSNUpdate{写提交?}
+    LSNUpdate -->|Yes| RecordLSN[Pipeline/Extension<br/>record_write]
+    LSNUpdate -->|No| ReturnConn
+
+    RouteExt --> ForwardExt[整批 + Sync 一次性转发<br/>zero-copy 流式回传响应]
+    ForwardExt --> PinCheck{named Parse?}
+    PinCheck -->|Yes| Pin[pin 物理连接到会话]
+    PinCheck -->|No| ExtLSN
+    Pin --> ExtLSN{写提交?}
+    ExtLSN -->|Yes| ExtPending[pending_write = true]
+    ExtLSN -->|No| ReturnConn
+    ExtPending --> ReturnConn
+
+    RecordLSN --> ReturnConn[归还/保持连接]
+    ReturnConn --> SendRFQ[send_ready_for_query] --> Loop
+
+    Cleanup[Session Cleanup]
+    Cleanup --> DiscardHeld[discard held_backend]
+    Cleanup --> ReleasePool[release_session 所有 pool]
+    Cleanup --> RemoveLSN[lsn_tracker.remove_session]
+    Cleanup --> UnregCancel[unregister cancel key]
+    Cleanup --> Close([连接关闭])
+
+    SyncRFQ --> Loop
+</div>
+</div>
+
+<div class="note">
+<strong>注意</strong>：Extended Query 批次的路由决策不做逐语句耗时统计——
+<code>trident_query_duration_ms</code>、<code>trident_slow_queries_total</code>
+及管理控制台"慢查询"页目前只覆盖 Simple Query 路径（见 DEPLOYMENT.md 第 4 节）。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="comparison">7. 模式对比</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<table>
+<tr>
+  <th></th>
+  <th><span class="badge badge-writer">Pipeline</span></th>
+  <th><span class="badge badge-reader">Extension</span></th>
+  <th><span class="badge badge-aurora">Aurora WF</span></th>
+</tr>
+<tr>
+  <td><strong>适用后端</strong></td>
+  <td>任何 PostgreSQL</td>
+  <td>装了 LSN 上报扩展的 PG</td>
+  <td>Aurora PG (WF 已启用)</td>
+</tr>
+<tr>
+  <td><strong>额外网络往返</strong></td>
+  <td>0 (同一 write_all)</td>
+  <td>0</td>
+  <td>0 (不追踪 LSN)</td>
+</tr>
+<tr>
+  <td><strong>额外延迟</strong></td>
+  <td>~10-50&mu;s (内部查询执行)</td>
+  <td>0</td>
+  <td>0 (代理侧)</td>
+</tr>
+<tr>
+  <td><strong>写路径</strong></td>
+  <td>Proxy → Writer 直连</td>
+  <td>Proxy → Writer 直连</td>
+  <td>Proxy → Reader → Writer 转发</td>
+</tr>
+<tr>
+  <td><strong>一致性保证者</strong></td>
+  <td>Trident (LSN 比对)</td>
+  <td>Trident (LSN 比对)</td>
+  <td>Aurora 存储层</td>
+</tr>
+<tr>
+  <td><strong>Proxy 复杂度</strong></td>
+  <td>高 (双 frame + timeout + lazy)</td>
+  <td>中 (GUC 捕获)</td>
+  <td>极低 (纯转发)</td>
+</tr>
+<tr>
+  <td><strong>连接池模式</strong></td>
+  <td>Transaction / Session</td>
+  <td>Transaction / Session</td>
+  <td>仅 Session</td>
+</tr>
+<tr>
+  <td><strong>事务拆分</strong></td>
+  <td>支持</td>
+  <td>支持</td>
+  <td>不支持 (绕过 Router)</td>
+</tr>
+<tr>
+  <td><strong>降级行为</strong></td>
+  <td>Timeout → pending_write → Lazy</td>
+  <td>无扩展 → Auto 退回 Pipeline</td>
+  <td>Reader 不健康 → 报错</td>
+</tr>
+<tr>
+  <td><strong>SERIALIZABLE</strong></td>
+  <td>支持</td>
+  <td>支持</td>
+  <td>不支持</td>
+</tr>
+<tr>
+  <td><strong>DDL / COPY</strong></td>
+  <td>支持 (走 Writer)</td>
+  <td>支持 (走 Writer)</td>
+  <td>不支持 (Aurora 限制)</td>
+</tr>
+</table>
+</div>
+
+<div class="card">
+<p class="card-title">配置示例</p>
+<pre style="background:#f1f5f9; padding:1rem; border-radius:4px; overflow-x:auto; font-size:0.85rem;"><code># Pipeline (默认，无需额外配置)
+lsn_tracking:
+  mode: auto
+  pipeline:
+    internal_query_timeout_ms: 100
+    lazy_fallback: true
+  extension:
+    guc_name: "lsn_tracker.last_lsn"
+
+# ─── 或显式 Extension ───
+lsn_tracking:
+  mode: extension
+  extension:
+    guc_name: "lsn_tracker.last_lsn"
+
+# ─── 或 Aurora Write Forwarding ───
+lsn_tracking:
+  mode: aurora_write_forwarding
+
+pool:
+  mode: session          # Aurora WF 强制要求
+
+routing:
+  default_consistency: session  # 映射为 Aurora 的 SESSION 一致性</code></pre>
+</div>
+
+<div class="card">
+<p class="card-title">选型决策树</p>
+<div class="mermaid">
+flowchart TD
+    Start([选择 LSN 模式]) --> AuroraQ{使用 Aurora PG<br/>且已启用 WF?}
+
+    AuroraQ -->|Yes| AcceptLimit{能接受:<br/>- 额外写延迟<br/>- 无 DDL/COPY<br/>- 无 SERIALIZABLE<br/>- Session pool only}
+    AcceptLimit -->|Yes| Aurora[<span class='badge badge-aurora'>aurora_write_forwarding</span><br/>最简架构]
+    AcceptLimit -->|No| Pipeline
+
+    AuroraQ -->|No| ExtQ{后端装了<br/>LSN 扩展?}
+    ExtQ -->|Yes| Extension[<span class='badge badge-reader'>extension</span><br/>零开销]
+    ExtQ -->|No| Pipeline[<span class='badge badge-writer'>pipeline / auto</span><br/>通用方案]
+</div>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'neutral',
+  sequence: { mirrorActors: false, messageMargin: 40 },
+  flowchart: { curve: 'basis', htmlLabels: true }
+});
+</script>
+</body>
+</html>

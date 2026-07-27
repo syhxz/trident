@@ -1,0 +1,193 @@
+proxy:
+  listen_addr: "0.0.0.0:6432"
+  max_clients: 2000
+  # Client protocol boundary:
+  # - Trident currently accepts PostgreSQL startup without validating a
+  #   client password. Keep this listener on a trusted network or put an
+  #   authenticated TCP proxy in front of it.
+  # - Only Simple Query (`Q`) is supported. Parse/Bind/Describe/Execute
+  #   return SQLSTATE 0A000; the connection recovers after Sync.
+  # - SSLRequest/GSSENCRequest receive `N` and startup continues in
+  #   plaintext. Trident does not terminate client TLS or GSS encryption.
+
+nodes:
+  # `password` is optional (see DEPLOYMENT.md 第 2 节). It is used by both
+  # pooled backend connections and health probes. PostgreSQL Cleartext,
+  # MD5, and SCRAM-SHA-256 password authentication are supported.
+  # Two ways to avoid plaintext here:
+  # - "${ENV_VAR}" placeholder (used below): resolved from the process
+  #   environment at load time, e.g. export TRIDENT_PRIMARY_PASSWORD=... .
+  # - omit the field entirely: looked up from a .pgpass-format file
+  #   (PGPASSFILE env var, or ~/.pgpass) by host/port/database/username,
+  #   matching libpq's own convention.
+  - name: primary
+    host: 10.0.1.10
+    port: 5432
+    type: writer
+    weight: 1
+    database: mydb
+    username: proxy_user
+    password: "${TRIDENT_PRIMARY_PASSWORD}"
+
+  - name: reader-1
+    host: 10.0.1.11
+    port: 5432
+    type: reader
+    weight: 5
+    database: mydb
+    username: proxy_user
+    password: "${TRIDENT_READER1_PASSWORD}"
+
+  - name: reader-2
+    host: 10.0.1.12
+    port: 5432
+    type: reader
+    weight: 3
+    database: mydb
+    username: proxy_user
+    password: "${TRIDENT_READER2_PASSWORD}"
+
+  - name: analytics-1
+    host: 10.0.1.20
+    port: 5432
+    type: analytics
+    weight: 1
+    database: mydb
+    username: proxy_user
+    password: "${TRIDENT_ANALYTICS1_PASSWORD}"
+
+routing:
+  default_consistency: session
+  load_balance_strategy: weighted_round_robin
+  # When enabled, BEGIN is acknowledged locally and sent to the backend
+  # only with the first statement. Read-first transactions may start on a
+  # Reader; the first write rolls that backend transaction back, switches
+  # to the Writer, and begins there. The chosen physical connection stays
+  # pinned through COMMIT/ROLLBACK (or failed-transaction recovery).
+  enable_transaction_split: true
+  # Apply normal session/global consistency eligibility checks before a
+  # split transaction is allowed to start on a Reader.
+  split_respects_consistency: true
+  enable_hint_routing: true
+  enable_cost_routing: true
+  cost_threshold: 50000
+  analytics_patterns:
+    - "SELECT.*FROM\\s+(fact_|dim_|dw_)"
+    - "SELECT.*GROUP BY.*HAVING"
+  # If false, reads never fall back to Writer. When no eligible Reader is
+  # available, the client receives SQLSTATE 57P03 instead.
+  writer_readable: true
+  max_replication_lag_ms: 1000
+  # Any Simple Query containing multiple top-level SQL statements is
+  # always sent to the Writer, even if the first statement or a hint looks
+  # read-only.
+  # Custom per-table/per-function routing overrides (see DEPLOYMENT.md).
+  # Optional; omit entirely for no behavior change. `_type`: t=table,
+  # f=function. `rw_mode`: w=writer-only (forces Writer even for an
+  # otherwise-readable query referencing this name), r=reader-eligible
+  # (lifts a previous writer-only restriction; does not force Reader).
+  # custom_rules:
+  #   - _name: sensitive_table
+  #     _type: t
+  #     rw_mode: w
+  #   - _name: my_reporting_func
+  #     _type: f
+  #     rw_mode: r
+
+lsn_tracking:
+  # Restart-only: changes under lsn_tracking are not applied by hot reload.
+  # `auto` can automatically select Extension only when that integration is
+  # available; otherwise it uses Pipeline. A GUC alone cannot prove that
+  # Aurora write forwarding is enabled, so Aurora is never auto-selected.
+  # Select `aurora_write_forwarding` explicitly only after write forwarding
+  # has been enabled in the AWS control plane. That mode also requires
+  # pool.mode=session and at least one Reader node, and uses
+  # routing.default_consistency as its consistency level.
+  mode: auto
+  pipeline:
+    internal_query_timeout_ms: 100
+    lazy_fallback: true
+  extension:
+    guc_name: "lsn_tracker.last_lsn"
+
+pool:
+  mode: transaction
+  # All sizes are per backend node, per Trident process.
+  max_pool_size: 50
+  # Pre-created for every node before the listener accepts clients. A
+  # prewarm failure aborts startup instead of silently starting undersized.
+  min_pool_size: 5
+  # Idle/lifetime limits are checked lazily when an idle connection is
+  # acquired. Checked-out, pinned, and transaction-held connections are
+  # never interrupted mid-use; an expired idle socket is discarded.
+  max_idle_time: 5m
+  # Maximum time allowed to create and authenticate a backend connection.
+  connection_timeout: 5s
+  max_lifetime: 30m
+
+health:
+  check_interval: 3s
+  # Every round probes all nodes concurrently; this timeout applies to
+  # each node independently rather than accumulating node by node.
+  check_timeout: 2s
+  max_retries: 3
+
+logging:
+  level: info
+  # query_trace: when true, every simple-query statement is logged at INFO
+  # level with its duration and routing target (writer/reader/analytics).
+  # Independent of the `level` setting above. Off by default since it can
+  # be high-volume; the always-on `trident_query_duration_ms` metric and
+  # `/client-stats` admin endpoint (see DEPLOYMENT.md section 4) are much
+  # lower-overhead alternatives when full per-statement logging is not
+  # actually needed.
+  query_trace: false
+  # slow_query: any statement taking at least this many milliseconds
+  # (wall-clock, routing + pool acquisition + full backend round trip) is
+  # logged at WARN level regardless of `query_trace`, and counted in the
+  # `trident_slow_queries_total` metric. Both `query_trace` and this
+  # threshold log the SQL text verbatim -- see DEPLOYMENT.md section 4
+  # for the implication on environments with log-content compliance
+  # requirements.
+  slow_query: 1000
+  # `dir` is optional; omit it (or leave commented out) to log to stdout
+  # only, unchanged from before this field existed. Set it to write logs
+  # to a rolling file as well -- rotation and retention (deleting files
+  # beyond `max_files`) both run continuously for the life of the
+  # process, not just once at startup -- see DEPLOYMENT.md.
+  # dir: /var/log/trident
+  # file_prefix: trident.log
+  # `max_files` accounting follows logroller: daily/hourly include the
+  # current date-stamped file in this count; size_based keeps this many
+  # numbered archives plus one separate active `{file_prefix}` file.
+  # max_files: 14
+  #
+  # `rotation` selects the rotation strategy (default: daily):
+  #   daily      - one file per day, named {file_prefix}.YYYY-MM-DD.
+  #                Simple and calendar-aligned, but an unusually chatty
+  #                day still produces one correspondingly large file.
+  #   hourly     - one file per hour, named {file_prefix}.YYYY-MM-DD-HH.
+  #   size_based - rotate whenever the current file reaches
+  #                `max_file_size_mb`, regardless of elapsed time. Use
+  #                this if you need a hard cap on individual file size.
+  # rotation: daily
+  # max_file_size_mb: 100   # only used when rotation: size_based
+
+# Admin/observability HTTP server: GET /metrics (Prometheus),
+# GET /healthz (liveness/readiness), and POST /reload (hot reload, see
+# below). Disabled by default. This endpoint is UNAUTHENTICATED -- if
+# enabled, bind it to a private/internal address only and restrict network
+# access to it (see DEPLOYMENT.md).
+admin:
+  enabled: false
+  listen_addr: "127.0.0.1:9090"
+
+# Hot reload: send SIGHUP to the process, or POST to /reload above, to
+# re-read this file and apply these routing settings WITHOUT a restart:
+# enable_transaction_split, split_respects_consistency,
+# enable_hint_routing, enable_cost_routing, cost_threshold,
+# writer_readable, analytics_patterns, custom_rules, and
+# default_consistency. Everything else (including load_balance_strategy,
+# proxy.*, nodes, pool.*, admin.*, health.*, logging.*, and
+# lsn_tracking.*) requires a restart to take effect -- see DEPLOYMENT.md's
+# hot-reload section.

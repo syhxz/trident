@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trident - Architecture &amp; Routing Flows</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg: #f8f9fa;
+  --card-bg: #ffffff;
+  --border: #e2e8f0;
+  --text: #1a202c;
+  --muted: #64748b;
+  --accent: #2563eb;
+  --accent-light: #eff6ff;
+  --writer: #dc2626;
+  --reader: #16a34a;
+  --analytics: #9333ea;
+  --aurora: #ea580c;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  padding: 2rem;
+}
+h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+h2 { font-size: 1.5rem; margin: 2.5rem 0 1rem; border-bottom: 2px solid var(--accent); padding-bottom: 0.3rem; }
+h3 { font-size: 1.15rem; margin: 1.5rem 0 0.5rem; color: var(--accent); }
+.subtitle { color: var(--muted); margin-bottom: 2rem; }
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+.card-title { font-weight: 600; margin-bottom: 0.75rem; }
+.mermaid { margin: 1rem 0; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
+th, td { border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; }
+th { background: var(--accent-light); font-weight: 600; }
+tr:nth-child(even) { background: #f1f5f9; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #fff;
+}
+.badge-writer { background: var(--writer); }
+.badge-reader { background: var(--reader); }
+.badge-analytics { background: var(--analytics); }
+.badge-aurora { background: var(--aurora); }
+code {
+  background: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.85em;
+}
+.note {
+  background: #fffbeb;
+  border-left: 4px solid #f59e0b;
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9rem;
+}
+.toc { margin: 1rem 0 2rem; }
+.toc a { color: var(--accent); text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.toc ul { list-style: none; padding-left: 1rem; }
+.toc > ul { padding-left: 0; }
+.toc li { margin: 0.25rem 0; }
+@media (max-width: 768px) {
+  body { padding: 1rem; }
+  h1 { font-size: 1.5rem; }
+}
+</style>
+</head>
+<body>
+
+<h1>Trident Architecture &amp; Routing Flows</h1>
+<p class="subtitle">PostgreSQL Intelligent Read/Write Splitting Proxy &mdash; Internal Technical Documentation</p>
+
+<nav class="toc card">
+<p class="card-title">Table of Contents</p>
+<ul>
+  <li><a href="#arch">1. High-Level Architecture</a></li>
+  <li><a href="#components">2. Core Components</a></li>
+  <li><a href="#routing">3. Routing Decision Flow</a></li>
+  <li><a href="#lsn">4. LSN Tracking Modes</a>
+    <ul>
+      <li><a href="#pipeline">4.1 Pipeline Mode</a></li>
+      <li><a href="#extension">4.2 Extension Mode</a></li>
+      <li><a href="#aurora">4.3 Aurora Write Forwarding Mode</a></li>
+      <li><a href="#auto">4.4 Auto Mode</a></li>
+    </ul>
+  </li>
+  <li><a href="#txsplit">5. Transaction Split State Machine</a></li>
+  <li><a href="#lifecycle">6. Connection Lifecycle</a></li>
+  <li><a href="#comparison">7. Mode Comparison</a></li>
+</ul>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="arch">1. High-Level Architecture</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<div class="mermaid">
+graph TB
+    subgraph Clients["Clients"]
+        C1[App 1]
+        C2[App 2]
+        C3[App N]
+    end
+
+    subgraph Trident["Trident Proxy"]
+        direction TB
+        Listener["TCP Listener<br/><code>proxy.listen_addr</code>"]
+        Handler["Connection Handler<br/>(per session)"]
+        Router["Router<br/>SQL Classification + Hint + Cost + Consistency"]
+        Pool["Pool Manager<br/>(per node)"]
+        Health["Health Checker<br/>(periodic probing)"]
+        LSN["LSN Tracker<br/>(Session/Global)"]
+        Admin["Admin HTTP<br/>/metrics /healthz"]
+    end
+
+    subgraph Backends["PostgreSQL Backends"]
+        W[(Writer<br/>Primary)]
+        R1[(Reader 1)]
+        R2[(Reader 2)]
+        A[(Analytics)]
+    end
+
+    C1 & C2 & C3 -->|"PG Wire Protocol<br/>(Simple Query)"| Listener
+    Listener --> Handler
+    Handler --> Router
+    Handler --> Pool
+    Router -.->|"snapshot"| Health
+    Pool -->|"acquire/release"| W & R1 & R2 & A
+    Health -->|"SELECT 1 / LSN / lag"| W & R1 & R2 & A
+    Handler -->|"record_write"| LSN
+    Admin -.->|"Prometheus metrics"| Health
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="components">2. Core Components</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<table>
+<tr><th>Component</th><th>Responsibility</th><th>Key Interface</th></tr>
+<tr><td><strong>ConnectionHandler</strong></td><td>Full lifecycle of a single client session: Startup &rarr; message loop &rarr; cleanup</td><td><code>handle()</code></td></tr>
+<tr><td><strong>Router</strong></td><td>Chains Hint &rarr; Tx state &rarr; SQL classification &rarr; Cost &rarr; Consistency &rarr; Load balancing</td><td><code>route(sql, ctx, readers, analytics)</code></td></tr>
+<tr><td><strong>PoolManager</strong></td><td>Per-node connection pool management, Session/Transaction modes</td><td><code>pool_for(node_id)</code>, <code>snapshot()</code></td></tr>
+<tr><td><strong>HealthChecker</strong></td><td>Periodic concurrent probing; 3-consecutive-failures rule triggers state transitions</td><td><code>check_once()</code>, <code>run()</code></td></tr>
+<tr><td><strong>LsnTracker</strong></td><td>Monotonic WAL watermark maintenance at Session + Global levels</td><td><code>record_write()</code>, <code>session_write_lsn()</code></td></tr>
+<tr><td><strong>Forwarder</strong></td><td>Streaming message relay, Pipeline LSN capture, Extension GUC interception</td><td><code>forward_simple_query_with_options()</code></td></tr>
+<tr><td><strong>CancelRegistry</strong></td><td>CANCEL request key &rarr; session &rarr; backend mapping</td><td><code>resolve_cancel_target()</code></td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="routing">3. Routing Decision Flow</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<p class="card-title">Router.route() &mdash; Complete Decision Chain</p>
+<div class="mermaid">
+flowchart TD
+    Start([Receive Simple Query]) --> Multi{Contains multiple statements?}
+    Multi -->|Yes| WR1[<span class='badge badge-writer'>Writer</span><br/>Conservative multi-statement routing]
+    Multi -->|No| Hint{Parse Hint comment}
+
+    Hint -->|ROUTE_TO_WRITER| WR2[<span class='badge badge-writer'>Writer</span>]
+    Hint -->|ROUTE_TO_READER| RD1[<span class='badge badge-reader'>Reader</span><br/>Direct selection]
+    Hint -->|ROUTE_TO_ANALYTICS| AN1[<span class='badge badge-analytics'>Analytics</span>]
+    Hint -->|CONSISTENCY hint| SetC[Override session consistency] --> TxCheck
+    Hint -->|No hint| TxCheck
+
+    TxCheck{Inside explicit transaction?}
+    TxCheck -->|Yes| Split[Transaction split state machine<br/>See Section 5]
+    TxCheck -->|No| Classify
+
+    Classify{SQL Classification}
+    Classify -->|"Write / DDL / FOR UPDATE<br/>Write function call"| WR3[<span class='badge badge-writer'>Writer</span>]
+    Classify -->|"SELECT / SHOW / EXPLAIN"| CustomRule
+
+    CustomRule{Custom routing rule?}
+    CustomRule -->|Matches writer-only rule| WR4[<span class='badge badge-writer'>Writer</span>]
+    CustomRule -->|No match or reader rule| Cost
+
+    Cost{Cost-based<br/>routing enabled?}
+    Cost -->|"cost > threshold"| AN2[<span class='badge badge-analytics'>Analytics</span>]
+    Cost -->|"cost <= threshold"| Consist
+
+    Consist{Consistency check<br/>Session/Global}
+    Consist -->|Eligible Readers available| Balance[Load-balanced selection]
+    Consist -->|No eligible Reader| Fallback{writer_readable?}
+
+    Balance --> RD2[<span class='badge badge-reader'>Reader</span>]
+    Fallback -->|true| WR5[<span class='badge badge-writer'>Writer</span><br/>fallback]
+    Fallback -->|false| ERR[Return SQLSTATE 57P03]
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="lsn">4. LSN Tracking Modes</h2>
+<!-- ============================================================ -->
+
+<h3 id="pipeline">4.1 Pipeline Mode</h3>
+
+<div class="card">
+<p class="card-title">Dual Query Frame &mdash; Zero Extra Network Round-Trips</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer)
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    Note over T: Detects autocommit write<br/>pipeline_safe_sql = true
+
+    T->>B: [TCP write_all]<br/>Query Frame 1: INSERT INTO t VALUES (1)<br/>Query Frame 2: SELECT pg_current_wal_lsn()
+
+    Note over B: Process Frame 1<br/>Execute INSERT (autocommit)
+
+    B->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+    B->>T: ReadyForQuery(Idle)
+    Note over T: Hold RFQ, do not forward
+
+    Note over B: Process Frame 2<br/>INSERT already committed
+
+    B->>T: DataRow("16/B374D848")
+    B->>T: CommandComplete("SELECT 1")
+    B->>T: ReadyForQuery(Idle)
+    Note over T: Parse LSN = 0x16B374D848<br/>record_write(session, lsn)<br/>Swallow internal response
+
+    T->>C: ReadyForQuery(Idle)
+    Note over C: Receives normal response<br/>Unaware of internal LSN query
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Pipeline COMMIT Path (Explicit Transaction)</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer)
+
+    Note over T: Transaction had writes<br/>tx_has_writes = true
+
+    C->>T: Query("COMMIT")
+    Note over T: commit_attempt = true<br/>pipeline_safe_sql("COMMIT") = true
+
+    T->>B: [write_all]<br/>Query("COMMIT") + Query("SELECT pg_current_wal_lsn()")
+
+    B->>T: CommandComplete("COMMIT")
+    T->>C: CommandComplete("COMMIT")
+    B->>T: ReadyForQuery(Idle)
+
+    B->>T: DataRow("16/B374D848")
+    B->>T: CommandComplete("SELECT 1")
+    B->>T: ReadyForQuery(Idle)
+    Note over T: LSN captured, pending_write = false
+
+    T->>C: ReadyForQuery(Idle)
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Pipeline Timeout / Degradation Path</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer)
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    T->>B: Query("INSERT...") + Query("SELECT pg_current_wal_lsn()")
+
+    B->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+    B->>T: ReadyForQuery(Idle)
+
+    Note over T: Waiting for internal LSN response...<br/>internal_query_timeout_ms = 100
+
+    Note over T,B: TIMEOUT! No response within 100ms
+
+    Note over T: connection_reusable = false<br/>pending_write = true<br/>Discard backend connection
+
+    T->>C: ReadyForQuery(Idle)
+    Note over C: User write succeeds regardless
+
+    Note over T: Next time routing to Reader:<br/>Lazy Fetch to obtain LSN
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Lazy Fallback &mdash; Deferred Watermark Resolution</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant W as Writer Pool
+    participant R as Reader
+
+    Note over T: pending_write = true<br/>Router decision = Reader
+
+    T->>W: acquire() - get Writer connection
+    T->>W: SELECT pg_current_wal_lsn()
+    W->>T: DataRow("16/B374D848")
+    Note over T: record_write(session, lsn)<br/>pending_write = false
+
+    T->>W: release() - return Writer
+
+    Note over T: Re-run Router.route()<br/>with refreshed session_write_lsn
+
+    T->>R: Query("SELECT ...") routed to Reader
+    R->>T: RowDescription + DataRow + ...
+    T->>C: Stream results to client
+</div>
+</div>
+
+<h3 id="extension">4.2 Extension Mode</h3>
+
+<div class="card">
+<p class="card-title">ParameterStatus GUC Reporting &mdash; Zero Extra Queries</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant B as Backend (Writer + Extension)
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    T->>B: Query("INSERT INTO t VALUES (1)")
+
+    B->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+
+    B->>T: ParameterStatus("lsn_tracker.last_lsn", "16/B374D848")
+    Note over T: Matches extension.guc_name<br/>Parse LSN = 0x16B374D848<br/>record_write(session, lsn)<br/>Not forwarded to client
+
+    B->>T: ReadyForQuery(Idle)
+    T->>C: ReadyForQuery(Idle)
+
+    Note over C: Completely transparent<br/>Zero additional overhead
+</div>
+</div>
+
+<h3 id="aurora">4.3 Aurora Write Forwarding Mode</h3>
+
+<div class="card">
+<p class="card-title">All SQL Sent to a Pinned Reader &mdash; Aurora Kernel Manages Consistency</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant R as Aurora Reader (pinned)
+    participant W as Aurora Writer
+
+    Note over T: First request: select healthy Reader<br/>aurora_node_id = "reader-1"
+
+    T->>R: SET apg_write_forward.consistency_mode = 'SESSION'
+    R->>T: CommandComplete("SET")
+    Note over T: aurora_initialized_backend_pid = PID
+
+    C->>T: Query("INSERT INTO t VALUES (1)")
+    T->>R: Query("INSERT INTO t VALUES (1)")
+    Note over R: Aurora kernel detects write<br/>Forwards to Writer
+    R->>W: (internal forwarding)
+    W->>R: (returns result)
+    R->>T: CommandComplete("INSERT 0 1")
+    T->>C: CommandComplete("INSERT 0 1")
+    R->>T: ReadyForQuery(Idle)
+    T->>C: ReadyForQuery(Idle)
+
+    C->>T: Query("SELECT * FROM t WHERE id = 1")
+    T->>R: Query("SELECT ...")
+    Note over R: Aurora SESSION consistency<br/>Waits for this session's writes to be visible
+    R->>T: RowDescription + DataRow + CommandComplete
+    T->>C: Stream results
+
+    Note over T: No LSN tracking<br/>No read/write routing<br/>Router bypassed entirely
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Aurora Mode &mdash; Dynamic Consistency Switching</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant R as Aurora Reader (pinned)
+
+    C->>T: Query("SET trident.consistency = 'global'")
+    Note over T: Intercept and translate
+
+    T->>R: Query("SET apg_write_forward.consistency_mode = 'GLOBAL'")
+    R->>T: CommandComplete("SET")
+    T->>C: CommandComplete("SET")
+    R->>T: ReadyForQuery(Idle)
+    T->>C: ReadyForQuery(Idle)
+
+    Note over T: session.consistency = Global<br/>Subsequent queries use GLOBAL consistency
+</div>
+</div>
+
+<h3 id="auto">4.4 Auto Mode (Default)</h3>
+
+<div class="card">
+<p class="card-title">Auto Detection Logic: Pipeline &rarr; Extension Automatic Switch</p>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Pipeline: Session starts
+
+    Pipeline --> Pipeline: Write statement (no ParameterStatus)
+    Pipeline --> Extension: Observed guc_name<br/>ParameterStatus report
+
+    Extension --> Extension: All subsequent writes<br/>no internal query appended
+
+    Note right of Pipeline: Initially uses dual Query Frame<br/>to capture commit-time LSN
+    Note right of Extension: After switch: zero overhead<br/>Per-session, irreversible
+</div>
+
+<div class="note">
+<strong>Note</strong>: Auto mode will never automatically select Aurora Write Forwarding.
+The reason is that <code>SHOW apg_write_forward.consistency_mode</code> returning a value does not prove
+Write Forwarding is actually enabled &mdash; reliable detection requires querying the AWS control plane API.
+Aurora mode must be explicitly configured by the operator.
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="txsplit">5. Transaction Split State Machine</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<p class="card-title">Transaction Split Routing Decisions</p>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Pending: BEGIN (client)<br/>Trident synthesizes BEGIN response<br/>No backend connection used
+
+    Pending --> TX_READING: First statement is READ<br/>and consistency check passes
+    Pending --> TX_WRITING: First statement is WRITE<br/>or consistency check fails<br/>or RR/SERIALIZABLE
+
+    TX_READING --> TX_READING: Subsequent READs
+    TX_READING --> Upgrading: WRITE statement encountered
+
+    Upgrading --> TX_WRITING: ROLLBACK Reader<br/>discard Reader connection<br/>BEGIN on Writer<br/>execute WRITE
+
+    TX_WRITING --> TX_WRITING: All subsequent statements<br/>(never reverts)
+
+    TX_READING --> [*]: COMMIT / ROLLBACK
+    TX_WRITING --> [*]: COMMIT / ROLLBACK
+    Pending --> [*]: COMMIT / ROLLBACK<br/>(synthesized locally, no backend needed)
+</div>
+</div>
+
+<div class="card">
+<p class="card-title">Transaction Split + LSN Pipeline &mdash; Complete Flow</p>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant T as Trident
+    participant R as Reader
+    participant W as Writer
+
+    C->>T: BEGIN
+    Note over T: Synthesize response, no backend
+    T->>C: CommandComplete("BEGIN") + RFQ(T)
+
+    C->>T: SELECT * FROM orders
+    Note over T: Route decision = Reader<br/>Deferred BEGIN pipelined with<br/>first statement (one round trip)
+    T->>R: BEGIN READ COMMITTED
+    T->>R: SELECT * FROM orders
+    R->>T: Result set
+    T->>C: Stream results
+
+    C->>T: UPDATE orders SET status = 'paid'
+    Note over T: Write statement! Trigger upgrade
+
+    T->>R: ROLLBACK
+    Note over T: Discard Reader connection
+
+    T->>W: BEGIN READ COMMITTED
+    T->>W: UPDATE orders SET status = 'paid'
+    W->>T: CommandComplete("UPDATE 1")
+    T->>C: CommandComplete("UPDATE 1") + RFQ(T)
+    Note over T: tx_has_writes = true
+
+    C->>T: COMMIT
+    Note over T: commit_attempt = true<br/>Append LSN Pipeline
+
+    T->>W: Query("COMMIT") + Query("SELECT pg_current_wal_lsn()")
+    W->>T: CommandComplete("COMMIT") + RFQ(I)
+    T->>C: CommandComplete("COMMIT")
+    W->>T: DataRow("16/B374D848") + RFQ(I)
+    Note over T: record_write(session, lsn)
+    T->>C: ReadyForQuery(Idle)
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="lifecycle">6. Connection Lifecycle</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<p class="card-title">Single Client Connection &mdash; Full Lifecycle</p>
+<div class="mermaid">
+flowchart TD
+    Accept[TCP Accept] --> SSL{SSLRequest?}
+    SSL -->|Yes| RejectSSL["Reply 'N'"] --> SSL
+    SSL -->|No / GssEnc| Startup{StartupMessage?}
+
+    Startup -->|CancelRequest| Cancel[handle_cancel_request<br/>Lookup mapping - forward/ignore] --> Close
+
+    Startup -->|StartupMessage| Auth[Trust Authentication<br/>Send AuthOk + Params + KeyData + RFQ]
+
+    Auth --> Loop{Message Loop}
+
+    Loop -->|Query| Route[Routing decision + acquire connection]
+    Loop -->|Terminate| Cleanup
+    Loop -->|Parse/Bind/Describe/<br/>Execute/Close| Batch["Append to extended_batch<br/>(capped at 4096 messages)"]
+    Loop -->|Sync| HasBatch{Batch non-empty?}
+
+    Batch --> Loop
+    HasBatch -->|No| SyncRFQ[Return ReadyForQuery]
+    HasBatch -->|Yes| RouteExt[handle_extended_query_batch<br/>route by first Parse's SQL<br/>/ recorded named-statement route<br/>/ held connection]
+
+    Route --> Forward[forward_simple_query_with_options]
+    Forward --> LSNUpdate{Write committed?}
+    LSNUpdate -->|Yes| RecordLSN[Pipeline/Extension<br/>record_write]
+    LSNUpdate -->|No| ReturnConn
+
+    RouteExt --> ForwardExt[Forward batch + Sync as one unit<br/>zero-copy streaming relay of responses]
+    ForwardExt --> PinCheck{Named Parse?}
+    PinCheck -->|Yes| Pin[Pin physical connection to session]
+    PinCheck -->|No| ExtLSN
+    Pin --> ExtLSN{Write committed?}
+    ExtLSN -->|Yes| ExtPending[pending_write = true]
+    ExtLSN -->|No| ReturnConn
+    ExtPending --> ReturnConn
+
+    RecordLSN --> ReturnConn[Release/retain connection]
+    ReturnConn --> SendRFQ[send_ready_for_query] --> Loop
+
+    Cleanup[Session Cleanup]
+    Cleanup --> DiscardHeld[discard held_backend]
+    Cleanup --> ReleasePool[release_session for all pools]
+    Cleanup --> RemoveLSN[lsn_tracker.remove_session]
+    Cleanup --> UnregCancel[unregister cancel key]
+    Cleanup --> Close([Connection closed])
+
+    SyncRFQ --> Loop
+</div>
+</div>
+
+<div class="note">
+<strong>Note</strong>: Extended Query batches are not included in per-statement
+timing instrumentation &mdash; <code>trident_query_duration_ms</code>,
+<code>trident_slow_queries_total</code>, and the admin console's Slow Queries
+page currently cover only the Simple Query path (see DEPLOYMENT.md Section 4).
+</div>
+
+<!-- ============================================================ -->
+<h2 id="comparison">7. Mode Comparison</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<table>
+<tr>
+  <th></th>
+  <th><span class="badge badge-writer">Pipeline</span></th>
+  <th><span class="badge badge-reader">Extension</span></th>
+  <th><span class="badge badge-aurora">Aurora WF</span></th>
+</tr>
+<tr>
+  <td><strong>Compatible Backends</strong></td>
+  <td>Any PostgreSQL</td>
+  <td>PG with LSN reporting extension</td>
+  <td>Aurora PG (WF enabled)</td>
+</tr>
+<tr>
+  <td><strong>Extra Network Round-Trips</strong></td>
+  <td>0 (same write_all)</td>
+  <td>0</td>
+  <td>0 (no LSN tracking)</td>
+</tr>
+<tr>
+  <td><strong>Extra Latency</strong></td>
+  <td>~10-50&mu;s (internal query execution)</td>
+  <td>0</td>
+  <td>0 (proxy side)</td>
+</tr>
+<tr>
+  <td><strong>Write Path</strong></td>
+  <td>Proxy &rarr; Writer direct</td>
+  <td>Proxy &rarr; Writer direct</td>
+  <td>Proxy &rarr; Reader &rarr; Writer forwarded</td>
+</tr>
+<tr>
+  <td><strong>Consistency Guarantor</strong></td>
+  <td>Trident (LSN comparison)</td>
+  <td>Trident (LSN comparison)</td>
+  <td>Aurora storage layer</td>
+</tr>
+<tr>
+  <td><strong>Proxy Complexity</strong></td>
+  <td>High (dual frame + timeout + lazy)</td>
+  <td>Medium (GUC capture)</td>
+  <td>Very low (pure relay)</td>
+</tr>
+<tr>
+  <td><strong>Pool Mode</strong></td>
+  <td>Transaction / Session</td>
+  <td>Transaction / Session</td>
+  <td>Session only</td>
+</tr>
+<tr>
+  <td><strong>Transaction Splitting</strong></td>
+  <td>Supported</td>
+  <td>Supported</td>
+  <td>Not supported (Router bypassed)</td>
+</tr>
+<tr>
+  <td><strong>Degradation Behavior</strong></td>
+  <td>Timeout &rarr; pending_write &rarr; Lazy</td>
+  <td>No extension &rarr; Auto falls back to Pipeline</td>
+  <td>Reader unhealthy &rarr; error</td>
+</tr>
+<tr>
+  <td><strong>SERIALIZABLE</strong></td>
+  <td>Supported</td>
+  <td>Supported</td>
+  <td>Not supported</td>
+</tr>
+<tr>
+  <td><strong>DDL / COPY</strong></td>
+  <td>Supported (routed to Writer)</td>
+  <td>Supported (routed to Writer)</td>
+  <td>Not supported (Aurora limitation)</td>
+</tr>
+</table>
+</div>
+
+<div class="card">
+<p class="card-title">Configuration Examples</p>
+<pre style="background:#f1f5f9; padding:1rem; border-radius:4px; overflow-x:auto; font-size:0.85rem;"><code># Pipeline (default, no extra configuration needed)
+lsn_tracking:
+  mode: auto
+  pipeline:
+    internal_query_timeout_ms: 100
+    lazy_fallback: true
+  extension:
+    guc_name: "lsn_tracker.last_lsn"
+
+# --- Explicit Extension ---
+lsn_tracking:
+  mode: extension
+  extension:
+    guc_name: "lsn_tracker.last_lsn"
+
+# --- Aurora Write Forwarding ---
+lsn_tracking:
+  mode: aurora_write_forwarding
+
+pool:
+  mode: session          # Required by Aurora WF
+
+routing:
+  default_consistency: session  # Maps to Aurora's SESSION consistency</code></pre>
+</div>
+
+<div class="card">
+<p class="card-title">Mode Selection Decision Tree</p>
+<div class="mermaid">
+flowchart TD
+    Start([Choose LSN Mode]) --> AuroraQ{Using Aurora PG<br/>with WF enabled?}
+
+    AuroraQ -->|Yes| AcceptLimit{Can accept:<br/>- Extra write latency<br/>- No DDL/COPY<br/>- No SERIALIZABLE<br/>- Session pool only}
+    AcceptLimit -->|Yes| Aurora[<span class='badge badge-aurora'>aurora_write_forwarding</span><br/>Simplest architecture]
+    AcceptLimit -->|No| Pipeline
+
+    AuroraQ -->|No| ExtQ{Backend has<br/>LSN extension?}
+    ExtQ -->|Yes| Extension[<span class='badge badge-reader'>extension</span><br/>Zero overhead]
+    ExtQ -->|No| Pipeline[<span class='badge badge-writer'>pipeline / auto</span><br/>Universal solution]
+</div>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'neutral',
+  sequence: { mirrorActors: false, messageMargin: 40 },
+  flowchart: { curve: 'basis', htmlLabels: true }
+});
+</script>
+</body>
+</html>

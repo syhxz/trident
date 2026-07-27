@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trident Console</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#e2e8f0;--muted:#94a3b8;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--orange:#f97316}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);display:flex;min-height:100vh}
+a{color:var(--accent);text-decoration:none}
+
+/* Sidebar */
+.sidebar{width:220px;background:var(--card);border-right:1px solid var(--border);padding:1rem 0;display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto}
+.sidebar .logo{padding:0 1rem 1.5rem;font-size:1.25rem;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);margin-bottom:0.5rem}
+.sidebar .nav-group{padding:0.5rem 0}
+.sidebar .nav-group-title{padding:0.25rem 1rem;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted)}
+.sidebar .nav-item{display:block;padding:0.5rem 1rem;cursor:pointer;transition:background 0.15s;font-size:0.875rem}
+.sidebar .nav-item:hover{background:rgba(59,130,246,0.1)}
+.sidebar .nav-item.active{background:rgba(59,130,246,0.15);color:var(--accent);border-left:3px solid var(--accent)}
+
+/* Main */
+.main{margin-left:220px;flex:1;padding:1.5rem;overflow-y:auto;min-height:100vh}
+.page{display:none}
+.page.active{display:block}
+.page-title{font-size:1.5rem;font-weight:600;margin-bottom:1.25rem}
+
+/* Cards */
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1rem}
+.stat-card .label{font-size:0.75rem;color:var(--muted);text-transform:uppercase;margin-bottom:0.25rem}
+.stat-card .value{font-size:1.75rem;font-weight:700}
+.stat-card .value.green{color:var(--green)}
+.stat-card .value.red{color:var(--red)}
+
+/* Tables */
+.table-container{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:0.85rem}
+th,td{padding:0.6rem 0.75rem;text-align:left;border-bottom:1px solid var(--border)}
+th{background:rgba(0,0,0,0.2);font-weight:600;color:var(--muted);font-size:0.75rem;text-transform:uppercase}
+tr:last-child td{border-bottom:none}
+
+/* Status badges */
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:600}
+.badge-healthy{background:rgba(34,197,94,0.15);color:var(--green)}
+.badge-unhealthy{background:rgba(239,68,68,0.15);color:var(--red)}
+.badge-writer{background:rgba(239,68,68,0.15);color:var(--red)}
+.badge-reader{background:rgba(34,197,94,0.15);color:var(--green)}
+.badge-analytics{background:rgba(168,85,247,0.15);color:#a855f7}
+
+/* Charts */
+.chart-container{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1.5rem}
+.chart-container canvas{max-height:250px}
+
+/* Config */
+.config-section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-bottom:1rem}
+.config-section h3{font-size:0.9rem;color:var(--accent);margin-bottom:0.75rem}
+.form-row{display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem;flex-wrap:wrap}
+.form-row label{font-size:0.8rem;color:var(--muted);min-width:160px}
+.form-row input,.form-row select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:0.4rem 0.6rem;border-radius:4px;font-size:0.85rem}
+.form-row input[type=checkbox]{width:auto}
+.btn{padding:0.5rem 1rem;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem;font-weight:500;transition:opacity 0.15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{opacity:0.85}
+.btn-danger{background:var(--red);color:#fff}
+.btn-sm{padding:0.3rem 0.6rem;font-size:0.75rem}
+.btn-bar{margin-top:1rem;display:flex;gap:0.5rem}
+.toast{position:fixed;top:1rem;right:1rem;padding:0.75rem 1rem;border-radius:6px;font-size:0.85rem;z-index:9999;animation:fadeIn 0.2s}
+.toast-success{background:var(--green);color:#fff}
+.toast-error{background:var(--red);color:#fff}
+@keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+
+/* Logs */
+.log-container{background:#000;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:"JetBrains Mono",monospace;font-size:0.78rem;height:calc(100vh - 180px);overflow-y:auto;line-height:1.5}
+.log-line{white-space:pre-wrap;word-break:break-all}
+.log-line .ts{color:var(--muted)}
+.log-line .lvl-INFO{color:var(--green)}
+.log-line .lvl-WARN{color:var(--yellow)}
+.log-line .lvl-ERROR{color:var(--red)}
+.log-line .lvl-DEBUG{color:var(--muted)}
+.log-toolbar{display:flex;gap:0.5rem;margin-bottom:0.75rem;align-items:center}
+.log-toolbar select,.log-toolbar input{background:var(--card);border:1px solid var(--border);color:var(--text);padding:0.4rem;border-radius:4px;font-size:0.8rem}
+.log-toolbar input{flex:1}
+
+/* Rules table */
+.rules-bar{display:flex;gap:0.5rem;margin-bottom:0.75rem}
+.rules-bar input,.rules-bar select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:0.4rem;border-radius:4px;font-size:0.8rem}
+
+/* Pagination */
+.pagination-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem;font-size:0.8rem;color:var(--muted)}
+.pagination-bar div{display:flex;gap:0.25rem}
+.log-page-bar{display:flex;justify-content:space-between;align-items:center;margin-top:0.5rem}
+</style>
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="logo">Trident</div>
+  <div class="nav-group">
+    <div class="nav-group-title">Monitor</div>
+    <div class="nav-item active" data-page="overview">Overview</div>
+    <div class="nav-item" data-page="clients">Clients</div>
+    <div class="nav-item" data-page="slow-queries">Slow Queries</div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-title">Nodes</div>
+    <div class="nav-item" data-page="nodes">Backend Nodes</div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-title">Configure</div>
+    <div class="nav-item" data-page="config-routing">Routing</div>
+    <div class="nav-item" data-page="config-rules">Custom Rules</div>
+    <div class="nav-item" data-page="config-pool">Connection Pool</div>
+    <div class="nav-item" data-page="config-lsn">LSN Mode</div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-title">Logs</div>
+    <div class="nav-item" data-page="logs">Live Logs</div>
+  </div>
+</nav>
+
+<div class="main">
+
+<!-- Overview -->
+<div class="page active" id="page-overview">
+  <h1 class="page-title">Overview</h1>
+  <div class="cards" id="overview-cards"></div>
+  <div class="chart-container"><canvas id="chart-routing"></canvas></div>
+  <div class="chart-container"><canvas id="chart-latency"></canvas></div>
+</div>
+
+<!-- Clients -->
+<div class="page" id="page-clients">
+  <h1 class="page-title">Clients</h1>
+  <div class="table-container"><table id="clients-table"><thead><tr><th>IP</th><th>Active</th><th>Total</th><th>Last Seen</th></tr></thead><tbody></tbody></table></div>
+</div>
+
+<!-- Slow Queries -->
+<div class="page" id="page-slow-queries">
+  <h1 class="page-title">Slow Queries</h1>
+  <div class="pagination-bar">
+    <span id="sq-info"></span>
+    <div>
+      <button class="btn btn-sm btn-primary" id="sq-prev" disabled>Prev</button>
+      <button class="btn btn-sm btn-primary" id="sq-next">Next</button>
+    </div>
+  </div>
+  <div class="table-container"><table id="slow-queries-table"><thead><tr><th>Time</th><th>Duration</th><th>Target</th><th>SQL</th></tr></thead><tbody></tbody></table></div>
+  <div class="pagination-bar" style="margin-top:0.75rem">
+    <span id="sq-info2"></span>
+    <div>
+      <button class="btn btn-sm btn-primary" id="sq-prev2" disabled>Prev</button>
+      <button class="btn btn-sm btn-primary" id="sq-next2">Next</button>
+    </div>
+  </div>
+</div>
+
+<!-- Nodes -->
+<div class="page" id="page-nodes">
+  <h1 class="page-title">Backend Nodes</h1>
+  <div class="cards" id="nodes-cards"></div>
+  <div class="table-container"><table id="nodes-table"><thead><tr><th>Node</th><th>Type</th><th>Health</th><th>Connections</th><th>Pool Max</th><th>Replication Lag</th><th>Replay LSN</th></tr></thead><tbody></tbody></table></div>
+</div>
+
+<!-- Config: Routing -->
+<div class="page" id="page-config-routing">
+  <h1 class="page-title">Routing Configuration</h1>
+  <div class="config-section" id="routing-form"></div>
+  <div class="btn-bar"><button class="btn btn-primary" id="btn-save-routing">Apply (runtime-only)</button></div>
+</div>
+
+<!-- Config: Custom Rules -->
+<div class="page" id="page-config-rules">
+  <h1 class="page-title">Custom Routing Rules</h1>
+  <div class="rules-bar">
+    <input id="rule-name" placeholder="Name (e.g. sensitive_table)">
+    <select id="rule-type"><option value="t">Table</option><option value="f">Function</option></select>
+    <select id="rule-mode"><option value="w">Writer-only</option><option value="r">Reader-eligible</option></select>
+    <button class="btn btn-primary btn-sm" id="btn-add-rule">Add</button>
+  </div>
+  <div class="table-container"><table id="rules-table"><thead><tr><th>Name</th><th>Type</th><th>Mode</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+</div>
+
+<!-- Config: LSN Mode -->
+<div class="page" id="page-config-pool">
+  <h1 class="page-title">Connection Pool</h1>
+  <div class="config-section" id="pool-info"></div>
+</div>
+
+<!-- Config: LSN Mode -->
+<div class="page" id="page-config-lsn">
+  <h1 class="page-title">LSN Tracking Mode</h1>
+  <div class="config-section" id="lsn-info"></div>
+</div>
+
+<!-- Logs -->
+<div class="page" id="page-logs">
+  <h1 class="page-title">Live Logs</h1>
+  <div class="log-toolbar">
+    <select id="log-level-filter"><option value="">All Levels</option><option value="ERROR">ERROR</option><option value="WARN">WARN</option><option value="INFO">INFO</option><option value="DEBUG">DEBUG</option></select>
+    <input id="log-search" placeholder="Search...">
+    <label style="font-size:0.8rem;color:var(--muted);display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-autoscroll" checked> Auto-scroll</label>
+    <span id="log-count" style="font-size:0.75rem;color:var(--muted)"></span>
+    <button class="btn btn-sm btn-primary" id="btn-clear-logs">Clear</button>
+  </div>
+  <div class="log-container" id="log-output"></div>
+  <div class="log-page-bar">
+    <button class="btn btn-sm btn-primary" id="log-older">Older</button>
+    <span id="log-page-info" style="font-size:0.75rem;color:var(--muted)"></span>
+    <button class="btn btn-sm btn-primary" id="log-newer">Newer</button>
+  </div>
+</div>
+
+</div><!-- /main -->
+
+<script>
+const API = '';
+let routingChart, latencyChart;
+let logWs = null;
+const logBuffer = [];
+const MAX_LOG_LINES = 2000;
+
+// Navigation
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    item.classList.add('active');
+    document.getElementById('page-' + item.dataset.page).classList.add('active');
+    onPageShow(item.dataset.page);
+  });
+});
+
+function onPageShow(page) {
+  if (page === 'overview') fetchOverview();
+  if (page === 'clients') fetchClients();
+  if (page === 'slow-queries') fetchSlowQueries();
+  if (page === 'nodes') fetchNodes();
+  if (page === 'config-routing') fetchConfig();
+  if (page === 'config-rules') fetchRules();
+  if (page === 'config-lsn') fetchLsnMode();
+  if (page === 'config-pool') fetchPoolConfig();
+  if (page === 'logs') connectLogs();
+}
+
+// Toast
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+// Fetch helpers
+async function api(path, opts) {
+  const res = await fetch(API + path, opts);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+// Overview
+// Queries are shown as a real-time rate (QPS), not cumulative totals: the
+// backend counters are monotonic Prometheus counters, so the rate is the
+// delta between two polls divided by the elapsed time. The first poll has
+// no baseline and shows "–"; a quick follow-up poll fills it in.
+let prevOverview = null;
+function rateFmt(v){ return (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(1)) + '/s'; }
+async function fetchOverview() {
+  try {
+    const data = await api('/api/overview');
+    const now = Date.now();
+    let qpsW = '–', qpsR = '–', qpsA = '–';
+    // The routing chart shows the same real-time distribution when a
+    // baseline exists; only the very first paint falls back to cumulative.
+    let chartData = [data.routing_writer, data.routing_reader, data.routing_analytics];
+    const hadBaseline = !!prevOverview;
+    if (prevOverview) {
+      const dt = (now - prevOverview.t) / 1000;
+      if (dt > 0.2) {
+        // Math.max guards against counter resets on proxy restart.
+        const dW = Math.max(0, data.routing_writer - prevOverview.w) / dt;
+        const dR = Math.max(0, data.routing_reader - prevOverview.r) / dt;
+        const dA = Math.max(0, data.routing_analytics - prevOverview.a) / dt;
+        qpsW = rateFmt(dW); qpsR = rateFmt(dR); qpsA = rateFmt(dA);
+        if (dW + dR + dA > 0) chartData = [dW, dR, dA];
+      }
+    }
+    prevOverview = { t: now, w: data.routing_writer, r: data.routing_reader, a: data.routing_analytics };
+    const cards = document.getElementById('overview-cards');
+    cards.innerHTML = `
+      <div class="stat-card"><div class="label">Active Connections</div><div class="value">${data.active_connections}</div></div>
+      <div class="stat-card"><div class="label">Total Accepted</div><div class="value">${fmt(data.total_accepted)}</div></div>
+      <div class="stat-card"><div class="label">Queries/s (Writer)</div><div class="value">${qpsW}</div></div>
+      <div class="stat-card"><div class="label">Queries/s (Reader)</div><div class="value">${qpsR}</div></div>
+      <div class="stat-card"><div class="label">Queries/s (Analytics)</div><div class="value">${qpsA}</div></div>
+      <div class="stat-card"><div class="label">Slow Queries (1m)</div><div class="value ${data.slow_queries_1m > 0 ? 'red' : ''}">${fmt(data.slow_queries_1m)}</div></div>
+      <div class="stat-card"><div class="label">Pool Exhausted</div><div class="value ${data.pool_exhausted > 0 ? 'red' : ''}">${fmt(data.pool_exhausted)}</div></div>
+      <div class="stat-card"><div class="label">Health Status</div><div class="value ${data.healthy ? 'green' : 'red'}">${data.healthy ? 'Healthy' : 'Unhealthy'}</div></div>
+    `;
+    updateRoutingChart(chartData);
+    // No baseline on the first paint: poll once more shortly so the QPS
+    // cards show real numbers without waiting a full refresh cycle.
+    if (!hadBaseline) setTimeout(fetchOverview, 1000);
+  } catch(e) { console.error('overview error', e); }
+}
+
+function updateRoutingChart(values) {
+  const ctx = document.getElementById('chart-routing');
+  if (routingChart) routingChart.destroy();
+  routingChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Writer', 'Reader', 'Analytics'],
+      datasets: [{ data: values, backgroundColor: ['#ef4444','#22c55e','#a855f7'] }]
+    },
+    options: { responsive: true, plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8' } } } }
+  });
+}
+
+// Clients
+async function fetchClients() {
+  try {
+    const data = await api('/client-stats');
+    const tbody = document.querySelector('#clients-table tbody');
+    tbody.innerHTML = data.map(c => `<tr><td>${c.ip}</td><td>${c.active_connections}</td><td>${c.total_connections}</td><td>${new Date(c.last_seen_unix_secs * 1000).toLocaleString()}</td></tr>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+// Slow Queries (paginated)
+let sqPage = 1;
+const SQ_PER_PAGE = 50;
+
+async function fetchSlowQueries() {
+  try {
+    const data = await api(`/api/slow-queries?page=${sqPage}&per_page=${SQ_PER_PAGE}`);
+    const tbody = document.querySelector('#slow-queries-table tbody');
+    tbody.innerHTML = data.items.map(q => `<tr><td style="white-space:nowrap">${new Date(q.time_unix_secs * 1000).toLocaleString()}</td><td>${q.duration_ms}ms</td><td><span class="badge badge-${q.target}">${q.target}</span></td><td style="max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(q.sql)}">${esc(q.sql)}</td></tr>`).join('');
+    const info = `Showing ${(data.page-1)*data.per_page+1}-${Math.min(data.page*data.per_page, data.total)} of ${data.total}`;
+    document.getElementById('sq-info').textContent = info;
+    document.getElementById('sq-info2').textContent = info;
+    document.getElementById('sq-prev').disabled = data.page <= 1;
+    document.getElementById('sq-prev2').disabled = data.page <= 1;
+    document.getElementById('sq-next').disabled = data.page >= data.total_pages;
+    document.getElementById('sq-next2').disabled = data.page >= data.total_pages;
+  } catch(e) { console.error(e); }
+}
+document.getElementById('sq-prev').addEventListener('click', () => { sqPage = Math.max(1, sqPage-1); fetchSlowQueries(); });
+document.getElementById('sq-prev2').addEventListener('click', () => { sqPage = Math.max(1, sqPage-1); fetchSlowQueries(); });
+document.getElementById('sq-next').addEventListener('click', () => { sqPage++; fetchSlowQueries(); });
+document.getElementById('sq-next2').addEventListener('click', () => { sqPage++; fetchSlowQueries(); });
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+function fmt(n){if(n>=1e9)return(n/1e9).toFixed(1)+"G";if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e4)return(n/1e3).toFixed(1)+"K";return n.toLocaleString()}
+
+// Nodes
+async function fetchNodes() {
+  try {
+    const data = await api('/api/nodes');
+    const tbody = document.querySelector('#nodes-table tbody');
+    tbody.innerHTML = data.nodes.map(n => `<tr>
+      <td>${n.node_id}</td>
+      <td><span class="badge badge-${n.node_type}">${n.node_type}</span></td>
+      <td><span class="badge badge-${n.healthy?'healthy':'unhealthy'}">${n.healthy?'Healthy':'Unhealthy'}</span></td>
+      <td>${n.active_connections}</td>
+      <td>${data.max_pool_size}</td>
+      <td>${n.replication_lag_ms !== null ? n.replication_lag_ms + 'ms' : '-'}</td>
+      <td>${n.replay_lsn > 0 ? '0x'+n.replay_lsn.toString(16).toUpperCase() : '-'}</td>
+    </tr>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+// Config: Routing
+async function fetchConfig() {
+  try {
+    const data = await api('/api/config');
+    const form = document.getElementById('routing-form');
+    form.innerHTML = `<h3>Routing Parameters</h3>
+      ${cfgRow('default_consistency', 'select', data.default_consistency, ['eventual','session','global'])}
+      ${cfgRow('enable_transaction_split', 'checkbox', data.enable_transaction_split)}
+      ${cfgRow('split_respects_consistency', 'checkbox', data.split_respects_consistency)}
+      ${cfgRow('enable_hint_routing', 'checkbox', data.enable_hint_routing)}
+      ${cfgRow('enable_cost_routing', 'checkbox', data.enable_cost_routing)}
+      ${cfgRow('cost_threshold', 'number', data.cost_threshold)}
+      ${cfgRow('writer_readable', 'checkbox', data.writer_readable)}
+      ${cfgRow('max_replication_lag_ms', 'number', data.max_replication_lag_ms, null, true)}
+      <p style="color:var(--muted);font-size:0.75rem;margin-top:0.75rem">Changes apply to the running process only and are not written back to the config file. A config-file reload (SIGHUP / POST /reload) or restart reverts them. max_replication_lag_ms is restart-only.</p>
+    `;
+  } catch(e) { console.error(e); }
+}
+function cfgRow(name, type, value, options, readonly) {
+  const label = `<label>${name}</label>`;
+  const dis = readonly ? 'disabled' : '';
+  if (type === 'checkbox') return `<div class="form-row">${label}<input type="checkbox" id="cfg-${name}" ${value?'checked':''} ${dis}></div>`;
+  if (type === 'select') return `<div class="form-row">${label}<select id="cfg-${name}" ${dis}>${options.map(o=>`<option ${o===value?'selected':''}>${o}</option>`).join('')}</select></div>`;
+  return `<div class="form-row">${label}<input type="number" id="cfg-${name}" value="${value}" ${dis}></div>`;
+}
+document.getElementById('btn-save-routing').addEventListener('click', async () => {
+  const body = {
+    default_consistency: document.getElementById('cfg-default_consistency').value,
+    enable_transaction_split: document.getElementById('cfg-enable_transaction_split').checked,
+    split_respects_consistency: document.getElementById('cfg-split_respects_consistency').checked,
+    enable_hint_routing: document.getElementById('cfg-enable_hint_routing').checked,
+    enable_cost_routing: document.getElementById('cfg-enable_cost_routing').checked,
+    cost_threshold: parseFloat(document.getElementById('cfg-cost_threshold').value),
+    writer_readable: document.getElementById('cfg-writer_readable').checked,
+    max_replication_lag_ms: parseInt(document.getElementById('cfg-max_replication_lag_ms').value),
+  };
+  try {
+    await api('/api/config', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    toast('Applied (runtime-only; not written to config file)');
+    fetchConfig();
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+});
+
+// Config: Rules
+async function fetchRules() {
+  try {
+    const data = await api('/custom-rules');
+    const tbody = document.querySelector('#rules-table tbody');
+    tbody.innerHTML = data.map(r => `<tr><td>${r._name}</td><td>${r._type==='t'?'Table':'Function'}</td><td>${r.rw_mode==='w'?'Writer-only':'Reader-eligible'}</td><td><button class="btn btn-danger btn-sm" onclick="deleteRule('${r._name}','${r._type}')">Delete</button></td></tr>`).join('');
+  } catch(e) { console.error(e); }
+}
+document.getElementById('btn-add-rule').addEventListener('click', async () => {
+  const body = { _name: document.getElementById('rule-name').value, _type: document.getElementById('rule-type').value, rw_mode: document.getElementById('rule-mode').value };
+  if (!body._name) return toast('Name is required', 'error');
+  try {
+    await api('/custom-rules', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    toast('Rule added');
+    fetchRules();
+    document.getElementById('rule-name').value = '';
+  } catch(e) { toast(e.message, 'error'); }
+});
+async function deleteRule(name, type) {
+  try {
+    await api('/custom-rules', { method:'DELETE', headers:{'Content-Type':'application/json'}, body: JSON.stringify({_name:name,_type:type}) });
+    toast('Rule deleted');
+    fetchRules();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// Config: LSN Mode
+async function fetchLsnMode() {
+  try {
+    const data = await api('/api/config');
+    const el = document.getElementById('lsn-info');
+    el.innerHTML = `<h3>Current LSN Tracking Mode</h3>
+      <p style="margin:0.5rem 0;font-size:1.25rem;font-weight:600;color:var(--accent)">${data.lsn_mode || 'auto'}</p>
+      <p style="color:var(--muted);font-size:0.85rem;margin-top:0.5rem">This setting is restart-only. Changes require restarting the Trident process.</p>
+      <div style="margin-top:1rem;padding:0.75rem;background:var(--bg);border-radius:4px;font-size:0.8rem">
+        <p><strong>pipeline.internal_query_timeout_ms:</strong> ${data.pipeline_internal_query_timeout_ms || 100}</p>
+        <p><strong>pipeline.lazy_fallback:</strong> ${data.pipeline_lazy_fallback ?? true}</p>
+        <p><strong>extension.guc_name:</strong> ${data.extension_guc_name || 'lsn_tracker.last_lsn'}</p>
+      </div>`;
+  } catch(e) { console.error(e); }
+}
+
+// Config: Pool
+async function fetchPoolConfig() {
+  try {
+    const data = await api('/api/config');
+    const el = document.getElementById('pool-info');
+    el.innerHTML = `<h3>Connection Pool Settings</h3>
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:1rem">These settings are restart-only. Changes require restarting the Trident process.</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
+        <div class="stat-card"><div class="label">Mode</div><div class="value" style="font-size:1.1rem">${data.pool_mode}</div></div>
+        <div class="stat-card"><div class="label">Max Pool Size (per node)</div><div class="value" style="font-size:1.1rem">${data.pool_max_pool_size}</div></div>
+        <div class="stat-card"><div class="label">Min Pool Size (per node)</div><div class="value" style="font-size:1.1rem">${data.pool_min_pool_size}</div></div>
+        <div class="stat-card"><div class="label">Connection Timeout</div><div class="value" style="font-size:1.1rem">${data.pool_connection_timeout}</div></div>
+        <div class="stat-card"><div class="label">Max Idle Time</div><div class="value" style="font-size:1.1rem">${data.pool_max_idle_time}</div></div>
+        <div class="stat-card"><div class="label">Max Lifetime</div><div class="value" style="font-size:1.1rem">${data.pool_max_lifetime}</div></div>
+      </div>`;
+  } catch(e) { console.error(e); }
+}
+
+// Logs (WebSocket with paged view)
+function connectLogs() {
+  if (logWs && logWs.readyState <= 1) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  logWs = new WebSocket(proto + '//' + location.host + '/ws/logs');
+  logWs.onmessage = (ev) => {
+    logBuffer.push(ev.data);
+    if (logBuffer.length > MAX_LOG_LINES) logBuffer.shift();
+    if (document.getElementById('log-autoscroll').checked) {
+      logViewEnd = logBuffer.length;
+      logViewStart = Math.max(0, logViewEnd - LOG_PAGE_SIZE);
+    }
+    renderLogs();
+  };
+  logWs.onclose = () => setTimeout(connectLogs, 2000);
+}
+
+const LOG_PAGE_SIZE = 200;
+let logViewStart = 0;
+let logViewEnd = 0;
+
+function renderLogs() {
+  const filter = document.getElementById('log-level-filter').value;
+  const search = document.getElementById('log-search').value.toLowerCase();
+  const filtered = logBuffer.filter(l => {
+    if (filter && !l.includes(filter)) return false;
+    if (search && !l.toLowerCase().includes(search)) return false;
+    return true;
+  });
+
+  const total = filtered.length;
+  logViewEnd = Math.min(logViewEnd || total, total);
+  logViewStart = Math.max(0, logViewEnd - LOG_PAGE_SIZE);
+  const page = filtered.slice(logViewStart, logViewEnd);
+
+  const container = document.getElementById('log-output');
+  container.innerHTML = page.map(l => {
+    let lvl = 'INFO';
+    if (l.includes('ERROR')) lvl = 'ERROR';
+    else if (l.includes('WARN')) lvl = 'WARN';
+    else if (l.includes('DEBUG')) lvl = 'DEBUG';
+    return `<div class="log-line"><span class="lvl-${lvl}">${esc(l)}</span></div>`;
+  }).join('');
+
+  document.getElementById('log-count').textContent = `${total} lines total`;
+  document.getElementById('log-page-info').textContent = `Showing ${logViewStart+1}-${logViewEnd} of ${total}`;
+  document.getElementById('log-older').disabled = logViewStart <= 0;
+  document.getElementById('log-newer').disabled = logViewEnd >= total;
+
+  if (document.getElementById('log-autoscroll').checked) {
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+document.getElementById('log-older').addEventListener('click', () => {
+  document.getElementById('log-autoscroll').checked = false;
+  logViewEnd = logViewStart;
+  logViewStart = Math.max(0, logViewEnd - LOG_PAGE_SIZE);
+  renderLogs();
+});
+document.getElementById('log-newer').addEventListener('click', () => {
+  logViewStart = logViewEnd;
+  logViewEnd = Math.min(logBuffer.length, logViewStart + LOG_PAGE_SIZE);
+  renderLogs();
+});
+document.getElementById('log-level-filter').addEventListener('change', () => { logViewEnd = 0; renderLogs(); });
+document.getElementById('log-search').addEventListener('input', () => { logViewEnd = 0; renderLogs(); });
+document.getElementById('btn-clear-logs').addEventListener('click', () => { logBuffer.length = 0; logViewStart = 0; logViewEnd = 0; renderLogs(); });
+
+// Auto-refresh
+setInterval(() => {
+  const active = document.querySelector('.nav-item.active');
+  if (active) onPageShow(active.dataset.page);
+}, 5000);
+
+// Initial load
+fetchOverview();
+</script>
+</body>
+</html>

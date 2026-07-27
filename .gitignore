@@ -1,0 +1,29 @@
+# Build artifacts
+/target/
+*.o
+*.so
+*.dylib
+
+# IDE / Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Kiro
+.kiro/
+
+# Test scripts and benchmarks
+/tests/
+/bench/
+
+# Test/local config files
+config-test-*.yaml
+config-local-*.yaml
+
+# Design docs (internal)
+DESIGN.md
+
+# Logs
+*.log

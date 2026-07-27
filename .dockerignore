@@ -1,0 +1,6 @@
+target
+.git
+.kiro
+*.md
+tests
+Cargo.lock.bak

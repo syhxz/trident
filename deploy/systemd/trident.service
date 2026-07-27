@@ -1,0 +1,57 @@
+[Unit]
+Description=Trident PostgreSQL read/write splitting proxy
+Documentation=https://github.com/your-org/trident
+# Trident only proxies to backend PostgreSQL nodes over the network, it
+# does not require a local postgresql.service, so no After=/Requires= on
+# postgresql is declared here. Adjust if your backends run on the same host.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated, unprivileged service account. Create it once with:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin trident
+User=trident
+Group=trident
+
+# Path where the release binary is installed; adjust to your packaging
+# layout (e.g. /opt/trident/bin/trident).
+ExecStart=/usr/local/bin/trident
+# Enables `systemctl reload trident` to hot-reload non-sensitive routing.*
+# settings without a restart (see DEPLOYMENT.md 第 5 节).
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Configuration file path (see DEPLOYMENT.md). Keep this file's
+# permissions restricted (chmod 600, owned by the trident user) since it
+# currently contains backend passwords in plaintext unless you have
+# switched to .pgpass / ${ENV_VAR} substitution.
+Environment=TRIDENT_CONFIG=/etc/trident/config.yaml
+Environment=RUST_LOG=info
+
+# Restart policy: always restart on crash or clean exit, with a short
+# backoff, but bail out if it keeps failing in a tight loop (avoids a
+# crash-restart storm from masking a real configuration problem).
+Restart=always
+RestartSec=2s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# Hardening: Trident does not need to write to the filesystem at runtime
+# (aside from its own log file, if file-based logging is configured), so
+# it is safe to lock most of this down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Allow writing rotated log files if LoggingConfig.dir is configured to a
+# path under /var/log/trident; adjust or remove if logging only goes to
+# stdout/journald (the default).
+ReadWritePaths=/var/log/trident
+
+# Trident is a network proxy; it needs to bind a listening socket and
+# make outbound connections, both of which are unaffected by the above
+# filesystem restrictions.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

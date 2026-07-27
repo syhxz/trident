@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: trident
+  namespace: trident
+spec:
+  type: ClusterIP
+  selector:
+    app: trident
+  ports:
+    - name: pg-proxy
+      port: 6432
+      targetPort: pg-proxy
+      protocol: TCP
+  # PostgreSQL wire protocol is a stateful binary protocol (not HTTP), so
+  # this Service must load-balance at L4/TCP -- which is exactly what a
+  # ClusterIP Service does (no L7/HTTP routing involved). If you run
+  # replicas > 1, enabling ClientIP affinity approximates the "sticky by
+  # source IP" recommendation in DEPLOYMENT.md section 8.3 (CANCEL
+  # affinity) -- it reduces, but does not eliminate, the chance of a
+  # CANCEL landing on a different pod than its original query.
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+---
+# For exposing Trident outside the cluster, uncomment and adapt one of:
+#
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: trident-external
+#   namespace: trident
+# spec:
+#   type: LoadBalancer
+#   selector:
+#     app: trident
+#   sessionAffinity: ClientIP
+#   ports:
+#     - port: 6432
+#       targetPort: pg-proxy

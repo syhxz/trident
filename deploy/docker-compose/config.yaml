@@ -1,0 +1,56 @@
+# Config used by docker-compose.yml, pointing at the two Postgres
+# containers defined there (service names are resolved via Docker's
+# internal DNS, so "writer"/"reader" work as hostnames from inside the
+# trident container).
+proxy:
+  listen_addr: "0.0.0.0:6432"
+  max_clients: 2000
+
+nodes:
+  - name: primary
+    host: writer
+    port: 5432
+    type: writer
+    weight: 1
+    database: mydb
+    username: proxy_user
+    password: proxy_pass
+
+  - name: reader-1
+    host: reader
+    port: 5432
+    type: reader
+    weight: 1
+    database: mydb
+    username: proxy_user
+    password: proxy_pass
+
+routing:
+  default_consistency: session
+  load_balance_strategy: weighted_round_robin
+  enable_transaction_split: true
+  split_respects_consistency: true
+  enable_hint_routing: true
+  enable_cost_routing: false
+  cost_threshold: 50000
+  analytics_patterns: []
+  writer_readable: true
+  max_replication_lag_ms: 1000
+
+pool:
+  mode: transaction
+  max_pool_size: 20
+  min_pool_size: 2
+  max_idle_time: 5m
+  connection_timeout: 5s
+  max_lifetime: 30m
+
+health:
+  check_interval: 3s
+  check_timeout: 2s
+  max_retries: 3
+
+logging:
+  level: info
+  query_trace: false
+  slow_query: 1000
