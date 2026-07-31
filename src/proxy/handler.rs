@@ -1334,6 +1334,29 @@ where
         let held = session.held_backend.as_mut().expect("checked by caller");
         let write_intent = query_has_write_intent(sql);
 
+        // Compute LSN tracking options matching the main path
+        // (handle_simple_query_inner) so that Extension GUC
+        // ParameterStatus messages are intercepted rather than leaked to
+        // the client, and pipeline LSN queries fire on COMMIT when
+        // appropriate.
+        let extension_guc = match self.lsn_tracking.mode {
+            LsnTrackingMode::Extension | LsnTrackingMode::Auto => {
+                Some(self.lsn_tracking.extension.guc_name.as_str())
+            }
+            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraWriteForwarding => None,
+        };
+        let pipeline_mode = match self.lsn_tracking.mode {
+            LsnTrackingMode::Pipeline => true,
+            LsnTrackingMode::Auto => !session.extension_detected,
+            LsnTrackingMode::Extension | LsnTrackingMode::AuroraWriteForwarding => false,
+        };
+        let commit_attempt = session.tx_has_writes
+            && transaction_end_tag(sql) == Some("COMMIT");
+        let pipeline_lsn = pipeline_mode
+            && !self.lsn_tracking.pipeline.lazy_fallback
+            && pipeline_safe_sql(sql)
+            && commit_attempt;
+
         self.cancel_registry.mark_active(
             &session.state.id,
             &held.conn.node_id,
@@ -1344,7 +1367,14 @@ where
             &mut held.socket,
             client_stream,
             sql,
-            QueryForwardOptions::default(),
+            QueryForwardOptions {
+                pipeline_lsn,
+                extension_guc,
+                internal_query_timeout: std::time::Duration::from_millis(
+                    self.lsn_tracking.pipeline.internal_query_timeout_ms,
+                ),
+                begin_prefix: None,
+            },
         )
         .await;
         self.cancel_registry.clear_active(&session.state.id);
@@ -1366,6 +1396,12 @@ where
             }
         };
 
+        if self.lsn_tracking.mode == LsnTrackingMode::Auto
+            && relay_outcome.reported_lsn.is_some()
+        {
+            session.extension_detected = true;
+        }
+
         if write_intent && !relay_outcome.had_error_response {
             session.tx_has_writes = true;
         }
@@ -1375,10 +1411,21 @@ where
         // If the transaction ended, track pending LSN for committed writes
         // and release the held backend.
         if session.state.tx_state == TxState::Idle {
-            // COMMIT with prior writes: mark pending_write so the LSN is
-            // resolved lazily before the next read routes to a reader.
-            // Rollbacks and Eventual consistency don't need LSN tracking.
-            if session.tx_has_writes
+            // COMMIT with prior writes and successful LSN capture: record
+            // the watermark immediately rather than deferring to lazy
+            // resolution. This mirrors handle_simple_query_inner's logic.
+            let successful_commit = commit_attempt
+                && !relay_outcome.had_error_response
+                && relay_outcome.tx_status == TransactionStatus::Idle
+                && relay_outcome.command_tags.iter().any(|tag| tag == "COMMIT");
+            if successful_commit && session.state.consistency != ConsistencyLevel::Eventual {
+                if let Some(lsn) = relay_outcome.reported_lsn.or(relay_outcome.pipelined_lsn) {
+                    self.lsn_tracker.record_write(&session.state.id, lsn);
+                    session.pending_write = false;
+                } else {
+                    session.pending_write = true;
+                }
+            } else if session.tx_has_writes
                 && transaction_end_tag(sql) == Some("COMMIT")
                 && !relay_outcome.had_error_response
                 && session.state.consistency != ConsistencyLevel::Eventual
@@ -1389,16 +1436,38 @@ where
             if let Some(split) = session.state.tx_split.take() {
                 let _ = split;
             }
-            let held = session.held_backend.take().unwrap();
-            let pool = self.pool_manager.pool_for(&held.conn.node_id).ok_or_else(|| {
-                ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
-                    "pool for '{}' no longer exists",
-                    held.conn.node_id
-                )))
-            })?;
-            self.connection_registry
-                .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
-            pool.release(&session.state.id, held.conn).await?;
+
+            // Pinned connections must stay held (consistent with the main
+            // path in handle_simple_query_inner) so subsequent statements
+            // always find them via the fast path without an unnecessary
+            // pool acquire/release cycle.
+            let held = session.held_backend.as_ref().unwrap();
+            if held.conn.pinned {
+                // Keep in held_backend — nothing to do.
+            } else {
+                let held = session.held_backend.take().unwrap();
+                let pool = self.pool_manager.pool_for(&held.conn.node_id).ok_or_else(|| {
+                    ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
+                        "pool for '{}' no longer exists",
+                        held.conn.node_id
+                    )))
+                })?;
+                self.connection_registry
+                    .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
+                pool.release(&session.state.id, held.conn).await?;
+            }
+        }
+
+        // The client write/commit completed but the internal pipeline LSN
+        // cycle timed out or failed. The connection is in an unknown state
+        // and must not be reused.
+        if !relay_outcome.connection_reusable {
+            if let Some(held) = session.held_backend.take() {
+                if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                    let _ = pool.discard(held.conn);
+                }
+                drop(held.socket);
+            }
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await?;

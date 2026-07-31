@@ -15,7 +15,6 @@
 //!   (Requirement 11.5).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -38,36 +37,34 @@ use crate::session::session::TxState;
 #[derive(Debug, Default)]
 pub struct ExtendedQueryRouteTracker {
     /// statement name -> node_id chosen when the statement was parsed.
-    routes: Mutex<HashMap<String, String>>,
+    routes: HashMap<String, String>,
 }
 
 impl ExtendedQueryRouteTracker {
     pub fn new() -> Self {
         ExtendedQueryRouteTracker {
-            routes: Mutex::new(HashMap::new()),
+            routes: HashMap::new(),
         }
     }
 
     /// Records the routing target decided when a `Parse` message for
     /// `statement_name` was processed.
-    pub fn record_parse_route(&self, statement_name: &str, node_id: &str) {
-        let mut routes = self.routes.lock().expect("route tracker lock poisoned");
-        routes.insert(statement_name.to_string(), node_id.to_string());
+    pub fn record_parse_route(&mut self, statement_name: &str, node_id: &str) {
+        self.routes
+            .insert(statement_name.to_string(), node_id.to_string());
     }
 
     /// Returns the node id that a `Bind`/`Execute` referencing
     /// `statement_name` must be forwarded to, if a `Parse` was previously
     /// recorded for that name.
     pub fn route_for_statement(&self, statement_name: &str) -> Option<String> {
-        let routes = self.routes.lock().expect("route tracker lock poisoned");
-        routes.get(statement_name).cloned()
+        self.routes.get(statement_name).cloned()
     }
 
     /// Removes a statement's recorded route (e.g. on `DEALLOCATE` or when
     /// the unnamed statement is re-parsed).
-    pub fn forget_statement(&self, statement_name: &str) {
-        let mut routes = self.routes.lock().expect("route tracker lock poisoned");
-        routes.remove(statement_name);
+    pub fn forget_statement(&mut self, statement_name: &str) {
+        self.routes.remove(statement_name);
     }
 }
 
@@ -473,7 +470,12 @@ async fn write_raw_frame<C: AsyncWrite + Unpin + Send>(
     tag: u8,
     body: &[u8],
 ) -> Result<(), ProtocolError> {
-    let len = (body.len() as i32) + 4;
+    let body_len = body.len();
+    debug_assert!(
+        body_len <= (i32::MAX - 4) as usize,
+        "message body exceeds PostgreSQL protocol limit"
+    );
+    let len = (body_len as i32) + 4;
     let header: [u8; 5] = [
         tag,
         (len >> 24) as u8,
@@ -595,7 +597,7 @@ mod tests {
             node_id in "[a-z][a-z0-9_-]{0,10}",
             lookups in 1usize..10,
         ) {
-            let tracker = ExtendedQueryRouteTracker::new();
+            let mut tracker = ExtendedQueryRouteTracker::new();
             tracker.record_parse_route(&statement_name, &node_id);
 
             for _ in 0..lookups {
@@ -639,7 +641,7 @@ mod tests {
 
     #[test]
     fn forget_statement_removes_recorded_route() {
-        let tracker = ExtendedQueryRouteTracker::new();
+        let mut tracker = ExtendedQueryRouteTracker::new();
         tracker.record_parse_route("stmt1", "writer");
         assert_eq!(tracker.route_for_statement("stmt1"), Some("writer".to_string()));
         tracker.forget_statement("stmt1");
@@ -648,7 +650,7 @@ mod tests {
 
     #[test]
     fn re_parsing_a_statement_overwrites_its_route() {
-        let tracker = ExtendedQueryRouteTracker::new();
+        let mut tracker = ExtendedQueryRouteTracker::new();
         tracker.record_parse_route("stmt1", "writer");
         tracker.record_parse_route("stmt1", "reader-1");
         assert_eq!(tracker.route_for_statement("stmt1"), Some("reader-1".to_string()));

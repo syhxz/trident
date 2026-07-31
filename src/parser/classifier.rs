@@ -124,6 +124,15 @@ fn skip_leading_comments_and_whitespace(sql: &str) -> &str {
     }
 }
 
+/// Returns `true` if `b` can appear in an unquoted SQL identifier
+/// (alphanumeric, underscore, or high-byte for non-ASCII identifiers).
+/// Used to distinguish the `E` prefix of escape-string literals from
+/// the tail of a regular identifier like `table`.
+#[inline]
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b > 127
+}
+
 /// Conservatively detects more than one top-level statement in a Simple
 /// Query message. Semicolons inside quoted strings/identifiers, nested block
 /// comments, line comments, dollar-quoted bodies, or parentheses do not split
@@ -139,11 +148,17 @@ pub fn contains_multiple_statements(sql: &str) -> bool {
     while index < bytes.len() {
         match bytes[index] {
             b'\'' => {
+                // Detect E'...' escape-string literal: preceding char must be
+                // E/e and the char before that (if any) must be a non-identifier
+                // character (whitespace, operator, open paren, comma, etc.).
+                let is_escape_string = index > 0
+                    && (bytes[index - 1] == b'E' || bytes[index - 1] == b'e')
+                    && (index < 2 || !is_ident_char(bytes[index - 2]));
                 statement_has_content = true;
                 index += 1;
                 while index < bytes.len() {
                     match bytes[index] {
-                        b'\\' if index + 1 < bytes.len() => index += 2,
+                        b'\\' if is_escape_string && index + 1 < bytes.len() => index += 2,
                         b'\'' if index + 1 < bytes.len() && bytes[index + 1] == b'\'' => {
                             index += 2;
                         }
@@ -277,10 +292,16 @@ pub fn split_statements(sql: &str) -> Option<Vec<&str>> {
     while index < bytes.len() {
         match bytes[index] {
             b'\'' => {
+                // Detect E'...' escape-string literal: preceding char must be
+                // E/e and the char before that (if any) must be a non-identifier
+                // character (whitespace, operator, open paren, comma, etc.).
+                let is_escape_string = index > 0
+                    && (bytes[index - 1] == b'E' || bytes[index - 1] == b'e')
+                    && (index < 2 || !is_ident_char(bytes[index - 2]));
                 index += 1;
                 while index < bytes.len() {
                     match bytes[index] {
-                        b'\\' if index + 1 < bytes.len() => index += 2,
+                        b'\\' if is_escape_string && index + 1 < bytes.len() => index += 2,
                         b'\'' if index + 1 < bytes.len() && bytes[index + 1] == b'\'' => {
                             index += 2;
                         }
@@ -649,5 +670,44 @@ mod tests {
                 "unexpectedly classified as multiple statements: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn backslash_in_standard_string_is_not_escape() {
+        // In standard_conforming_strings=on (PG 9.1+ default), backslash in
+        // '...' is a literal character. A bare '\' followed by a quote should
+        // terminate the string, not escape it.
+        // This SQL is: SELECT '\'; SELECT 1  → two statements
+        assert!(contains_multiple_statements("SELECT '\\'; SELECT 1"));
+        // split_statements should also split correctly
+        let parts = split_statements("SELECT '\\'; SELECT 1").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "SELECT '\\'");
+        assert_eq!(parts[1], "SELECT 1");
+    }
+
+    #[test]
+    fn backslash_in_escape_string_is_escape() {
+        // E'...' strings DO treat backslash as escape character.
+        // E'\'' is a single-character string containing one quote.
+        // So: SELECT E'\''; SELECT 1 → two statements (E'\'' is the string, then semicolon)
+        // But: SELECT E'\';  → single statement (backslash escapes the quote,
+        //      string is unterminated at end but we consume to end without a second stmt)
+        assert!(!contains_multiple_statements("SELECT E'\\'; SELECT 1"));
+        // The E-string swallows the \' so the remaining text is part of the string
+        assert!(!contains_multiple_statements("SELECT e'foo\\'; SELECT 1"));
+    }
+
+    #[test]
+    fn escape_prefix_must_not_be_part_of_identifier() {
+        // "table" ends in 'e' but the quote after it is a regular string, not E'...'
+        // So: SELECT table'\\'; SELECT 1 → two statements
+        assert!(contains_multiple_statements("SELECT table'\\'; SELECT 1"));
+        // But a standalone E prefix is an escape string:
+        assert!(!contains_multiple_statements("SELECT E'\\'; SELECT 1"));
+        // After whitespace:
+        assert!(!contains_multiple_statements("SELECT  e'\\'; SELECT 1"));
+        // After open paren:
+        assert!(!contains_multiple_statements("SELECT (E'\\'; SELECT 1)"));
     }
 }
