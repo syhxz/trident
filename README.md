@@ -134,6 +134,36 @@ Tested on a 2-vCPU EC2 instance (t-series). Trident uses a multi-threaded tokio 
 - A 4-vCPU instance is expected to reach ~50K read TPS; 8-vCPU ~100K TPS
 - For higher throughput, deploy multiple Trident instances behind a NLB (see Deployment section)
 
+### Upgraded EC2 Proxy — Controlled Comparison (Proxy vs Direct)
+
+After upgrading the EC2 proxy instance from **c7g.large (2 vCPU / 4 GB)** to **c7g.xlarge (4 vCPU / 8 GB)**, a controlled A/B test was conducted with proper warm-up (eliminating Serverless cold-start effects) and reversed test order (proxy first, then direct) to ensure fair comparison.
+
+**Environment**: Aurora PostgreSQL Serverless (pre-warmed), Trident on c7g.xlarge, pgbench scale=100, 30s per test.
+
+| Scenario | Clients | Proxy TPS | Direct TPS | Proxy Advantage |
+|----------|---------|-----------|------------|-----------------|
+| TPC-B Mixed | 10 | 999 | 968 | +3.2% |
+| | 50 | 3,073 | 3,091 | ≈Tied |
+| | 100 | 4,001 | 3,575 | **+11.9%** |
+| Read-Only | 10 | 15,548 | 17,306 | -10% (direct faster) |
+| | 50 | 32,016 | 20,331 | **+57.5%** |
+| | 100 | 34,647 | 22,748 | **+52.3%** |
+| Write-Only | 10 | 1,306 | 1,227 | +6.4% |
+| | 50 | 4,234 | 3,542 | **+19.5%** |
+| | 100 | 6,299 | 4,819 | **+30.7%** |
+| Pool Stress | 200 | 33,889 | 22,507 | **+50.5%** |
+| | 500 | 35,633 | 20,472 | **+74.0%** |
+
+#### Key Findings
+
+1. **Serverless warm-up is not the main factor** — Proxy maintains its advantage after full warm-up, confirming real performance gains
+2. **Low concurrency (10 clients): minimal gap** — At 10 clients, direct is slightly faster for reads (-10%) since the proxy hop adds latency without pool contention benefits
+3. **Medium-to-high concurrency: proxy advantage is substantial** — At 50+ clients, connection pool reuse far outweighs the extra hop:
+   - Read-Only: **+52% ~ +57%**
+   - Write-Only: **+20% ~ +31%**
+   - Pool Stress (200-500 clients): **+50% ~ +74%**
+4. **TPC-B Mixed at 50 clients is tied** — True write-heavy improvement is +3% ~ +12%, lower than initial tests suggested (some earlier gains were warm-up artifacts)
+
 ## Deployment
 
 Three deployment options are provided:

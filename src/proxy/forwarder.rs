@@ -337,9 +337,25 @@ where
             }
             TAG_PARAMETER_STATUS if options.extension_guc.is_some() => {
                 // Check if this is the extension LSN GUC we're watching.
-                let (name, value) = extract_two_cstrings(&body);
-                if Some(name.as_str()) == options.extension_guc {
-                    reported_lsn = crate::health::parse_lsn(&value);
+                // Zero-copy: compare the GUC name directly in the raw body
+                // bytes (body format is: name\0value\0) without allocating
+                // Strings unless we actually need the value.
+                let guc = options.extension_guc.unwrap();
+                let guc_bytes = guc.as_bytes();
+                let is_our_guc = body.len() > guc_bytes.len()
+                    && &body[..guc_bytes.len()] == guc_bytes
+                    && body[guc_bytes.len()] == 0;
+                if is_our_guc {
+                    // Extract just the value (after name\0)
+                    let value_start = guc_bytes.len() + 1;
+                    let value_end = body[value_start..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .map(|p| value_start + p)
+                        .unwrap_or(body.len());
+                    let value_str = std::str::from_utf8(&body[value_start..value_end])
+                        .unwrap_or("");
+                    reported_lsn = crate::health::parse_lsn(value_str);
                     // Suppress this message from the client.
                 } else {
                     // Not our GUC — relay raw.
@@ -465,8 +481,18 @@ async fn write_raw_frame<C: AsyncWrite + Unpin + Send>(
         (len >> 8) as u8,
         len as u8,
     ];
-    client.write_all(&header).await?;
-    if !body.is_empty() {
+    // For small messages (≤ 8KB - 5 bytes header), combine header + body
+    // into a single write_all call to reduce syscall overhead. The BufWriter
+    // layer coalesces further, but avoiding the second write_all eliminates
+    // an await point and potential partial flush for messages that fit in a
+    // small stack buffer.
+    if body.len() <= 8187 {
+        let mut buf = Vec::with_capacity(5 + body.len());
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(body);
+        client.write_all(&buf).await?;
+    } else {
+        client.write_all(&header).await?;
         client.write_all(body).await?;
     }
     Ok(())
@@ -480,22 +506,6 @@ fn extract_cstring(body: &[u8]) -> String {
         Some(pos) => String::from_utf8_lossy(&body[..pos]).into_owned(),
         None => String::from_utf8_lossy(body).into_owned(),
     }
-}
-
-/// Extracts two consecutive C-strings from a message body (used for
-/// ParameterStatus which contains name + value).
-#[inline]
-fn extract_two_cstrings(body: &[u8]) -> (String, String) {
-    let first_end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
-    let first = String::from_utf8_lossy(&body[..first_end]).into_owned();
-    let rest = if first_end + 1 < body.len() {
-        &body[first_end + 1..]
-    } else {
-        &[]
-    };
-    let second_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-    let second = String::from_utf8_lossy(&rest[..second_end]).into_owned();
-    (first, second)
 }
 
 async fn drain_internal_lsn_query<B>(

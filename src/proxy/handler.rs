@@ -2515,8 +2515,13 @@ async fn write_raw_frame_to<S: AsyncWrite + Unpin + Send>(
         (len >> 8) as u8,
         len as u8,
     ];
-    client.write_all(&header).await.map_err(ProtocolError::Io)?;
-    if !body.is_empty() {
+    if body.len() <= 8187 {
+        let mut buf = Vec::with_capacity(5 + body.len());
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(body);
+        client.write_all(&buf).await.map_err(ProtocolError::Io)?;
+    } else {
+        client.write_all(&header).await.map_err(ProtocolError::Io)?;
         client.write_all(body).await.map_err(ProtocolError::Io)?;
     }
     Ok(())
@@ -2649,13 +2654,17 @@ async fn send_ready_for_query<S: AsyncWrite + Unpin + Send>(
     stream: &mut S,
     tx_state: TxState,
 ) -> Result<(), ProxyError> {
-    let status = match tx_state {
-        TxState::Idle => TransactionStatus::Idle,
-        TxState::InTransaction => TransactionStatus::InTransaction,
-        TxState::Failed => TransactionStatus::Failed,
+    // ReadyForQuery is always exactly 6 bytes: tag('Z') + len(5) + status.
+    // Use pre-built constants to avoid encode_backend_message overhead.
+    static RFQ_IDLE: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+    static RFQ_IN_TX: [u8; 6] = [b'Z', 0, 0, 0, 5, b'T'];
+    static RFQ_FAILED: [u8; 6] = [b'Z', 0, 0, 0, 5, b'E'];
+    let bytes = match tx_state {
+        TxState::Idle => &RFQ_IDLE,
+        TxState::InTransaction => &RFQ_IN_TX,
+        TxState::Failed => &RFQ_FAILED,
     };
-    let bytes = encode_backend_message(&BackendMessage::ReadyForQuery(status));
-    stream.write_all(&bytes).await.map_err(ProtocolError::Io)?;
+    stream.write_all(bytes).await.map_err(ProtocolError::Io)?;
     Ok(())
 }
 
