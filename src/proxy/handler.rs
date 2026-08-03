@@ -68,6 +68,13 @@ pub struct ClientSession {
     /// Tracks which backend node each named prepared statement was parsed on,
     /// so subsequent Bind/Execute referencing it are forwarded consistently.
     extended_route_tracker: ExtendedQueryRouteTracker,
+    /// When an unnamed Parse is issued, tracks the node_id for the current
+    /// batch. By default (strict mode), a Bind referencing the unnamed
+    /// statement in a *different* batch (cross-Sync) is rejected with a
+    /// protocol error, matching PgBouncer behavior. When
+    /// `allow_cross_sync_unnamed` is enabled, the proxy instead holds the
+    /// connection until the Bind arrives.
+    unnamed_parse_node: Option<String>,
 }
 
 /// A backend connection checked out exclusively by this client. It is
@@ -181,6 +188,7 @@ impl ClientSession {
             aurora_node_id: None,
             aurora_initialized_backend_pid: None,
             extended_route_tracker: ExtendedQueryRouteTracker::new(),
+            unnamed_parse_node: None,
         }
     }
 }
@@ -389,7 +397,7 @@ where
 
         // --- Authentication -----------------------------------------------
         let auth_outcome = startup_handler
-            .handle_startup(startup_msg)
+            .handle_startup_with_stream(startup_msg, &mut client_stream)
             .await
             .map_err(ProxyError::Protocol)?;
         send_startup_success(&mut client_stream, &auth_outcome).await?;
@@ -695,21 +703,71 @@ where
         // frame whose header C-strings cannot be extracted is malformed
         // enough that routing is impossible; reject it here (the strict
         // parser would previously have rejected it at read time).
-        let route_sql = match batch.iter().find(|f| f.tag == frontend_tag::PARSE) {
-            Some(frame) => Some(frame.parse_sql().ok_or_else(|| {
+        //
+        // FIX: Check ALL Parse messages in the batch, not just the first.
+        // If any Parse requires a Writer (e.g. INSERT, UPDATE), the entire
+        // batch must be routed to the Writer. This prevents a batch like
+        // [Parse(SELECT), Parse(INSERT)] from being sent to a Reader.
+        let mut route_sql: Option<&str> = None;
+        let classifier = KeywordClassifier;
+        for frame in batch.iter().filter(|f| f.tag == frontend_tag::PARSE) {
+            let sql = frame.parse_sql().ok_or_else(|| {
                 ProxyError::Protocol(ProtocolError::Malformed(
                     "Parse message missing statement name or query C-string".into(),
                 ))
-            })?),
-            None => None,
-        };
+            })?;
+            if route_sql.is_none() {
+                route_sql = Some(sql);
+            }
+            // If any Parse in the batch requires a Writer, use that SQL
+            // for routing so the entire batch goes to the Writer.
+            if requires_writer(&classifier, sql) {
+                route_sql = Some(sql);
+                break;
+            }
+        }
 
         // If no Parse in batch, look up the statement name referenced by
         // Bind/Describe(Statement) to find its previously recorded route
         // target. Execute references a *portal* (a separate namespace
         // created by Bind on a specific connection), so portal names are
         // deliberately not looked up here.
+        //
+        // FIX: Cross-Sync unnamed statement references are rejected by
+        // default (PgBouncer behavior). The unnamed statement only exists
+        // on the physical connection that executed the Parse; without
+        // pinning that connection, a cross-Sync Bind("") would land on a
+        // different backend. Rather than degrading transaction pooling to
+        // session pooling (which would happen if we pinned on every
+        // parameterized query), we return a protocol error. Well-behaved
+        // drivers always send Parse+Bind+Execute in the same batch.
         let tracked_node = if route_sql.is_none() {
+            // Check if this batch references the unnamed statement cross-Sync
+            let references_unnamed_cross_sync = batch.iter().any(|frame| match frame.tag {
+                frontend_tag::BIND => match frame.bind_statement() {
+                    Some(stmt) if stmt.is_empty() => true,
+                    _ => false,
+                },
+                frontend_tag::DESCRIBE => match frame.kind_and_name() {
+                    Some((b'S', name)) if name.is_empty() => true,
+                    _ => false,
+                },
+                _ => false,
+            });
+
+            if references_unnamed_cross_sync && session.unnamed_parse_node.is_some() {
+                // Reject: unnamed statement Bind/Describe arrived in a
+                // different batch from its Parse. This is unsupported in
+                // transaction pooling mode (same as PgBouncer).
+                return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                    "unnamed prepared statement cannot be referenced across Sync \
+                     boundaries in transaction pooling mode. Ensure Parse, Bind, \
+                     and Execute for unnamed statements are sent in the same message batch."
+                        .into(),
+                )));
+            }
+
+            // Named statement lookup
             batch.iter().find_map(|frame| match frame.tag {
                 frontend_tag::BIND => match frame.bind_statement() {
                     Some(statement) if !statement.is_empty() => {
@@ -851,6 +909,26 @@ where
             pool.pin(&session.state.id, &mut conn);
         }
 
+        // Detect connection-pinning triggers in ALL Parse SQL within this
+        // batch (not just named statements). This mirrors the simple-query
+        // path's `detects_pinning_trigger()` call. Without this, extended
+        // protocol SET search_path, LISTEN, CREATE TEMP TABLE, advisory
+        // locks etc. would return the connection to the shared pool without
+        // DISCARD ALL, leaking session state to other clients.
+        let batch_pinning_trigger = batch.iter().find_map(|frame| {
+            if frame.tag == frontend_tag::PARSE {
+                frame.parse_sql().and_then(detects_pinning_trigger)
+            } else {
+                None
+            }
+        });
+        if batch_pinning_trigger.is_some() {
+            conn.dirty = true;
+            if !conn.pinned {
+                pool.pin(&session.state.id, &mut conn);
+            }
+        }
+
         // Aurora write forwarding: initialize the consistency GUC once per
         // physical backend, mirroring the Simple Query Aurora path.
         if self.lsn_tracking.mode == LsnTrackingMode::AuroraWriteForwarding
@@ -918,8 +996,28 @@ where
             match tag {
                 b'Z' => {
                     // ReadyForQuery: extract status, do NOT relay (handler sends its own).
-                    let status = TransactionStatus::from_byte(*body.first().unwrap_or(&b'I'))
-                        .unwrap_or(TransactionStatus::Idle);
+                    // Reject malformed ReadyForQuery (body must be exactly 1 byte
+                    // containing I/T/E). Invalid bytes previously degraded to Idle,
+                    // which could return a connection in unknown state to the pool.
+                    if body.len() != 1 {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        drop(backend_socket);
+                        return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                            "ReadyForQuery body length is not 1".into(),
+                        )));
+                    }
+                    let status = match TransactionStatus::from_byte(body[0]) {
+                        Some(s) => s,
+                        None => {
+                            self.cancel_registry.clear_active(&session.state.id);
+                            pool.discard(conn)?;
+                            drop(backend_socket);
+                            return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                                format!("ReadyForQuery invalid status byte: 0x{:02x}", body[0]),
+                            )));
+                        }
+                    };
                     break status;
                 }
                 b'C' => {
@@ -998,6 +1096,10 @@ where
         // on Close. Only process if the batch succeeded (no error).
         if !had_error {
             record_statement_routes(session, batch, &conn.node_id);
+            // Track unnamed Parse: if this batch contained a Parse with an
+            // empty name, record the node so subsequent Bind("") across
+            // Sync boundaries can find the correct physical connection.
+            update_unnamed_parse_tracking(session, batch, &conn.node_id);
         }
 
         // Track writes for LSN watermark. Two cases:
@@ -1035,6 +1137,11 @@ where
         if session.state.tx_state != TxState::Idle || conn.pinned {
             session.held_backend = Some(HeldBackend { conn, socket: backend_socket });
         } else {
+            // Connection returned to pool: any unnamed statement on it is
+            // gone (the physical connection may be handed to another client).
+            // Clear the tracking flag so the next batch with Bind("") doesn't
+            // spuriously trigger the cross-Sync rejection.
+            session.unnamed_parse_node = None;
             self.connection_registry
                 .insert(&conn.node_id, conn.backend_pid, backend_socket);
             pool.release(&session.state.id, conn).await?;
@@ -1115,8 +1222,32 @@ where
 
             match tag {
                 b'Z' => {
-                    let status = TransactionStatus::from_byte(*body.first().unwrap_or(&b'I'))
-                        .unwrap_or(TransactionStatus::Idle);
+                    // Strict ReadyForQuery validation (same as non-held path).
+                    if body.len() != 1 {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        drop(held.socket);
+                        return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                            "ReadyForQuery body length is not 1".into(),
+                        )));
+                    }
+                    let status = match TransactionStatus::from_byte(body[0]) {
+                        Some(s) => s,
+                        None => {
+                            self.cancel_registry.clear_active(&session.state.id);
+                            let held = session.held_backend.take().unwrap();
+                            if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                                let _ = pool.discard(held.conn);
+                            }
+                            drop(held.socket);
+                            return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                                format!("ReadyForQuery invalid status byte: 0x{:02x}", body[0]),
+                            )));
+                        }
+                    };
                     break status;
                 }
                 b'C' => {
@@ -1189,8 +1320,19 @@ where
         // fail after COMMIT with "prepared statement does not exist".
         if !had_error {
             let creates_named_statement = batch.iter().any(frame_is_named_parse);
-            if creates_named_statement {
+            // Also detect pinning triggers in Parse SQL (SET, LISTEN, etc.)
+            let batch_pinning_trigger = batch.iter().find_map(|frame| {
+                if frame.tag == frontend_tag::PARSE {
+                    frame.parse_sql().and_then(detects_pinning_trigger)
+                } else {
+                    None
+                }
+            });
+            if creates_named_statement || batch_pinning_trigger.is_some() {
                 let held = session.held_backend.as_mut().expect("checked by caller");
+                if batch_pinning_trigger.is_some() {
+                    held.conn.dirty = true;
+                }
                 if !held.conn.pinned {
                     if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
                         pool.pin(&session.state.id, &mut held.conn);
@@ -1205,6 +1347,7 @@ where
                 .node_id
                 .clone();
             record_statement_routes(session, batch, &held_node_id);
+            update_unnamed_parse_tracking(session, batch, &held_node_id);
         }
 
         // Track writes for LSN watermark (same logic as full path).
@@ -1235,6 +1378,8 @@ where
             let held = session.held_backend.as_ref().unwrap();
             if !held.conn.pinned {
                 let held = session.held_backend.take().unwrap();
+                // Unnamed statement is gone once connection returns to pool.
+                session.unnamed_parse_node = None;
                 let pool = self.pool_manager.pool_for(&held.conn.node_id).ok_or_else(|| {
                     ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
                         "pool for '{}' no longer exists",
@@ -2568,6 +2713,43 @@ fn record_statement_routes(session: &mut ClientSession, batch: &[ExtendedFrame],
             _ => {}
         }
     }
+}
+
+/// Tracks which node an unnamed Parse was sent to, and clears it when the
+/// batch contains a Bind referencing the unnamed statement (meaning the
+/// Parse+Bind+Execute cycle is complete within this batch or the Bind has
+/// consumed it). This enables cross-Sync unnamed statement routing.
+fn update_unnamed_parse_tracking(session: &mut ClientSession, batch: &[ExtendedFrame], node_id: &str) {
+    let has_unnamed_parse = batch.iter().any(|frame| {
+        frame.tag == frontend_tag::PARSE
+            && frame.body.first().is_some_and(|&b| b == 0) // empty name = unnamed
+    });
+    let has_unnamed_bind = batch.iter().any(|frame| {
+        frame.tag == frontend_tag::BIND && {
+            // Bind body: portal_name\0 statement_name\0 ...
+            // Check if statement_name (second C-string) is empty
+            if let Some((_, next)) = cstr_at(&frame.body, 0) {
+                frame.body.get(next) == Some(&0) // empty statement name
+            } else {
+                false
+            }
+        }
+    });
+
+    if has_unnamed_parse {
+        if has_unnamed_bind {
+            // Parse + Bind in same batch: cycle complete, no cross-Sync needed
+            session.unnamed_parse_node = None;
+        } else {
+            // Parse without Bind: next batch's Bind must go to this node
+            session.unnamed_parse_node = Some(node_id.to_string());
+        }
+    } else if has_unnamed_bind {
+        // Bind consumed the previously tracked unnamed Parse
+        session.unnamed_parse_node = None;
+    }
+    // Otherwise: batch has neither unnamed Parse nor unnamed Bind, keep
+    // existing tracking unchanged.
 }
 
 /// Writes a raw PostgreSQL wire frame to the client stream.

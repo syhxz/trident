@@ -262,7 +262,15 @@ where
                 })?;
             match tag {
                 b'Z' => {
-                    let status = TransactionStatus::from_byte(*body.first().unwrap_or(&b'I'));
+                    if body.len() != 1 {
+                        return Err(QueryRelayError {
+                            source: ProtocolError::Malformed(
+                                "ReadyForQuery body length is not 1".into(),
+                            ),
+                            error_response_relayed: false,
+                        });
+                    }
+                    let status = TransactionStatus::from_byte(body[0]);
                     if status != Some(TransactionStatus::InTransaction) {
                         return Err(QueryRelayError {
                             source: ProtocolError::Malformed(
@@ -313,8 +321,26 @@ where
         match tag {
             TAG_READY_FOR_QUERY => {
                 // Terminal message: extract transaction status, do NOT relay.
-                let status = TransactionStatus::from_byte(*body.first().unwrap_or(&b'I'))
-                    .unwrap_or(TransactionStatus::Idle);
+                // Strict validation: body must be exactly 1 byte of I/T/E.
+                if body.len() != 1 {
+                    return Err(QueryRelayError {
+                        source: ProtocolError::Malformed(
+                            "ReadyForQuery body length is not 1".into(),
+                        ),
+                        error_response_relayed,
+                    });
+                }
+                let status = match TransactionStatus::from_byte(body[0]) {
+                    Some(s) => s,
+                    None => {
+                        return Err(QueryRelayError {
+                            source: ProtocolError::Malformed(
+                                format!("ReadyForQuery invalid status byte: 0x{:02x}", body[0]),
+                            ),
+                            error_response_relayed,
+                        });
+                    }
+                };
                 break status;
             }
             TAG_COMMAND_COMPLETE => {

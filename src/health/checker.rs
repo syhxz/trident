@@ -79,15 +79,16 @@ const CONSECUTIVE_THRESHOLD: u32 = 3;
 /// A single node's health state machine: decides the healthy <-> unhealthy
 /// transition based on the number of consecutive successes/failures.
 ///
-/// See Property 35: transitions from healthy to unhealthy only after 3
-/// consecutive failures; transitions from unhealthy to healthy only after
-/// 3 consecutive successes; an opposite-outcome result resets the
-/// corresponding counter.
+/// See Property 35: transitions from healthy to unhealthy only after N
+/// consecutive failures (configurable, default 3); transitions from
+/// unhealthy to healthy only after N consecutive successes; an
+/// opposite-outcome result resets the corresponding counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthStateMachine {
     healthy: bool,
     consecutive_failures: u32,
     consecutive_successes: u32,
+    threshold: u32,
 }
 
 impl Default for HealthStateMachine {
@@ -98,6 +99,7 @@ impl Default for HealthStateMachine {
             healthy: true,
             consecutive_failures: 0,
             consecutive_successes: 0,
+            threshold: CONSECUTIVE_THRESHOLD,
         }
     }
 }
@@ -108,6 +110,18 @@ impl HealthStateMachine {
             healthy: initially_healthy,
             consecutive_failures: 0,
             consecutive_successes: 0,
+            threshold: CONSECUTIVE_THRESHOLD,
+        }
+    }
+
+    /// Creates a state machine with a custom threshold for transitions.
+    pub fn with_threshold(initially_healthy: bool, threshold: u32) -> Self {
+        let threshold = if threshold == 0 { CONSECUTIVE_THRESHOLD } else { threshold };
+        HealthStateMachine {
+            healthy: initially_healthy,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            threshold,
         }
     }
 
@@ -121,13 +135,13 @@ impl HealthStateMachine {
         if success {
             self.consecutive_failures = 0;
             self.consecutive_successes += 1;
-            if !self.healthy && self.consecutive_successes >= CONSECUTIVE_THRESHOLD {
+            if !self.healthy && self.consecutive_successes >= self.threshold {
                 self.healthy = true;
             }
         } else {
             self.consecutive_successes = 0;
             self.consecutive_failures += 1;
-            if self.healthy && self.consecutive_failures >= CONSECUTIVE_THRESHOLD {
+            if self.healthy && self.consecutive_failures >= self.threshold {
                 self.healthy = false;
             }
         }
@@ -433,6 +447,19 @@ impl<P: HealthProbe> HealthChecker<P> {
         max_replication_lag_ms: u64,
         check_timeout: Duration,
     ) -> Self {
+        Self::with_max_retries(node_probes, max_replication_lag_ms, check_timeout, CONSECUTIVE_THRESHOLD)
+    }
+
+    /// Creates a HealthChecker with a custom `max_retries` threshold for
+    /// the consecutive-failure/success state machine. This is the value
+    /// from `health.max_retries` in the configuration file.
+    pub fn with_max_retries(
+        node_probes: Vec<(String, NodeType, u32, P)>,
+        max_replication_lag_ms: u64,
+        check_timeout: Duration,
+        max_retries: u32,
+    ) -> Self {
+        let threshold = if max_retries == 0 { CONSECUTIVE_THRESHOLD } else { max_retries };
         let mut probes = HashMap::new();
         let mut nodes = HashMap::new();
         for (node_id, node_type, weight, probe) in node_probes {
@@ -442,7 +469,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                 TrackedNode {
                     node_type,
                     weight,
-                    state: HealthStateMachine::default(),
+                    state: HealthStateMachine::with_threshold(true, threshold),
                     last_replay_lsn: 0,
                     last_replication_lag_ms: None,
                 },

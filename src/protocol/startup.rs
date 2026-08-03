@@ -124,12 +124,32 @@ pub struct AuthOutcome {
     pub secret_key: i32,
 }
 
-/// Startup/authentication flow handling
+/// Startup/authentication flow handling.
+///
+/// Two levels of auth are supported:
+/// - `handle_startup`: returns immediately (trust mode, or when auth is
+///   performed externally).
+/// - `handle_startup_with_stream`: given a mutable reference to the client
+///   stream, can perform multi-round-trip auth (MD5, SCRAM). Default
+///   implementation delegates to `handle_startup` (trust mode).
+///
+/// Implementations that need to send AuthenticationRequest / receive
+/// PasswordMessage should override `handle_startup_with_stream`.
 pub trait StartupHandler {
     fn handle_startup(
         &mut self,
         msg: StartupMessage,
     ) -> impl std::future::Future<Output = Result<AuthOutcome, ProtocolError>> + Send;
+
+    /// Auth with stream access for challenge-response protocols.
+    /// Default: delegates to handle_startup (no challenge-response).
+    fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+        &mut self,
+        msg: StartupMessage,
+        _stream: &mut S,
+    ) -> impl std::future::Future<Output = Result<AuthOutcome, ProtocolError>> + Send {
+        self.handle_startup(msg)
+    }
 }
 
 /// A "trust auth" implementation for test/development use only: performs
@@ -150,6 +170,164 @@ impl StartupHandler for TrustStartupHandler {
             secret_key: self.secret_key,
         })
     }
+}
+
+/// MD5 password auth handler: validates client credentials against a local
+/// password file (PgBouncer-style `userlist.txt`). The proxy verifies the
+/// client's identity, then continues to use the configured service account
+/// when connecting to the backend. This provides client-side access control
+/// without requiring end-to-end credential passthrough.
+///
+/// Auth file format (one entry per line):
+///   "username" "md5<hash>"
+/// or
+///   "username" "plaintext_password"
+///
+/// The MD5 hash follows PostgreSQL convention: md5(password + username).
+pub struct Md5PasswordStartupHandler {
+    pub backend_pid: i32,
+    pub secret_key: i32,
+    /// username -> password (plaintext or md5-hashed)
+    pub credentials: std::sync::Arc<std::collections::HashMap<String, String>>,
+}
+
+impl StartupHandler for Md5PasswordStartupHandler {
+    async fn handle_startup(&mut self, _msg: StartupMessage) -> Result<AuthOutcome, ProtocolError> {
+        // This path should not be called directly; use handle_startup_with_stream.
+        Err(ProtocolError::Malformed(
+            "MD5 auth requires stream access; internal error".into(),
+        ))
+    }
+
+    async fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+        &mut self,
+        msg: StartupMessage,
+        stream: &mut S,
+    ) -> Result<AuthOutcome, ProtocolError> {
+        use md5::Md5;
+        use sha2::Digest; // for Md5::new() / update / finalize (md5 re-exports digest trait)
+        use tokio::io::AsyncWriteExt;
+
+        let username = msg
+            .params
+            .get("user")
+            .cloned()
+            .unwrap_or_default();
+
+        let expected_password = self
+            .credentials
+            .get(&username)
+            .ok_or_else(|| {
+                ProtocolError::Malformed(format!("unknown user: {}", username))
+            })?
+            .clone();
+
+        // Send AuthenticationMD5Password with a random 4-byte salt
+        let salt: [u8; 4] = rand::random();
+        let mut auth_msg = Vec::with_capacity(13);
+        // type 'R'
+        auth_msg.push(b'R');
+        // length: 4 (len) + 4 (auth type) + 4 (salt) = 12
+        auth_msg.extend_from_slice(&12i32.to_be_bytes());
+        // AuthType = 5 (MD5Password)
+        auth_msg.extend_from_slice(&5i32.to_be_bytes());
+        auth_msg.extend_from_slice(&salt);
+
+        stream
+            .write_all(&auth_msg)
+            .await
+            .map_err(ProtocolError::Io)?;
+        stream.flush().await.map_err(ProtocolError::Io)?;
+
+        // Read PasswordMessage ('p')
+        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        if tag != b'p' {
+            return Err(ProtocolError::Malformed(format!(
+                "expected PasswordMessage ('p'), got '{}'",
+                tag as char
+            )));
+        }
+
+        // Extract the password C-string from body
+        let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+        let client_response = std::str::from_utf8(&body[..end])
+            .map_err(|_| ProtocolError::Malformed("password is not valid UTF-8".into()))?;
+
+        // Compute expected MD5 response:
+        // PostgreSQL MD5 auth: client sends "md5" + hex(md5(hex(md5(password+user)) + salt))
+        let inner_hash = if expected_password.starts_with("md5") && expected_password.len() == 35 {
+            // Already stored as md5 hash
+            expected_password.clone()
+        } else {
+            // Plaintext: compute md5(password + username)
+            let mut hasher = Md5::new();
+            hasher.update(expected_password.as_bytes());
+            hasher.update(username.as_bytes());
+            let result = hasher.finalize();
+            format!("md5{:x}", result)
+        };
+
+        // Outer hash: md5(inner_hash_hex_without_prefix + salt_bytes)
+        let inner_hex = &inner_hash[3..]; // strip "md5" prefix
+        let mut hasher = Md5::new();
+        hasher.update(inner_hex.as_bytes());
+        hasher.update(&salt);
+        let outer_result = hasher.finalize();
+        let expected_response = format!("md5{:x}", outer_result);
+
+        // Constant-time comparison to prevent timing side-channel attacks.
+        // An attacker sending many auth attempts could otherwise infer the
+        // correct hash prefix from response-time differences.
+        let match_ok = client_response.as_bytes().len() == expected_response.as_bytes().len()
+            && subtle::ConstantTimeEq::ct_eq(
+                client_response.as_bytes(),
+                expected_response.as_bytes(),
+            )
+            .into();
+
+        if !match_ok {
+            return Err(ProtocolError::Malformed(
+                "password authentication failed".into(),
+            ));
+        }
+
+        Ok(AuthOutcome {
+            backend_pid: self.backend_pid,
+            secret_key: self.secret_key,
+        })
+    }
+}
+
+/// Parses an auth file in PgBouncer userlist.txt format:
+///   "username" "password_or_md5hash"
+/// Returns a map of username -> password/hash.
+pub fn parse_auth_file(content: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Format: "user" "password" — find quoted strings
+        let mut quoted = Vec::new();
+        let mut in_quote = false;
+        let mut current = String::new();
+        for ch in line.chars() {
+            if ch == '"' {
+                if in_quote {
+                    quoted.push(current.clone());
+                    current.clear();
+                }
+                in_quote = !in_quote;
+            } else if in_quote {
+                current.push(ch);
+            }
+        }
+        if quoted.len() >= 2 {
+            map.insert(quoted[0].clone(), quoted[1].clone());
+        }
+    }
+    map
 }
 
 /// Converts `StartupPacket::Startup` into `FrontendMessage::Startup`, for

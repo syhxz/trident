@@ -9,13 +9,17 @@
 //! (Requirement 13.4, 13.5).
 
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
-use tokio::io::{BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 
 use crate::config::{ConsistencyLevel, LsnTrackingConfig};
 use crate::pool::manager::PoolManager;
@@ -24,6 +28,55 @@ use crate::proxy::client_stats::ClientStats;
 use crate::proxy::handler::{ConnectionHandler, QueryLogSettings, RouteFn};
 use crate::proxy::registry::{CancelRegistry, ConnectionRegistry, NodeAddress};
 use crate::session::lsn::LsnTracker;
+
+/// A client-facing stream that is either plaintext or TLS-encrypted.
+/// Unlike `pool::conn::MaybeTlsStream` (which wraps *client*-side TLS for
+/// backend connections), this wraps *server*-side TLS for client connections.
+#[derive(Debug)]
+pub enum ClientStream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::server::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for ClientStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            ClientStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ClientStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            ClientStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            ClientStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            ClientStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Errors that can prevent the server from starting or accepting connections.
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +104,7 @@ pub struct ProxyDeps<RTR, PM, LSN> {
     pub lsn_tracker: Arc<LSN>,
     pub connection_registry: Arc<ConnectionRegistry>,
     pub cancel_registry: Arc<CancelRegistry>,
-    pub node_addresses: Arc<HashMap<String, NodeAddress>>,
+    pub node_addresses: Arc<ArcSwap<HashMap<String, NodeAddress>>>,
     /// The default consistency level assigned to a session at connection
     /// time (`routing.default_consistency`). Held behind an `ArcSwap`
     /// rather than a plain value so it can be hot-reloaded (see
@@ -83,6 +136,11 @@ pub struct ProxyDeps<RTR, PM, LSN> {
     /// mutex lock + VecDeque insert on statements that already crossed the
     /// slow-query threshold, so there is no meaningful "disabled" case.
     pub slow_queries: Arc<crate::admin::SlowQueryBuffer>,
+    /// Optional TLS acceptor for client-facing encryption. When `Some`,
+    /// the server responds `S` to SSLRequest and upgrades the connection
+    /// to TLS before proceeding with the startup handshake. When `None`,
+    /// SSLRequest is rejected with `N` (plaintext only).
+    pub tls_acceptor: Option<Arc<TlsAcceptor>>,
 }
 
 impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
@@ -99,6 +157,7 @@ impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
             query_log: self.query_log,
             lsn_tracking: self.lsn_tracking.clone(),
             slow_queries: self.slow_queries.clone(),
+            tls_acceptor: self.tls_acceptor.clone(),
         }
     }
 }
@@ -251,13 +310,28 @@ where
     SH: StartupHandler + Send + 'static,
 {
     tokio::spawn(async move {
+        // --- Client TLS negotiation ---
+        //
+        // PostgreSQL clients probe encryption by sending an SSLRequest (8 bytes)
+        // before the real StartupMessage. If we have a TLS acceptor configured,
+        // respond `S` and upgrade; otherwise respond `N` and continue plaintext.
+        //
+        // This must happen on the raw TcpStream BEFORE buffering, because the
+        // TLS handshake wraps the entire stream.
+        let client_stream = negotiate_client_tls(stream, deps.tls_acceptor.as_deref()).await?;
+
+        // Load the current node address snapshot for this connection's
+        // lifetime. Dynamic add/remove updates the ArcSwap, so new
+        // connections see the latest addresses. Existing connections use
+        // their snapshot (cancel routing to removed nodes is benign).
+        let node_addresses_snapshot = deps.node_addresses.load();
         let handler = ConnectionHandler::with_query_log(
             deps.router.as_ref(),
             deps.pool_manager.as_ref(),
             deps.lsn_tracker.as_ref(),
             deps.connection_registry.as_ref(),
             deps.cancel_registry.as_ref(),
-            deps.node_addresses.as_ref(),
+            node_addresses_snapshot.as_ref(),
             deps.query_log,
         )
         .with_lsn_tracking(deps.lsn_tracking.clone())
@@ -272,12 +346,81 @@ where
         //   into fewer TCP segments. Flushed at each ReadyForQuery boundary.
         let buffered_stream = BufReader::with_capacity(
             8 * 1024,
-            BufWriter::with_capacity(32 * 1024, stream),
+            BufWriter::with_capacity(32 * 1024, client_stream),
         );
         handler
             .handle(buffered_stream, &mut startup_handler, session_id, default_consistency)
             .await
     })
+}
+
+/// Performs the PostgreSQL SSL negotiation on a raw TCP stream.
+///
+/// The first message from a client may be an SSLRequest (code 80877103).
+/// If so, and we have a TLS acceptor, we respond `S` and upgrade.
+/// If no TLS acceptor, we respond `N` and continue plaintext.
+/// If the first message is NOT an SSLRequest (it's a regular Startup or
+/// CancelRequest), we return the stream as-is (the handler will parse it).
+///
+/// PostgreSQL wire protocol guarantees: SSLRequest is always exactly 8 bytes
+/// (4-byte length=8, 4-byte code=80877103). A regular StartupMessage has
+/// the same structure but code=196608 (3.0). We peek the first 8 bytes.
+async fn negotiate_client_tls(
+    mut stream: TcpStream,
+    tls_acceptor: Option<&TlsAcceptor>,
+) -> Result<ClientStream, crate::proxy::error::ProxyError> {
+    use crate::protocol::ProtocolError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Peek at the first 8 bytes to check if it's an SSLRequest.
+    // Use MSG_PEEK so the bytes remain in the kernel buffer for the handler
+    // if this is NOT an SSLRequest.
+    let mut peek_buf = [0u8; 8];
+    let n = stream.peek(&mut peek_buf).await.map_err(|e| {
+        crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+    })?;
+
+    if n < 8 {
+        // Not enough data for any valid startup packet — let the handler
+        // deal with the short read / EOF.
+        return Ok(ClientStream::Plain(stream));
+    }
+
+    let length = i32::from_be_bytes([peek_buf[0], peek_buf[1], peek_buf[2], peek_buf[3]]);
+    let code = i32::from_be_bytes([peek_buf[4], peek_buf[5], peek_buf[6], peek_buf[7]]);
+
+    const SSL_REQUEST_CODE: i32 = 80877103;
+
+    if length == 8 && code == SSL_REQUEST_CODE {
+        // Consume the SSLRequest from the stream (we only peeked above)
+        let mut discard = [0u8; 8];
+        stream.read_exact(&mut discard).await.map_err(|e| {
+            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+        })?;
+
+        if let Some(acceptor) = tls_acceptor {
+            // Accept TLS
+            stream.write_all(b"S").await.map_err(|e| {
+                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+            })?;
+
+            let tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+            })?;
+
+            metrics::counter!("trident_client_tls_connections_total").increment(1);
+            Ok(ClientStream::Tls(tls_stream))
+        } else {
+            // No TLS configured: reject
+            stream.write_all(b"N").await.map_err(|e| {
+                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+            })?;
+            Ok(ClientStream::Plain(stream))
+        }
+    } else {
+        // Not an SSLRequest — pass through as plaintext
+        Ok(ClientStream::Plain(stream))
+    }
 }
 
 #[cfg(test)]
@@ -385,7 +528,7 @@ mod tests {
         let lsn_tracker = Arc::new(InMemoryLsnTracker::new());
         let connection_registry = Arc::new(ConnectionRegistry::new());
         let cancel_registry = Arc::new(CancelRegistry::new());
-        let node_addresses = Arc::new(HashMap::new());
+        let node_addresses = Arc::new(ArcSwap::new(Arc::new(HashMap::new())));
 
         let deps = ProxyDeps {
             router,
@@ -399,6 +542,7 @@ mod tests {
             query_log: QueryLogSettings::default(),
             lsn_tracking: LsnTrackingConfig::default(),
             slow_queries: Arc::new(crate::admin::SlowQueryBuffer::new(16)),
+            tls_acceptor: None,
         };
 
         let server_task = tokio::spawn({

@@ -95,6 +95,14 @@ impl ConnectionRegistry {
         let mut sockets = self.sockets.lock();
         sockets.remove(&(node_id.to_string(), backend_pid));
     }
+
+    /// Removes and drops ALL sockets belonging to a given node. Used when
+    /// a node is dynamically removed to prevent FD/socket leaks from idle
+    /// connections that would otherwise never be reclaimed.
+    pub fn remove_by_node(&self, node_id: &str) {
+        let mut sockets = self.sockets.lock();
+        sockets.retain(|(n, _), _| n != node_id);
+    }
 }
 
 /// `ConnFactory` that establishes a real physical connection to a backend

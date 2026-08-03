@@ -127,11 +127,79 @@ pub enum PoolMode {
     Transaction,
 }
 
+/// Client-facing authentication mode.
+///
+/// - `Trust`: no authentication (development/testing only). Any client can
+///   connect without credentials.
+/// - `Md5`: proxy verifies client credentials against a local auth_file
+///   using PostgreSQL MD5 password protocol. The proxy still uses the
+///   configured service account when connecting to backends (no credential
+///   passthrough). This is the PgBouncer "auth_file" model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    Trust,
+    Md5,
+}
+
+fn default_client_auth() -> ClientAuthMode {
+    ClientAuthMode::Trust
+}
+
 /// Proxy listener configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ProxyConfig {
     pub listen_addr: String,
     pub max_clients: usize,
+    /// Client authentication mode. Default: "trust" (no auth, dev only).
+    /// "md5": proxy verifies client credentials via auth_file, then uses
+    /// the configured service account for backend connections.
+    #[serde(default = "default_client_auth")]
+    pub client_auth: ClientAuthMode,
+    /// Path to the auth file (PgBouncer userlist.txt format) when
+    /// client_auth is "md5". Each line: "username" "password_or_md5hash".
+    /// Ignored when client_auth is "trust".
+    #[serde(default)]
+    pub auth_file: Option<String>,
+    /// Maximum time to wait for a client to complete the startup/auth
+    /// handshake (including TLS negotiation). Prevents slow/stuck clients
+    /// from occupying a connection slot indefinitely. Default: "30s".
+    #[serde(default = "default_startup_timeout")]
+    pub startup_timeout: String,
+    /// Maximum time a fully-authenticated client connection can remain
+    /// idle (no messages received) before being forcibly closed.
+    /// Default: "0" (disabled — application connection pools routinely
+    /// hold idle connections for minutes/hours, which is normal).
+    #[serde(default = "default_client_idle_timeout")]
+    pub client_idle_timeout: String,
+    /// Timeout for establishing a TCP connection to the backend when
+    /// forwarding a CancelRequest. CancelRequest uses a fresh connection
+    /// per the protocol spec; this bounds how long that connect() call
+    /// can block. Default: "5s".
+    #[serde(default = "default_cancel_connect_timeout")]
+    pub cancel_connect_timeout: String,
+    /// Path to the TLS certificate file (PEM format) for client-facing
+    /// encryption. When both `tls_cert` and `tls_key` are set, the proxy
+    /// accepts SSLRequest from clients and upgrades to TLS. When unset,
+    /// SSLRequest is rejected with `N` (plaintext only).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+    /// Path to the TLS private key file (PEM format) for client-facing
+    /// encryption. Must be set together with `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<String>,
+}
+
+fn default_startup_timeout() -> String {
+    "30s".to_string()
+}
+
+fn default_client_idle_timeout() -> String {
+    "0".to_string()
+}
+
+fn default_cancel_connect_timeout() -> String {
+    "5s".to_string()
 }
 
 /// Backend node configuration
@@ -387,6 +455,9 @@ pub enum ConfigError {
 
     #[error("Aurora write forwarding LSN tracking requires at least one node with type 'reader'")]
     AuroraWriteForwardingRequiresReader,
+
+    #[error("configuration validation error: {0}")]
+    Validation(String),
 }
 
 impl AppConfig {
@@ -453,6 +524,25 @@ impl AppConfig {
                 max: self.pool.max_pool_size,
                 min: self.pool.min_pool_size,
             });
+        }
+
+        // Reject zero values that would cause failures or tight loops.
+        if self.pool.max_pool_size == 0 {
+            return Err(ConfigError::Validation(
+                "pool.max_pool_size must be > 0".to_string(),
+            ));
+        }
+        if self.proxy.max_clients == 0 {
+            return Err(ConfigError::Validation(
+                "proxy.max_clients must be > 0".to_string(),
+            ));
+        }
+
+        // Validate cost_threshold is non-negative and finite.
+        if self.routing.cost_threshold < 0.0 || !self.routing.cost_threshold.is_finite() {
+            return Err(ConfigError::Validation(
+                "routing.cost_threshold must be non-negative and finite".to_string(),
+            ));
         }
 
         // listen_addr must be a valid host:port.
@@ -556,6 +646,13 @@ mod tests {
             proxy: ProxyConfig {
                 listen_addr: "0.0.0.0:6432".to_string(),
                 max_clients: 2000,
+                client_auth: ClientAuthMode::Trust,
+                auth_file: None,
+                startup_timeout: "30s".to_string(),
+                client_idle_timeout: "0".to_string(),
+                cancel_connect_timeout: "5s".to_string(),
+                tls_cert: None,
+                tls_key: None,
             },
             nodes: vec![
                 sample_node("primary", NodeType::Writer),

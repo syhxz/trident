@@ -94,6 +94,7 @@ struct LiveNodeManager {
     health_checker: Arc<HealthChecker<WireProtocolHealthProbe>>,
     pool_manager: Arc<InMemoryPoolManager>,
     connection_registry: Arc<ConnectionRegistry>,
+    node_addresses: Arc<arc_swap::ArcSwap<HashMap<String, NodeAddress>>>,
     pool_mode: trident::config::PoolMode,
     max_pool_size: u32,
     pool_settings: NodePoolSettings,
@@ -163,6 +164,20 @@ impl admin::NodeManager for LiveNodeManager {
             return Err(format!("node '{}' pool already exists", config.name));
         }
 
+        // Update cancel-routing address table so CancelRequest for queries
+        // on this new node can be forwarded correctly.
+        self.node_addresses.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.insert(
+                config.name.clone(),
+                NodeAddress {
+                    host: config.host.clone(),
+                    port: config.port,
+                },
+            );
+            Arc::new(new_map)
+        });
+
         tracing::info!(node = %config.name, node_type = ?config.node_type, host = %config.host, "dynamically added backend node");
         Ok(())
     }
@@ -178,6 +193,19 @@ impl admin::NodeManager for LiveNodeManager {
         // Remove from pool manager (existing connections drain naturally
         // as Arc references are dropped by in-flight handlers)
         self.pool_manager.remove_pool(node_id);
+
+        // Remove from cancel-routing address table
+        let node_id_owned = node_id.to_string();
+        self.node_addresses.rcu(|current| {
+            let mut new_map = (**current).clone();
+            new_map.remove(&node_id_owned);
+            Arc::new(new_map)
+        });
+
+        // Drain idle sockets for this node from the connection registry
+        // to prevent FD leaks. In-flight connections will be discarded
+        // naturally when their handler completes.
+        self.connection_registry.remove_by_node(node_id);
 
         tracing::info!(node = %node_id, "dynamically removed backend node");
         Ok(())
@@ -294,10 +322,11 @@ async fn run(
     let check_timeout = parse_duration_or(&config.health.check_timeout, Duration::from_secs(2));
     let check_interval = parse_duration_or(&config.health.check_interval, Duration::from_secs(3));
 
-    let health_checker = Arc::new(HealthChecker::new(
+    let health_checker = Arc::new(HealthChecker::with_max_retries(
         node_probes,
         config.routing.max_replication_lag_ms,
         check_timeout,
+        config.health.max_retries,
     ));
 
     // Run health checks in the background for the lifetime of the process.
@@ -377,7 +406,7 @@ async fn run(
             },
         );
     }
-    let node_addresses = Arc::new(node_addresses);
+    let node_addresses = Arc::new(arc_swap::ArcSwap::new(Arc::new(node_addresses)));
     let cancel_registry = Arc::new(CancelRegistry::new());
 
     let health_checker_for_snapshot = health_checker.clone();
@@ -452,18 +481,56 @@ async fn run(
     let query_log = trident::proxy::handler::QueryLogSettings::new(config.logging.query_trace, config.logging.slow_query);
     let slow_queries = Arc::new(trident::admin::SlowQueryBuffer::new(500));
 
+    // --- Client TLS setup ---
+    let tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>> =
+        match (&config.proxy.tls_cert, &config.proxy.tls_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let certs = load_certs(cert_path).map_err(|e| {
+                    StartupError::InvalidAdminListenAddr(
+                        format!("failed to load TLS cert '{}': {}", cert_path, e),
+                        "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap_err(),
+                    )
+                })?;
+                let key = load_private_key(key_path).map_err(|e| {
+                    StartupError::InvalidAdminListenAddr(
+                        format!("failed to load TLS key '{}': {}", key_path, e),
+                        "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap_err(),
+                    )
+                })?;
+
+                let tls_config = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .map_err(|e| {
+                        StartupError::InvalidAdminListenAddr(
+                            format!("TLS config error: {}", e),
+                            "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap_err(),
+                        )
+                    })?;
+
+                tracing::info!(cert = %cert_path, key = %key_path, "client TLS enabled");
+                Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))))
+            }
+            (None, None) => None,
+            _ => {
+                tracing::error!("proxy.tls_cert and proxy.tls_key must both be set or both be unset");
+                std::process::exit(1);
+            }
+        };
+
     let deps = ProxyDeps {
         router: router.clone(),
         pool_manager: pool_manager.clone(),
         lsn_tracker,
         connection_registry: registry.clone(),
         cancel_registry,
-        node_addresses,
+        node_addresses: node_addresses.clone(),
         default_consistency: default_consistency.clone(),
         client_stats: client_stats.clone(),
         query_log,
         lsn_tracking: config.lsn_tracking.clone(),
         slow_queries: slow_queries.clone(),
+        tls_acceptor,
     };
 
     // --- Background task: per-node connection pool / replication lag
@@ -518,9 +585,10 @@ async fn run(
             health_checker: health_checker.clone(),
             pool_manager: pool_manager.clone(),
             connection_registry: registry.clone(),
+            node_addresses: node_addresses.clone(),
             pool_mode: config.pool.mode,
             max_pool_size: config.pool.max_pool_size,
-            pool_settings: pool_settings.clone(),
+            pool_settings,
         });
         let admin_snapshot_source = pool_manager.clone();
         let config_path_for_admin = config_path.clone();
@@ -564,15 +632,72 @@ async fn run(
         });
     }
 
-    server
-        .run(deps, move || {
-            let pid = next_backend_pid.fetch_add(1, Ordering::SeqCst);
-            TrustStartupHandler {
-                backend_pid: pid,
-                secret_key: generate_cancel_secret(),
-            }
-        })
-        .await?;
+    // SECURITY WARNING: Trust authentication accepts any client without
+    // credentials. This is suitable only for development/testing. In
+    // production, restrict network access (VPC/firewall) or implement
+    // proper client authentication (SCRAM-SHA-256).
+    if config.proxy.client_auth == trident::config::ClientAuthMode::Trust
+        && config.proxy.listen_addr.starts_with("0.0.0.0")
+    {
+        tracing::warn!(
+            "⚠️  SECURITY: proxy listens on 0.0.0.0 with trust authentication. \
+             Any network-reachable client can connect without credentials. \
+             Ensure network-level access controls (VPC, security groups, firewall) \
+             are in place for production deployments."
+        );
+    }
+
+    match config.proxy.client_auth {
+        trident::config::ClientAuthMode::Trust => {
+            server
+                .run(deps, move || {
+                    let pid = next_backend_pid.fetch_add(1, Ordering::SeqCst);
+                    TrustStartupHandler {
+                        backend_pid: pid,
+                        secret_key: generate_cancel_secret(),
+                    }
+                })
+                .await?;
+        }
+        trident::config::ClientAuthMode::Md5 => {
+            use trident::protocol::startup::{parse_auth_file, Md5PasswordStartupHandler};
+
+            let auth_file_path = config.proxy.auth_file.as_deref().unwrap_or("userlist.txt");
+            let auth_file_content = std::fs::read_to_string(auth_file_path).map_err(|e| {
+                StartupError::InvalidAdminListenAddr(
+                    format!("failed to read auth_file '{}': {}", auth_file_path, e),
+                    e.to_string().parse::<std::net::SocketAddr>().unwrap_err(),
+                )
+            });
+            let credentials = match auth_file_content {
+                Ok(content) => Arc::new(parse_auth_file(&content)),
+                Err(_) => {
+                    tracing::error!(
+                        path = %auth_file_path,
+                        "failed to read auth_file for md5 client authentication"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!(
+                users = credentials.len(),
+                path = %auth_file_path,
+                "loaded client auth credentials (md5 mode)"
+            );
+
+            let credentials_for_factory = credentials.clone();
+            server
+                .run(deps, move || {
+                    let pid = next_backend_pid.fetch_add(1, Ordering::SeqCst);
+                    Md5PasswordStartupHandler {
+                        backend_pid: pid,
+                        secret_key: generate_cancel_secret(),
+                        credentials: credentials_for_factory.clone(),
+                    }
+                })
+                .await?;
+        }
+    }
 
     Ok(())
 }
@@ -587,8 +712,21 @@ fn generate_cancel_secret() -> i32 {
 /// Parses a short human-readable duration string like `"5m"`, `"2s"`,
 /// `"30ms"` into a `std::time::Duration`, falling back to `default` if the
 /// string cannot be parsed. Supported suffixes: `ms`, `s`, `m`, `h`.
+/// Logs a warning when falling back so configuration typos are visible.
 fn parse_duration_or(value: &str, default: Duration) -> Duration {
-    parse_duration(value).unwrap_or(default)
+    match parse_duration(value) {
+        Some(d) => d,
+        None => {
+            if !value.is_empty() && value != "0" {
+                tracing::warn!(
+                    value = %value,
+                    default_ms = default.as_millis() as u64,
+                    "failed to parse duration, using default"
+                );
+            }
+            default
+        }
+    }
 }
 
 fn parse_duration(value: &str) -> Option<Duration> {
@@ -608,8 +746,8 @@ fn parse_duration(value: &str) -> Option<Duration> {
     match suffix {
         "ms" => Some(Duration::from_millis(number)),
         "s" => Some(Duration::from_secs(number)),
-        "m" => Some(Duration::from_secs(number * 60)),
-        "h" => Some(Duration::from_secs(number * 3600)),
+        "m" => Some(Duration::from_secs(number.checked_mul(60)?)),
+        "h" => Some(Duration::from_secs(number.checked_mul(3600)?)),
         _ => None,
     }
 }
@@ -648,5 +786,39 @@ mod tests {
     fn parse_duration_or_falls_back_to_default() {
         let default = Duration::from_secs(42);
         assert_eq!(parse_duration_or("not-a-duration", default), default);
+    }
+}
+
+/// Loads PEM-encoded certificates from a file.
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse certs: {e}"))?;
+    if certs.is_empty() {
+        return Err("no certificates found in file".to_string());
+    }
+    Ok(certs)
+}
+
+/// Loads the first PEM-encoded private key from a file.
+fn load_private_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    loop {
+        match rustls_pemfile::read_one(&mut reader).map_err(|e| format!("parse key: {e}"))? {
+            Some(rustls_pemfile::Item::Pkcs1Key(key)) => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(key));
+            }
+            Some(rustls_pemfile::Item::Pkcs8Key(key)) => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(key));
+            }
+            Some(rustls_pemfile::Item::Sec1Key(key)) => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Sec1(key));
+            }
+            Some(_) => continue, // skip non-key items (certs, etc.)
+            None => return Err("no private key found in file".to_string()),
+        }
     }
 }

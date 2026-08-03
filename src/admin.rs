@@ -437,7 +437,14 @@ async fn reload_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     };
 
     match reload_from_file(path, target.as_ref()).await {
-        Ok(()) => (StatusCode::OK, r#"{"status":"reloaded"}"#).into_response(),
+        Ok(()) => {
+            // Update the admin's routing config snapshot so /api/config
+            // reflects the reloaded values, not stale startup config.
+            if let Ok(fresh_config) = crate::config::AppConfig::load_from_file(path.as_str()) {
+                state.routing_config.store(Arc::new(fresh_config.routing));
+            }
+            (StatusCode::OK, r#"{"status":"reloaded"}"#).into_response()
+        }
         Err(e) => {
             let body = format!(r#"{{"status":"error","reason":{:?}}}"#, e.to_string());
             (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
@@ -550,13 +557,13 @@ async fn overview_handler(State(state): State<Arc<AdminState>>) -> impl IntoResp
         .unwrap_or(0);
 
     let resp = OverviewResponse {
-        active_connections: state.client_stats.distinct_active_ip_count(),
+        active_connections: parse_gauge(&metrics_text, "trident_active_connections"),
         total_accepted: parse_counter(&metrics_text, "trident_connections_accepted_total"),
         routing_writer: parse_counter_label(&metrics_text, "trident_routing_decisions_total", "writer"),
         routing_reader: parse_counter_label(&metrics_text, "trident_routing_decisions_total", "reader"),
         routing_analytics: parse_counter_label(&metrics_text, "trident_routing_decisions_total", "analytics"),
         slow_queries_1m: state.slow_queries.count_since(now_unix.saturating_sub(60)),
-        pool_exhausted: parse_counter(&metrics_text, "trident_pool_exhausted_total"),
+        pool_exhausted: parse_counter_sum(&metrics_text, "trident_pool_exhausted_total"),
         healthy: is_healthy(&snapshot),
     };
     Json(resp).into_response()
@@ -583,6 +590,32 @@ fn parse_counter_label(text: &str, name: &str, label_value: &str) -> u64 {
         }
     }
     0
+}
+
+/// Parses a gauge value from Prometheus metrics text (no labels).
+fn parse_gauge(text: &str, name: &str) -> usize {
+    for line in text.lines() {
+        if line.starts_with(name) && !line.starts_with('#') && !line.contains('{') {
+            if let Some(val) = line.split_whitespace().last() {
+                return val.parse::<f64>().unwrap_or(0.0) as usize;
+            }
+        }
+    }
+    0
+}
+
+/// Sums all series of a counter (with or without labels). Handles the case
+/// where a counter has per-node_id labels and the overview wants the total.
+fn parse_counter_sum(text: &str, name: &str) -> u64 {
+    let mut total: f64 = 0.0;
+    for line in text.lines() {
+        if line.starts_with(name) && !line.starts_with('#') {
+            if let Some(val) = line.split_whitespace().last() {
+                total += val.parse::<f64>().unwrap_or(0.0);
+            }
+        }
+    }
+    total as u64
 }
 
 #[derive(Serialize)]
