@@ -298,6 +298,288 @@ impl StartupHandler for Md5PasswordStartupHandler {
     }
 }
 
+/// SCRAM-SHA-256 server-side authentication handler. Validates client
+/// credentials against stored SCRAM verifiers (salt + StoredKey + ServerKey)
+/// loaded from an auth_file. The proxy verifies the client's identity,
+/// then continues to use the configured service account for backend
+/// connections.
+///
+/// Auth file format for SCRAM entries:
+///   "username" "SCRAM-SHA-256$iterations:base64salt$base64StoredKey:base64ServerKey"
+///
+/// You can generate a verifier using PostgreSQL:
+///   SELECT rolpassword FROM pg_authid WHERE rolname = 'user';
+///
+/// Plaintext passwords in the auth_file are also supported: the handler
+/// will derive the verifier on-the-fly using PBKDF2 with 4096 iterations.
+pub struct ScramStartupHandler {
+    pub backend_pid: i32,
+    pub secret_key: i32,
+    /// username -> password or SCRAM verifier string
+    pub credentials: std::sync::Arc<std::collections::HashMap<String, String>>,
+}
+
+/// Parsed SCRAM verifier components.
+struct ScramVerifier {
+    iterations: u32,
+    salt: Vec<u8>,
+    stored_key: [u8; 32],
+    server_key: [u8; 32],
+}
+
+impl ScramVerifier {
+    /// Parse a PostgreSQL-format SCRAM verifier:
+    /// `SCRAM-SHA-256$iterations:base64salt$base64StoredKey:base64ServerKey`
+    fn parse(s: &str) -> Option<Self> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+
+        let s = s.strip_prefix("SCRAM-SHA-256$")?;
+        let (iter_salt, keys) = s.split_once('$')?;
+        let (iter_str, salt_b64) = iter_salt.split_once(':')?;
+        let (stored_key_b64, server_key_b64) = keys.split_once(':')?;
+
+        let iterations: u32 = iter_str.parse().ok()?;
+        let salt = B64.decode(salt_b64).ok()?;
+        let stored_key_bytes = B64.decode(stored_key_b64).ok()?;
+        let server_key_bytes = B64.decode(server_key_b64).ok()?;
+
+        if stored_key_bytes.len() != 32 || server_key_bytes.len() != 32 {
+            return None;
+        }
+
+        let mut stored_key = [0u8; 32];
+        let mut server_key = [0u8; 32];
+        stored_key.copy_from_slice(&stored_key_bytes);
+        server_key.copy_from_slice(&server_key_bytes);
+
+        Some(ScramVerifier { iterations, salt, stored_key, server_key })
+    }
+
+    /// Derive a verifier from a plaintext password.
+    fn from_password(password: &str) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let iterations = 4096u32;
+        let mut salt_bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt_bytes);
+        let salt = salt_bytes.to_vec();
+
+        let normalized = stringprep::saslprep(password)
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|_| password.to_string());
+
+        let mut salted_password = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(
+            normalized.as_bytes(),
+            &salt,
+            iterations,
+            &mut salted_password,
+        );
+
+        let client_key = Self::hmac(&salted_password, b"Client Key");
+        let stored_key: [u8; 32] = Sha256::digest(client_key).into();
+        let server_key = Self::hmac(&salted_password, b"Server Key");
+
+        ScramVerifier { iterations, salt, stored_key, server_key }
+    }
+
+    fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC key length");
+        mac.update(data);
+        mac.finalize().into_bytes().into()
+    }
+}
+
+impl StartupHandler for ScramStartupHandler {
+    async fn handle_startup(&mut self, _msg: StartupMessage) -> Result<AuthOutcome, ProtocolError> {
+        Err(ProtocolError::Malformed(
+            "SCRAM auth requires stream access; internal error".into(),
+        ))
+    }
+
+    async fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+        &mut self,
+        msg: StartupMessage,
+        stream: &mut S,
+    ) -> Result<AuthOutcome, ProtocolError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+
+        let username = msg.params.get("user").cloned().unwrap_or_default();
+
+        let credential = self.credentials.get(&username).ok_or_else(|| {
+            ProtocolError::Malformed(format!("unknown user: {}", username))
+        })?.clone();
+
+        // Parse or derive the SCRAM verifier
+        let verifier = if credential.starts_with("SCRAM-SHA-256$") {
+            ScramVerifier::parse(&credential).ok_or_else(|| {
+                ProtocolError::Malformed("invalid SCRAM verifier format in auth_file".into())
+            })?
+        } else {
+            ScramVerifier::from_password(&credential)
+        };
+
+        // Step 1: Send AuthenticationSASL (offer SCRAM-SHA-256)
+        let mechanism = b"SCRAM-SHA-256\0";
+        let body_len = 4 + mechanism.len() + 1; // auth_type(4) + mechanism + list terminator
+        let mut auth_sasl = Vec::with_capacity(1 + 4 + body_len);
+        auth_sasl.push(b'R');
+        auth_sasl.extend_from_slice(&((body_len + 4) as i32).to_be_bytes());
+        auth_sasl.extend_from_slice(&10i32.to_be_bytes()); // AuthenticationSASL = 10
+        auth_sasl.extend_from_slice(mechanism);
+        auth_sasl.push(0); // mechanism list terminator
+
+        stream.write_all(&auth_sasl).await.map_err(ProtocolError::Io)?;
+        stream.flush().await.map_err(ProtocolError::Io)?;
+
+        // Step 2: Receive SASLInitialResponse (client-first-message)
+        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        if tag != b'p' {
+            return Err(ProtocolError::Malformed(format!(
+                "expected SASLInitialResponse ('p'), got '{}'", tag as char
+            )));
+        }
+
+        // Parse: mechanism\0 + int32(data_len) + data
+        let mech_end = body.iter().position(|&b| b == 0).ok_or_else(|| {
+            ProtocolError::Malformed("SASLInitialResponse missing mechanism terminator".into())
+        })?;
+        let rest = &body[mech_end + 1..];
+        if rest.len() < 4 {
+            return Err(ProtocolError::Malformed("SASLInitialResponse too short".into()));
+        }
+        let data_len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        if rest.len() < 4 + data_len {
+            return Err(ProtocolError::Malformed("SASLInitialResponse data truncated".into()));
+        }
+        let client_first = std::str::from_utf8(&rest[4..4 + data_len]).map_err(|_| {
+            ProtocolError::Malformed("client-first-message is not UTF-8".into())
+        })?;
+
+        // Parse "n,,<client_first_bare>" where client_first_bare = "n=,r=<nonce>"
+        let client_first_bare = client_first.strip_prefix("n,,").ok_or_else(|| {
+            ProtocolError::Malformed("client-first-message must start with 'n,,'".into())
+        })?;
+
+        let client_nonce = client_first_bare
+            .split(',')
+            .find_map(|part| part.strip_prefix("r="))
+            .ok_or_else(|| {
+                ProtocolError::Malformed("client-first-message missing 'r=' nonce".into())
+            })?;
+
+        // Generate server nonce
+        let mut server_nonce_bytes = [0u8; 18];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut server_nonce_bytes);
+        let combined_nonce = format!("{}{}", client_nonce, B64.encode(server_nonce_bytes));
+
+        // Step 3: Send AuthenticationSASLContinue (server-first-message)
+        let server_first = format!(
+            "r={},s={},i={}",
+            combined_nonce,
+            B64.encode(&verifier.salt),
+            verifier.iterations,
+        );
+
+        let sfm_body_len = 4 + server_first.len(); // auth_type(4) + data
+        let mut sasl_continue = Vec::with_capacity(1 + 4 + sfm_body_len);
+        sasl_continue.push(b'R');
+        sasl_continue.extend_from_slice(&((sfm_body_len + 4) as i32).to_be_bytes());
+        sasl_continue.extend_from_slice(&11i32.to_be_bytes()); // AuthSASLContinue = 11
+        sasl_continue.extend_from_slice(server_first.as_bytes());
+
+        stream.write_all(&sasl_continue).await.map_err(ProtocolError::Io)?;
+        stream.flush().await.map_err(ProtocolError::Io)?;
+
+        // Step 4: Receive SASLResponse (client-final-message)
+        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        if tag != b'p' {
+            return Err(ProtocolError::Malformed(format!(
+                "expected SASLResponse ('p'), got '{}'", tag as char
+            )));
+        }
+        let client_final = std::str::from_utf8(&body).map_err(|_| {
+            ProtocolError::Malformed("client-final-message is not UTF-8".into())
+        })?;
+        let client_final = client_final.trim_end_matches('\0');
+
+        // Extract proof
+        let proof_b64 = client_final
+            .split(',')
+            .find_map(|part| part.strip_prefix("p="))
+            .ok_or_else(|| {
+                ProtocolError::Malformed("client-final-message missing proof".into())
+            })?;
+        let client_proof = B64.decode(proof_b64).map_err(|_| {
+            ProtocolError::Malformed("invalid base64 proof".into())
+        })?;
+        if client_proof.len() != 32 {
+            return Err(ProtocolError::Malformed("proof must be 32 bytes".into()));
+        }
+
+        // Build auth_message
+        let client_final_without_proof = client_final
+            .rsplit_once(",p=")
+            .map(|(prefix, _)| prefix)
+            .ok_or_else(|| {
+                ProtocolError::Malformed("cannot split client-final at proof".into())
+            })?;
+
+        let auth_message = format!(
+            "{},{},{}",
+            client_first_bare, server_first, client_final_without_proof
+        );
+
+        // Verify: ClientSignature = HMAC(StoredKey, AuthMessage)
+        let client_signature = ScramVerifier::hmac(&verifier.stored_key, auth_message.as_bytes());
+
+        // Recover ClientKey = ClientProof XOR ClientSignature
+        let mut recovered_client_key = [0u8; 32];
+        for i in 0..32 {
+            recovered_client_key[i] = client_proof[i] ^ client_signature[i];
+        }
+
+        // H(recovered_client_key) must equal StoredKey
+        let recovered_stored_key: [u8; 32] = Sha256::digest(recovered_client_key).into();
+
+        let keys_match: bool = subtle::ConstantTimeEq::ct_eq(
+            &recovered_stored_key[..],
+            &verifier.stored_key[..],
+        ).into();
+
+        if !keys_match {
+            return Err(ProtocolError::Malformed(
+                "SCRAM authentication failed".into(),
+            ));
+        }
+
+        // Step 5: Send AuthenticationSASLFinal (server-final-message)
+        let server_signature = ScramVerifier::hmac(&verifier.server_key, auth_message.as_bytes());
+        let server_final_msg = format!("v={}", B64.encode(server_signature));
+
+        let sfinal_body_len = 4 + server_final_msg.len();
+        let mut sasl_final = Vec::with_capacity(1 + 4 + sfinal_body_len);
+        sasl_final.push(b'R');
+        sasl_final.extend_from_slice(&((sfinal_body_len + 4) as i32).to_be_bytes());
+        sasl_final.extend_from_slice(&12i32.to_be_bytes()); // AuthSASLFinal = 12
+        sasl_final.extend_from_slice(server_final_msg.as_bytes());
+
+        stream.write_all(&sasl_final).await.map_err(ProtocolError::Io)?;
+        stream.flush().await.map_err(ProtocolError::Io)?;
+
+        Ok(AuthOutcome {
+            backend_pid: self.backend_pid,
+            secret_key: self.secret_key,
+        })
+    }
+}
+
 /// Parses an auth file in PgBouncer userlist.txt format:
 ///   "username" "password_or_md5hash"
 /// Returns a map of username -> password/hash.

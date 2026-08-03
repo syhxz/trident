@@ -140,6 +140,8 @@ pub enum PoolMode {
 pub enum ClientAuthMode {
     Trust,
     Md5,
+    #[serde(rename = "scram-sha-256")]
+    ScramSha256,
 }
 
 fn default_client_auth() -> ClientAuthMode {

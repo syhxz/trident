@@ -697,6 +697,44 @@ async fn run(
                 })
                 .await?;
         }
+        trident::config::ClientAuthMode::ScramSha256 => {
+            use trident::protocol::startup::{parse_auth_file, ScramStartupHandler};
+
+            let auth_file_path = config.proxy.auth_file.as_deref().unwrap_or("userlist.txt");
+            let auth_file_content = std::fs::read_to_string(auth_file_path).map_err(|e| {
+                StartupError::InvalidAdminListenAddr(
+                    format!("failed to read auth_file '{}': {}", auth_file_path, e),
+                    e.to_string().parse::<std::net::SocketAddr>().unwrap_err(),
+                )
+            });
+            let credentials = match auth_file_content {
+                Ok(content) => Arc::new(parse_auth_file(&content)),
+                Err(_) => {
+                    tracing::error!(
+                        path = %auth_file_path,
+                        "failed to read auth_file for scram-sha-256 client authentication"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            tracing::info!(
+                users = credentials.len(),
+                path = %auth_file_path,
+                "loaded client auth credentials (scram-sha-256 mode)"
+            );
+
+            let credentials_for_factory = credentials.clone();
+            server
+                .run(deps, move || {
+                    let pid = next_backend_pid.fetch_add(1, Ordering::SeqCst);
+                    ScramStartupHandler {
+                        backend_pid: pid,
+                        secret_key: generate_cancel_secret(),
+                        credentials: credentials_for_factory.clone(),
+                    }
+                })
+                .await?;
+        }
     }
 
     Ok(())
