@@ -271,14 +271,14 @@ impl StartupHandler for Md5PasswordStartupHandler {
         let inner_hex = &inner_hash[3..]; // strip "md5" prefix
         let mut hasher = Md5::new();
         hasher.update(inner_hex.as_bytes());
-        hasher.update(&salt);
+        hasher.update(salt);
         let outer_result = hasher.finalize();
         let expected_response = format!("md5{:x}", outer_result);
 
         // Constant-time comparison to prevent timing side-channel attacks.
         // An attacker sending many auth attempts could otherwise infer the
         // correct hash prefix from response-time differences.
-        let match_ok = client_response.as_bytes().len() == expected_response.as_bytes().len()
+        let match_ok = client_response.len() == expected_response.len()
             && subtle::ConstantTimeEq::ct_eq(
                 client_response.as_bytes(),
                 expected_response.as_bytes(),

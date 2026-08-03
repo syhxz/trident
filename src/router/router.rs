@@ -309,13 +309,12 @@ where
         // statements are read-only, allow routing to Reader. Otherwise
         // conservatively route to Writer. This safety rule intentionally
         // takes precedence over Reader hints for mixed-intent batches.
-        if contains_multiple_statements(sql) {
-            if !multi_statement_all_readable(&self.classifier, sql) {
-                return Ok(RouteDecision::writer(
-                    "multiple statements with write intent in one simple-query message",
-                ));
-            }
-            // All statements are read-only — fall through to normal routing
+        if contains_multiple_statements(sql)
+            && !multi_statement_all_readable(&self.classifier, sql)
+        {
+            return Ok(RouteDecision::writer(
+                "multiple statements with write intent in one simple-query message",
+            ));
         }
 
         // Step 1: Hint parsing (Requirements 2.1-2.5). A forced-route hint

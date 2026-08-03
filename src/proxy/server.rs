@@ -35,7 +35,7 @@ use crate::session::lsn::LsnTracker;
 #[derive(Debug)]
 pub enum ClientStream {
     Plain(TcpStream),
-    Tls(tokio_rustls::server::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for ClientStream {
@@ -46,7 +46,7 @@ impl AsyncRead for ClientStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ClientStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            ClientStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -59,21 +59,21 @@ impl AsyncWrite for ClientStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             ClientStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            ClientStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ClientStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            ClientStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             ClientStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            ClientStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -409,7 +409,7 @@ async fn negotiate_client_tls(
             })?;
 
             metrics::counter!("trident_client_tls_connections_total").increment(1);
-            Ok(ClientStream::Tls(tls_stream))
+            Ok(ClientStream::Tls(Box::new(tls_stream)))
         } else {
             // No TLS configured: reject
             stream.write_all(b"N").await.map_err(|e| {

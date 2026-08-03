@@ -36,7 +36,7 @@ use crate::protocol::writer::encode_query;
 #[derive(Debug)]
 pub enum MaybeTlsStream {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for MaybeTlsStream {
@@ -47,7 +47,7 @@ impl AsyncRead for MaybeTlsStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -60,21 +60,21 @@ impl AsyncWrite for MaybeTlsStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -167,7 +167,7 @@ pub async fn establish_connection(
                     // Server accepts SSL -- perform TLS handshake
                     let tls_stream = upgrade_to_tls(tcp_stream, &target.host).await?;
                     tracing::debug!(node_id, "TLS handshake complete");
-                    MaybeTlsStream::Tls(tls_stream)
+                    MaybeTlsStream::Tls(Box::new(tls_stream))
                 }
                 b'N' => {
                     // Server declines SSL

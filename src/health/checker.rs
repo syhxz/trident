@@ -281,7 +281,7 @@ async fn upgrade_probe_stream(
                         .connect(server_name, tcp_stream)
                         .await
                         .map_err(|_| ())?;
-                    Ok(MaybeTlsStream::Tls(tls_stream))
+                    Ok(MaybeTlsStream::Tls(Box::new(tls_stream)))
                 }
                 b'N' => {
                     if target.ssl_mode == SslMode::Require {
@@ -433,6 +433,9 @@ struct TrackedNode {
 pub struct HealthChecker<P: HealthProbe> {
     probes: RwLock<HashMap<String, Arc<P>>>,
     max_replication_lag_ms: u64,
+    /// Configured threshold for consecutive failures/successes before
+    /// transitioning health state. Used for dynamically added nodes.
+    health_threshold: u32,
     nodes: Mutex<HashMap<String, TrackedNode>>,
     check_timeout: Duration,
     /// Cached snapshot updated after each health-check cycle. Reads are
@@ -490,6 +493,7 @@ impl<P: HealthProbe> HealthChecker<P> {
         HealthChecker {
             probes: RwLock::new(probes),
             max_replication_lag_ms,
+            health_threshold: threshold,
             nodes: Mutex::new(nodes),
             check_timeout,
             cached_snapshot: ArcSwap::new(Arc::new(initial_snapshot)),
@@ -666,7 +670,7 @@ impl<P: HealthProbe> HealthChecker<P> {
             TrackedNode {
                 node_type,
                 weight,
-                state: HealthStateMachine::new(false),
+                state: HealthStateMachine::with_threshold(false, self.health_threshold),
                 last_replay_lsn: 0,
                 last_replication_lag_ms: None,
             },

@@ -128,7 +128,7 @@ impl ExplainRunner for PoolExplainRunner {
         .await;
 
         match result {
-            Ok(Ok(cost)) => return Ok(cost),
+            Ok(Ok(cost)) => Ok(cost),
             Ok(Err(_)) => {
                 // Standard EXPLAIN failed (e.g. parameterized query with $1).
                 // Reconnect and try GENERIC_PLAN (PostgreSQL 16+).

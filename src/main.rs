@@ -752,6 +752,40 @@ fn parse_duration(value: &str) -> Option<Duration> {
     }
 }
 
+/// Loads PEM-encoded certificates from a file.
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse certs: {e}"))?;
+    if certs.is_empty() {
+        return Err("no certificates found in file".to_string());
+    }
+    Ok(certs)
+}
+
+/// Loads the first PEM-encoded private key from a file.
+fn load_private_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut reader = std::io::BufReader::new(file);
+    loop {
+        match rustls_pemfile::read_one(&mut reader).map_err(|e| format!("parse key: {e}"))? {
+            Some(rustls_pemfile::Item::Pkcs1Key(key)) => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(key));
+            }
+            Some(rustls_pemfile::Item::Pkcs8Key(key)) => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(key));
+            }
+            Some(rustls_pemfile::Item::Sec1Key(key)) => {
+                return Ok(rustls::pki_types::PrivateKeyDer::Sec1(key));
+            }
+            Some(_) => continue, // skip non-key items (certs, etc.)
+            None => return Err("no private key found in file".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,39 +820,5 @@ mod tests {
     fn parse_duration_or_falls_back_to_default() {
         let default = Duration::from_secs(42);
         assert_eq!(parse_duration_or("not-a-duration", default), default);
-    }
-}
-
-/// Loads PEM-encoded certificates from a file.
-fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("parse certs: {e}"))?;
-    if certs.is_empty() {
-        return Err("no certificates found in file".to_string());
-    }
-    Ok(certs)
-}
-
-/// Loads the first PEM-encoded private key from a file.
-fn load_private_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let mut reader = std::io::BufReader::new(file);
-    loop {
-        match rustls_pemfile::read_one(&mut reader).map_err(|e| format!("parse key: {e}"))? {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => {
-                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs1(key));
-            }
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => {
-                return Ok(rustls::pki_types::PrivateKeyDer::Pkcs8(key));
-            }
-            Some(rustls_pemfile::Item::Sec1Key(key)) => {
-                return Ok(rustls::pki_types::PrivateKeyDer::Sec1(key));
-            }
-            Some(_) => continue, // skip non-key items (certs, etc.)
-            None => return Err("no private key found in file".to_string()),
-        }
     }
 }

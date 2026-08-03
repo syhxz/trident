@@ -390,7 +390,7 @@ fn build_router(
         .route("/api/config", get(config_get_handler).put(config_put_handler))
         .route("/ws/logs", get(ws_logs_handler));
 
-    let app = if state.auth_token.is_some() {
+    if state.auth_token.is_some() {
         let auth_state = state.clone();
         let protected_routes = protected_routes.layer(
             axum::middleware::from_fn(move |req, next| {
@@ -405,9 +405,7 @@ fn build_router(
         public_routes
             .merge(protected_routes)
             .with_state(state)
-    };
-
-    app
+    }
 }
 
 async fn metrics_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -790,7 +788,7 @@ async fn slow_queries_handler(
     let all = state.slow_queries.snapshot();
     let total = all.len();
     let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.per_page.unwrap_or(50).min(200).max(1);
+    let per_page = params.per_page.unwrap_or(50).clamp(1, 200);
     let start = (page - 1) * per_page;
     let items: Vec<_> = all.into_iter().skip(start).take(per_page).collect();
     Json(PaginatedResponse {
@@ -798,7 +796,7 @@ async fn slow_queries_handler(
         total,
         page,
         per_page,
-        total_pages: (total + per_page - 1) / per_page,
+        total_pages: total.div_ceil(per_page),
     })
     .into_response()
 }

@@ -744,14 +744,8 @@ where
         let tracked_node = if route_sql.is_none() {
             // Check if this batch references the unnamed statement cross-Sync
             let references_unnamed_cross_sync = batch.iter().any(|frame| match frame.tag {
-                frontend_tag::BIND => match frame.bind_statement() {
-                    Some(stmt) if stmt.is_empty() => true,
-                    _ => false,
-                },
-                frontend_tag::DESCRIBE => match frame.kind_and_name() {
-                    Some((b'S', name)) if name.is_empty() => true,
-                    _ => false,
-                },
+                frontend_tag::BIND => matches!(frame.bind_statement(), Some(stmt) if stmt.is_empty()),
+                frontend_tag::DESCRIBE => matches!(frame.kind_and_name(), Some((b'S', name)) if name.is_empty()),
                 _ => false,
             });
 
