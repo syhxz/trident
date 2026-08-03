@@ -37,7 +37,7 @@ use crate::proxy::forwarder::{
     forward_simple_query_with_options, is_write_command_tag, ExtendedQueryRouteTracker,
     QueryForwardOptions,
 };
-use crate::proxy::registry::{send_cancel_request, BackendStream, CancelRegistry, ConnectionRegistry, NodeAddress};
+use crate::proxy::registry::{send_cancel_request_with_timeout, BackendStream, CancelRegistry, ConnectionRegistry, NodeAddress};
 use crate::router::consistency::ConsistencyChecker;
 use crate::router::cost::CostEstimator;
 use crate::router::router::{RouteDecision, Router, RoutingContext};
@@ -227,6 +227,10 @@ where
     /// Optional ring buffer receiving every statement that crosses the
     /// slow-query threshold, for the admin console's slow-query view.
     pub slow_query_buffer: Option<std::sync::Arc<crate::admin::SlowQueryBuffer>>,
+    /// Timeout for cancel request TCP connect. Zero = no timeout.
+    pub cancel_connect_timeout: std::time::Duration,
+    /// Client idle timeout. Zero = disabled.
+    pub client_idle_timeout: std::time::Duration,
 }
 
 /// Abstraction over `Router::route` used by the handler, so the handler
@@ -298,6 +302,8 @@ where
             query_log: QueryLogSettings::default(),
             lsn_tracking: LsnTrackingConfig::default(),
             slow_query_buffer: None,
+            cancel_connect_timeout: std::time::Duration::ZERO,
+            client_idle_timeout: std::time::Duration::ZERO,
         }
     }
 
@@ -323,6 +329,8 @@ where
             query_log,
             lsn_tracking: LsnTrackingConfig::default(),
             slow_query_buffer: None,
+            cancel_connect_timeout: std::time::Duration::ZERO,
+            client_idle_timeout: std::time::Duration::ZERO,
         }
     }
 
@@ -340,6 +348,17 @@ where
         buffer: std::sync::Arc<crate::admin::SlowQueryBuffer>,
     ) -> Self {
         self.slow_query_buffer = Some(buffer);
+        self
+    }
+
+    /// Sets the cancel-connect and client-idle timeouts.
+    pub fn with_timeouts(
+        mut self,
+        cancel_connect_timeout: std::time::Duration,
+        client_idle_timeout: std::time::Duration,
+    ) -> Self {
+        self.cancel_connect_timeout = cancel_connect_timeout;
+        self.client_idle_timeout = client_idle_timeout;
         self
     }
 
@@ -480,7 +499,7 @@ where
             return;
         };
 
-        if let Err(e) = send_cancel_request(addr, real_backend_pid, real_secret_key).await {
+        if let Err(e) = send_cancel_request_with_timeout(addr, real_backend_pid, real_secret_key, self.cancel_connect_timeout).await {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed").increment(1);
             tracing::warn!(node_id = %node_id, error = %e, "failed to forward CancelRequest to backend");
         } else {
@@ -510,7 +529,16 @@ where
             // byte-perfect forwarding of format codes and parameter values.
             // The backend remains the authoritative validator of message
             // contents; the proxy only extracts the few fields routing needs.
-            let (tag, body) = match read_tagged_frame(client_stream).await {
+            let (tag, body) = match if self.client_idle_timeout.is_zero() {
+                read_tagged_frame(client_stream).await
+            } else {
+                match tokio::time::timeout(self.client_idle_timeout, read_tagged_frame(client_stream)).await {
+                    Ok(result) => result,
+                    Err(_) => return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                        "client idle timeout exceeded".into(),
+                    ))),
+                }
+            } {
                 Ok(frame) => frame,
                 Err(ProtocolError::UnexpectedEof) => return Ok(()), // client closed connection
                 Err(e) => {

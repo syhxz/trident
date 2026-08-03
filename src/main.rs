@@ -531,6 +531,9 @@ async fn run(
         lsn_tracking: config.lsn_tracking.clone(),
         slow_queries: slow_queries.clone(),
         tls_acceptor,
+        startup_timeout: parse_duration_or(&config.proxy.startup_timeout, Duration::from_secs(30)),
+        client_idle_timeout: parse_duration_or(&config.proxy.client_idle_timeout, Duration::ZERO),
+        cancel_connect_timeout: parse_duration_or(&config.proxy.cancel_connect_timeout, Duration::from_secs(5)),
     };
 
     // --- Background task: per-node connection pool / replication lag

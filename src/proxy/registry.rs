@@ -296,7 +296,28 @@ pub async fn send_cancel_request(
     backend_pid: i32,
     secret_key: i32,
 ) -> Result<(), std::io::Error> {
-    let mut stream = TcpStream::connect((addr.host.as_str(), addr.port)).await?;
+    send_cancel_request_with_timeout(addr, backend_pid, secret_key, std::time::Duration::ZERO).await
+}
+
+/// Send a cancel request with an optional connect timeout.
+/// Duration::ZERO means no timeout (wait indefinitely).
+pub async fn send_cancel_request_with_timeout(
+    addr: &NodeAddress,
+    backend_pid: i32,
+    secret_key: i32,
+    connect_timeout: std::time::Duration,
+) -> Result<(), std::io::Error> {
+    let connect_fut = TcpStream::connect((addr.host.as_str(), addr.port));
+    let mut stream = if connect_timeout.is_zero() {
+        connect_fut.await?
+    } else {
+        tokio::time::timeout(connect_timeout, connect_fut)
+            .await
+            .map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "cancel request connect timed out",
+            ))??
+    };
     let bytes = encode_frontend_message(&FrontendMessage::CancelRequest {
         backend_pid,
         secret_key,

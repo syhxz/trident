@@ -141,6 +141,12 @@ pub struct ProxyDeps<RTR, PM, LSN> {
     /// to TLS before proceeding with the startup handshake. When `None`,
     /// SSLRequest is rejected with `N` (plaintext only).
     pub tls_acceptor: Option<Arc<TlsAcceptor>>,
+    /// Startup handshake timeout. Zero = disabled.
+    pub startup_timeout: std::time::Duration,
+    /// Client idle timeout (no messages received). Zero = disabled.
+    pub client_idle_timeout: std::time::Duration,
+    /// Cancel request TCP connect timeout. Zero = disabled.
+    pub cancel_connect_timeout: std::time::Duration,
 }
 
 impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
@@ -158,6 +164,9 @@ impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
             lsn_tracking: self.lsn_tracking.clone(),
             slow_queries: self.slow_queries.clone(),
             tls_acceptor: self.tls_acceptor.clone(),
+            startup_timeout: self.startup_timeout,
+            client_idle_timeout: self.client_idle_timeout,
+            cancel_connect_timeout: self.cancel_connect_timeout,
         }
     }
 }
@@ -318,7 +327,19 @@ where
         //
         // This must happen on the raw TcpStream BEFORE buffering, because the
         // TLS handshake wraps the entire stream.
-        let client_stream = negotiate_client_tls(stream, deps.tls_acceptor.as_deref()).await?;
+        //
+        // Apply startup_timeout to the TLS negotiation phase. A client that
+        // connects but never sends data (or stalls during TLS handshake)
+        // should not occupy a slot indefinitely.
+        let client_stream = if deps.startup_timeout.is_zero() {
+            negotiate_client_tls(stream, deps.tls_acceptor.as_deref()).await?
+        } else {
+            tokio::time::timeout(deps.startup_timeout, negotiate_client_tls(stream, deps.tls_acceptor.as_deref()))
+                .await
+                .map_err(|_| crate::proxy::error::ProxyError::Protocol(
+                    crate::protocol::ProtocolError::Malformed("startup timeout exceeded during TLS negotiation".into())
+                ))??
+        };
 
         // Load the current node address snapshot for this connection's
         // lifetime. Dynamic add/remove updates the ArcSwap, so new
@@ -335,7 +356,8 @@ where
             deps.query_log,
         )
         .with_lsn_tracking(deps.lsn_tracking.clone())
-        .with_slow_query_buffer(deps.slow_queries.clone());
+        .with_slow_query_buffer(deps.slow_queries.clone())
+        .with_timeouts(deps.cancel_connect_timeout, deps.client_idle_timeout);
         // Wrap the client socket in BufReader+BufWriter so:
         // - Reads are buffered: multiple small protocol messages (Bind +
         //   Execute + Sync) typically arrive in one TCP segment but would
@@ -543,6 +565,9 @@ mod tests {
             lsn_tracking: LsnTrackingConfig::default(),
             slow_queries: Arc::new(crate::admin::SlowQueryBuffer::new(16)),
             tls_acceptor: None,
+            startup_timeout: std::time::Duration::ZERO,
+            client_idle_timeout: std::time::Duration::ZERO,
+            cancel_connect_timeout: std::time::Duration::from_secs(5),
         };
 
         let server_task = tokio::spawn({
