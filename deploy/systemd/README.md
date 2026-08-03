@@ -1,55 +1,59 @@
-# systemd 部署
+# systemd Deployment
 
-适用场景：裸机/VM 上直接跑二进制，没有容器平台。
+For bare-metal/VM environments running the binary directly without a container platform.
 
-## 安装步骤
+## Installation Steps
 
 ```sh
-# 1. 编译发布版二进制
+# 1. Build the release binary
 cargo build --release
 
-# 2. 创建专用系统账户（不允许登录）
+# 2. Create a dedicated system account (no login shell)
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin trident
 
-# 3. 安装二进制
+# 3. Install the binary
 sudo install -m 0755 target/release/trident /usr/local/bin/trident
 
-# 4. 准备配置目录与文件，权限收紧（配置里目前可能含明文密码，见 DEPLOYMENT.md 第 4 节）
+# 4. Prepare config directory and file with restricted permissions
+#    (config may contain plaintext passwords; see DEPLOYMENT.md section 4)
 sudo mkdir -p /etc/trident
 sudo cp config.yaml /etc/trident/config.yaml
 sudo chown trident:trident /etc/trident/config.yaml
 sudo chmod 600 /etc/trident/config.yaml
 
-# 5. 安装并启用 service
+# 5. Install and enable the service
 sudo cp deploy/systemd/trident.service /etc/systemd/system/trident.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now trident
 
-# 6. 查看状态与日志
+# 6. Check status and logs
 sudo systemctl status trident
 sudo journalctl -u trident -f
 ```
 
-## 说明
+## Notes
 
-- `Restart=always` + `RestartSec=2s`：进程崩溃或正常退出都会自动重启；`StartLimitBurst=5`
-  在 60 秒窗口内失败 5 次后 systemd 会停止继续重启，避免死循环崩溃掩盖真实配置问题
-  （用 `systemctl reset-failed trident` 清除限流状态后可再重启）。
-- `ProtectSystem=strict`/`ProtectHome=true`/`PrivateTmp=true`：加固沙箱，Trident 运行时
-  不需要写文件系统（除非配置了文件日志，见 `ReadWritePaths`）。
-- 如果 Trident 支持了 SIGHUP 热加载（见 `DEPLOYMENT.md` 热加载章节），可以用
-  `systemctl reload trident` 触发（需要在 unit 文件里补充 `ExecReload=/bin/kill -HUP $MAINPID`）。
+- `Restart=always` + `RestartSec=2s`: the process is automatically restarted on crash or
+  normal exit; `StartLimitBurst=5` stops restart attempts after 5 failures within 60 seconds
+  to avoid masking real configuration issues with a crash loop
+  (use `systemctl reset-failed trident` to clear the rate limit and retry).
+- `ProtectSystem=strict`/`ProtectHome=true`/`PrivateTmp=true`: sandboxing hardening. Trident
+  does not need filesystem write access at runtime (unless file logging is configured; see
+  `ReadWritePaths`).
+- If Trident supports SIGHUP hot-reload (see the hot-reload section in `DEPLOYMENT.md`), you
+  can trigger it with `systemctl reload trident` (requires adding
+  `ExecReload=/bin/kill -HUP $MAINPID` to the unit file).
 
-## 日志文件与 logrotate（可选，非必需）
+## Log Files and logrotate (optional)
 
-如果在 `config.yaml` 的 `logging.dir` 配置了文件日志（见 `DEPLOYMENT.md` 第 3 节），
-Trident 自身会持续执行"保留最近 N 个滚动文件"的清理（每次滚动都会检查一次，不是只
-在启动时跑一次），并且支持 `rotation: size_based` 给单个文件设置大小上限（见
-`DEPLOYMENT.md` 第 3 节）。也就是说，磁盘不被日志占满这个核心保证，不再需要额外配
-`logrotate` 兜底。
+If file logging is configured via `logging.dir` in `config.yaml` (see `DEPLOYMENT.md`
+section 3), Trident performs its own rolling cleanup ("retain the most recent N rotated
+files"), checked on every rotation event (not just at startup). It also supports
+`rotation: size_based` for per-file size limits. This means the core guarantee of "disk
+won't fill up with logs" does not require an external `logrotate` configuration.
 
-如果仍然想要压缩归档旧日志（Trident 自身不做压缩），可以选择性地配一份 `logrotate`
-配置作为补充：
+If you still want to compress archived logs (Trident does not compress them itself), you
+can optionally add a `logrotate` config as a supplement:
 
 ```
 # /etc/logrotate.d/trident
@@ -63,9 +67,9 @@ Trident 自身会持续执行"保留最近 N 个滚动文件"的清理（每次�
 }
 ```
 
-由于 Trident 自己生成 `trident.log.YYYY-MM-DD`（或 `size_based` 模式下的
-`trident.log.1`、`trident.log.2` ...）这样的独立文件（而不是原地追加同一个文件再切
-割），这里的 `logrotate` 配置只起压缩归档的作用，不依赖 `postrotate`/信号通知
-Trident（不需要，因为 Trident 从不复用旧的滚动文件），清理旧文件的部分与 Trident
-自身的 `max_files` 配置是冗余的，二者取其一即可，建议只用 Trident 自身的保留策略
-以避免两边配置不一致。
+Since Trident generates independent files like `trident.log.YYYY-MM-DD` (or
+`trident.log.1`, `trident.log.2` ... in `size_based` mode) rather than appending to a
+single file and rotating in-place, this `logrotate` config only serves compression
+purposes. It does not depend on `postrotate`/signal notifications (Trident never reuses
+old rotated files). The old-file cleanup is redundant with Trident's own `max_files`
+setting — use one or the other to avoid configuration conflicts.

@@ -17,8 +17,8 @@ Group=trident
 # Path where the release binary is installed; adjust to your packaging
 # layout (e.g. /opt/trident/bin/trident).
 ExecStart=/usr/local/bin/trident
-# Enables `systemctl reload trident` to hot-reload non-sensitive routing.*
-# settings without a restart (see DEPLOYMENT.md 第 5 节).
+# Enables `systemctl reload trident` to hot-reload non-sensitive routing
+# settings without a restart (see DEPLOYMENT.md section 5).
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Configuration file path (see DEPLOYMENT.md). Keep this file's

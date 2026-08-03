@@ -1,19 +1,21 @@
-# Kubernetes 部署
+# Kubernetes Deployment
 
-适用场景：已有 k8s 集群，希望用标准的 Deployment/Service 管理 Trident。
+For environments with an existing Kubernetes cluster where you want to manage Trident
+using standard Deployment/Service resources.
 
-## 前提
+## Prerequisites
 
-- 已构建好 `trident:latest` 镜像（`docker build -t trident:latest .`）并推送到集群可访问的镜像仓库，
-  或者本地集群（kind/minikube）已 `load` 该镜像。
-- 后端 PostgreSQL 节点（Writer/Reader/Analytics）已经存在，本仓库不提供后端数据库的部署清单。
+- A `trident:latest` image has been built (`docker build -t trident:latest .`) and pushed
+  to a registry accessible by the cluster, or locally loaded (kind/minikube `load`).
+- Backend PostgreSQL nodes (Writer/Reader/Analytics) already exist. This repository does
+  not provide deployment manifests for the backend databases.
 
-## 部署步骤
+## Deployment Steps
 
 ```sh
 kubectl apply -f deploy/k8s/00-namespace.yaml
 
-# 用真实密码生成 Secret（不要提交带真实密码的 10-config-secret.yaml 到版本库）
+# Generate the Secret with real passwords (do not commit real passwords to version control)
 kubectl create secret generic trident-config \
   --namespace trident \
   --from-file=config.yaml=./config.yaml \
@@ -26,22 +28,26 @@ kubectl -n trident get pods -w
 kubectl -n trident logs -f deploy/trident
 ```
 
-## 已知限制（务必先读）
+## Known Limitations (read first)
 
-1. **`replicas > 1` 属于 `DEPLOYMENT.md` 第 8 节讨论的多实例场景**：`ConsistencyLevel::Global`
-   在跨 pod 场景下不正确，多副本时请把 `routing.default_consistency` 设为 `session` 或
-   `eventual`。
-2. **探活**：`readinessProbe` 已配成 `httpGet /healthz`（依赖 `10-config-secret.yaml` 里
-   `admin.enabled: true` 且 `admin.listen_addr` 绑 `0.0.0.0`，见该文件内注释）；
-   `livenessProbe` 仍用 TCP 探针（探活端点不健康不代表进程需要被杀重启，只应影响是否
-   接流量，因此 liveness 故意没有跟 readiness 复用同一逻辑）。`/metrics`/`/healthz`
-   只监听在 pod 内部端口，没有任何 Service 暴露到集群外，符合它们不做鉴权的设计前提。
-3. **CANCEL 请求的会话粘滞**：`30-service.yaml` 已经配置了 `sessionAffinity: ClientIP`，
-   降低（但不能消除）多副本下 CANCEL 请求被路由到另一个 pod 从而悄悄失效的概率，详见
-   `DEPLOYMENT.md` 8.3 节。
-4. **密码存储**：`NodeConfig.password` 现在支持 `${ENV_VAR}` 占位符或省略后走
-   `.pgpass` 查找（见 `DEPLOYMENT.md` 第 2 节），可以把 `10-config-secret.yaml`
-   拆分成 ConfigMap（非敏感的 `proxy`/`routing`/`pool`/`health`/`logging`）+
-   一个只放密码的小 Secret（作为环境变量注入，配合 `${ENV_VAR}` 占位符），示例已在
-   `10-config-secret.yaml` 顶部注释中说明；目前该文件仍演示"整份配置存 Secret"的
-   简单做法，两种方式都可用。
+1. **`replicas > 1` is the multi-instance scenario discussed in DEPLOYMENT.md section 8**:
+   `ConsistencyLevel::Global` is not correct across pods. When running multiple replicas,
+   set `routing.default_consistency` to `session` or `eventual`.
+2. **Probes**: `readinessProbe` is configured as `httpGet /healthz` (requires
+   `admin.enabled: true` and `admin.listen_addr` bound to `0.0.0.0` in
+   `10-config-secret.yaml`; see comments in that file). `livenessProbe` uses a TCP probe
+   (an unhealthy health endpoint does not mean the process should be killed and restarted —
+   it should only affect traffic routing, so liveness intentionally does not reuse the same
+   logic as readiness). `/metrics`/`/healthz` listen only on a pod-internal port with no
+   Service exposing them externally, consistent with their no-authentication design.
+3. **CANCEL request session stickiness**: `30-service.yaml` configures
+   `sessionAffinity: ClientIP` to reduce (but not eliminate) the probability of CANCEL
+   requests being routed to a different pod and silently failing in multi-replica setups.
+   See DEPLOYMENT.md section 8.3.
+4. **Password storage**: `NodeConfig.password` now supports `${ENV_VAR}` placeholders or
+   omission with `.pgpass` lookup (see DEPLOYMENT.md section 2). You can split
+   `10-config-secret.yaml` into a ConfigMap (non-sensitive `proxy`/`routing`/`pool`/
+   `health`/`logging`) plus a small Secret containing only passwords (injected as
+   environment variables, using `${ENV_VAR}` placeholders). An example is shown in the
+   comments at the top of `10-config-secret.yaml`. The current file demonstrates the
+   simpler approach of storing the entire config as a Secret; both methods work.
