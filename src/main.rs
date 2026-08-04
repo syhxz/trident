@@ -394,6 +394,14 @@ async fn run(
         ),
         max_idle_time: parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(5 * 60)),
         max_lifetime: parse_duration_or(&config.pool.max_lifetime, Duration::from_secs(30 * 60)),
+        acquire_timeout: parse_duration_or(
+            config.pool.acquire_timeout.as_deref().unwrap_or("0s"),
+            Duration::ZERO,
+        ),
+        leak_detection_threshold: parse_duration_or(
+            config.pool.leak_detection_threshold.as_deref().unwrap_or("0s"),
+            Duration::ZERO,
+        ),
     };
     for node in &config.nodes {
         let target = ConnectTarget {

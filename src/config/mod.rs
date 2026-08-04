@@ -284,6 +284,15 @@ pub struct PoolConfig {
     pub max_idle_time: String,
     pub connection_timeout: String,
     pub max_lifetime: String,
+    /// Maximum time to wait for a connection when the pool is full.
+    /// 0 or omitted = immediate rejection (no wait queue). Default: "5s".
+    #[serde(default)]
+    pub acquire_timeout: Option<String>,
+    /// Time threshold for connection leak detection warnings. When a
+    /// connection is checked out longer than this, a WARN log and metric
+    /// are emitted. 0 or omitted = disabled. Default: disabled.
+    #[serde(default)]
+    pub leak_detection_threshold: Option<String>,
     /// Maximum number of per-user pools across all nodes (passthrough mode).
     /// Each unique (node, user, database, params) gets its own pool.
     /// 0 = unlimited. Default: 1000.
@@ -752,6 +761,8 @@ mod tests {
                 max_idle_time: "5m".to_string(),
                 connection_timeout: "5s".to_string(),
                 max_lifetime: "30m".to_string(),
+                acquire_timeout: None,
+                leak_detection_threshold: None,
                 max_user_pools: 1000,
                 max_user_connections: 500,
             },

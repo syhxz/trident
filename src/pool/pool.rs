@@ -33,6 +33,9 @@ pub enum PoolError {
     #[error("connection pool for node '{0}' is exhausted (max_pool_size reached)")]
     Exhausted(String),
 
+    #[error("timed out after {timeout_ms} ms waiting for an available connection for node '{node_id}'")]
+    AcquireTimeout { node_id: String, timeout_ms: u128 },
+
     #[error("failed to establish new backend connection: {0}")]
     ConnectFailed(String),
 
@@ -162,6 +165,12 @@ pub struct NodePoolSettings {
     pub connection_timeout: Duration,
     pub max_idle_time: Duration,
     pub max_lifetime: Duration,
+    /// Maximum time to wait for a connection when the pool is exhausted.
+    /// 0 = no waiting (immediate rejection, legacy behavior). Default: 5s.
+    pub acquire_timeout: Duration,
+    /// Maximum time a connection may be checked out before a warning is
+    /// emitted (connection leak detection). 0 = disabled. Default: 0.
+    pub leak_detection_threshold: Duration,
 }
 
 impl Default for NodePoolSettings {
@@ -171,6 +180,8 @@ impl Default for NodePoolSettings {
             connection_timeout: Duration::from_secs(5),
             max_idle_time: Duration::from_secs(5 * 60),
             max_lifetime: Duration::from_secs(30 * 60),
+            acquire_timeout: Duration::ZERO,
+            leak_detection_threshold: Duration::ZERO,
         }
     }
 }
@@ -180,7 +191,7 @@ impl Default for NodePoolSettings {
 pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
     node_id: String,
     mode: PoolMode,
-    max_pool_size: u32,
+    max_pool_size: AtomicU32,
     settings: NodePoolSettings,
     factory: F,
     cleaner: C,
@@ -203,6 +214,14 @@ pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
     /// Transaction mode: session ID -> the set of connections that
     /// session has pinned and not yet released.
     pinned_by_session: Mutex<HashMap<String, Vec<PooledConnection>>>,
+    /// Notifies waiting acquirers when a connection is released back to
+    /// the idle queue (wait queue support).
+    release_notify: tokio::sync::Notify,
+    /// Tracks checkout timestamps for leak detection. Only populated when
+    /// `settings.leak_detection_threshold > 0`.
+    checkout_times: Mutex<HashMap<i32, Instant>>,
+    /// Flag to indicate the pool is draining (no new acquires allowed).
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
@@ -234,7 +253,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         NodePool {
             node_id: node_id.into(),
             mode,
-            max_pool_size,
+            max_pool_size: AtomicU32::new(max_pool_size),
             settings,
             factory,
             cleaner,
@@ -244,6 +263,9 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             session_bindings: Mutex::new(HashMap::new()),
             session_acquire_locks: Mutex::new(HashMap::new()),
             pinned_by_session: Mutex::new(HashMap::new()),
+            release_notify: tokio::sync::Notify::new(),
+            checkout_times: Mutex::new(HashMap::new()),
+            draining: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -255,9 +277,10 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     /// Uses a CAS loop to guarantee Requirement 5.5 (active connections
     /// never exceed max_pool_size) holds even under concurrency.
     fn try_reserve_slot(&self) -> bool {
+        let max = self.max_pool_size.load(Ordering::SeqCst);
         let mut current = self.active_connections.load(Ordering::SeqCst);
         loop {
-            if current >= self.max_pool_size {
+            if current >= max {
                 return false;
             }
             match self.active_connections.compare_exchange(
@@ -422,6 +445,12 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     }
 
     async fn acquire_transaction_mode(&self, session_id: &str) -> Result<PooledConnection, PoolError> {
+        // Check draining state
+        if self.draining.load(Ordering::SeqCst) {
+            return Err(PoolError::Exhausted(format!("{} (draining)", self.node_id)));
+        }
+
+        // Fast path: return a pinned connection for this session
         {
             let mut pinned = self.pinned_by_session.lock();
             let mut remove_entry = false;
@@ -434,17 +463,117 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 pinned.remove(session_id);
             }
             if let Some(connection) = connection {
+                self.record_checkout(&connection);
                 return Ok(connection);
             }
         }
+
+        // Try idle queue first
         if let Some(conn) = self.take_reusable_idle() {
+            self.record_checkout(&conn);
             return Ok(conn);
         }
 
-        if !self.try_reserve_slot() {
+        // Try to create a new connection
+        if self.try_reserve_slot() {
+            let conn = self.create_reserved_connection().await?;
+            self.record_checkout(&conn);
+            return Ok(conn);
+        }
+
+        // Pool exhausted — wait for a connection to be released
+        if self.settings.acquire_timeout.is_zero() {
             return Err(PoolError::Exhausted(self.node_id.clone()));
         }
-        self.create_reserved_connection().await
+
+        let deadline = Instant::now() + self.settings.acquire_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(PoolError::AcquireTimeout {
+                    node_id: self.node_id.clone(),
+                    timeout_ms: self.settings.acquire_timeout.as_millis(),
+                });
+            }
+
+            // Wait for a release notification or timeout
+            match tokio::time::timeout(remaining, self.release_notify.notified()).await {
+                Ok(()) => {
+                    // Something was released — try again
+                    if let Some(conn) = self.take_reusable_idle() {
+                        self.record_checkout(&conn);
+                        return Ok(conn);
+                    }
+                    if self.try_reserve_slot() {
+                        let conn = self.create_reserved_connection().await?;
+                        self.record_checkout(&conn);
+                        return Ok(conn);
+                    }
+                    // Another waiter got it first, loop again
+                }
+                Err(_) => {
+                    return Err(PoolError::AcquireTimeout {
+                        node_id: self.node_id.clone(),
+                        timeout_ms: self.settings.acquire_timeout.as_millis(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Records the checkout time for leak detection.
+    fn record_checkout(&self, conn: &PooledConnection) {
+        if !self.settings.leak_detection_threshold.is_zero() {
+            self.checkout_times.lock().insert(conn.backend_pid, Instant::now());
+        }
+    }
+
+    /// Clears checkout tracking and warns if the connection was held too long.
+    fn clear_checkout(&self, conn: &PooledConnection) {
+        if !self.settings.leak_detection_threshold.is_zero() {
+            if let Some(checkout_time) = self.checkout_times.lock().remove(&conn.backend_pid) {
+                let held_duration = Instant::now().duration_since(checkout_time);
+                if held_duration >= self.settings.leak_detection_threshold {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        backend_pid = conn.backend_pid,
+                        held_ms = held_duration.as_millis() as u64,
+                        threshold_ms = self.settings.leak_detection_threshold.as_millis() as u64,
+                        "potential connection leak detected: connection held longer than threshold"
+                    );
+                    metrics::counter!("trident_pool_leak_detections_total", "node_id" => self.node_id.clone()).increment(1);
+                }
+            }
+        }
+    }
+
+    /// Dynamically resizes the pool's maximum connection count. Takes
+    /// effect immediately for new acquire calls. Existing connections
+    /// beyond the new limit are not forcibly closed — they drain naturally.
+    pub fn resize(&self, new_max: u32) {
+        let old = self.max_pool_size.swap(new_max, Ordering::SeqCst);
+        if new_max > old {
+            // More capacity available — wake waiting acquirers
+            self.release_notify.notify_waiters();
+        }
+        tracing::info!(
+            node_id = %self.node_id,
+            old_max = old,
+            new_max = new_max,
+            "pool resized"
+        );
+    }
+
+    /// Puts the pool into draining mode: new acquires are rejected,
+    /// existing connections continue until released.
+    pub fn drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        tracing::info!(node_id = %self.node_id, "pool entering drain mode");
+    }
+
+    /// Takes the pool out of draining mode.
+    pub fn undrain(&self) {
+        self.draining.store(false, Ordering::SeqCst);
     }
 
     async fn release_transaction_mode(
@@ -455,6 +584,9 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         if conn.node_id != self.node_id {
             return Err(PoolError::NodeMismatch);
         }
+
+        // Clear leak detection tracking
+        self.clear_checkout(&conn);
 
         if conn.pinned {
             let mut pinned = self.pinned_by_session.lock();
@@ -474,14 +606,17 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                     // connection.
                     self.cleaner.discard(&conn);
                     self.release_known_slot(&conn);
+                    // Notify waiters that a slot freed up
+                    self.release_notify.notify_one();
                     return Err(e);
                 }
             }
         }
 
         conn.idle_since = Some(Instant::now());
-        let mut idle = self.idle.lock();
-        idle.push_back(conn);
+        self.idle.lock().push_back(conn);
+        // Notify one waiting acquirer that a connection is available
+        self.release_notify.notify_one();
         Ok(())
     }
 }
@@ -527,9 +662,12 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
         if conn.node_id != self.node_id {
             return Err(PoolError::NodeMismatch);
         }
+        self.clear_checkout(&conn);
         self.forget_metadata(&conn);
         self.cleaner.discard(&conn);
         self.release_known_slot(&conn);
+        // Slot freed — notify a waiting acquirer
+        self.release_notify.notify_one();
         Ok(())
     }
 

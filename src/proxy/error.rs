@@ -42,6 +42,13 @@ pub fn proxy_error_to_pg_error(err: &ProxyError) -> PgError {
             "53300", // too_many_connections
             format!("connection pool exhausted for node '{node}'"),
         ),
+        ProxyError::Pool(PoolError::AcquireTimeout {
+            node_id,
+            timeout_ms,
+        }) => (
+            "53300", // too_many_connections
+            format!("timed out after {timeout_ms} ms waiting for an available connection for node '{node_id}'"),
+        ),
         ProxyError::Pool(PoolError::ConnectFailed(reason)) => (
             "08001", // sqlclient_unable_to_establish_sqlconnection
             format!("failed to connect to backend: {reason}"),
