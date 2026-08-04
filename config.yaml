@@ -1,20 +1,34 @@
 proxy:
   listen_addr: "0.0.0.0:6432"
   max_clients: 2000
-  # Client protocol boundary:
-  # - Trident currently accepts PostgreSQL startup without validating a
-  #   client password. Keep this listener on a trusted network or put an
-  #   authenticated TCP proxy in front of it.
-  # - Only Simple Query (`Q`) is supported. Parse/Bind/Describe/Execute
-  #   return SQLSTATE 0A000; the connection recovers after Sync.
-  # - SSLRequest/GSSENCRequest receive `N` and startup continues in
-  #   plaintext. Trident does not terminate client TLS or GSS encryption.
+  # Client authentication mode. Supported values:
+  #   trust        - No authentication (dev/test only, default)
+  #   md5          - Proxy verifies client via local auth_file (PgBouncer model)
+  #   scram-sha-256 - Proxy verifies client via SCRAM verifier in auth_file
+  #   passthrough  - Client credentials are forwarded to backend PostgreSQL
+  #                  for authentication. Each (user, database) pair gets its
+  #                  own connection pool. Database-level RBAC and audit
+  #                  identity are fully preserved. Recommended for production.
+  # client_auth: passthrough
+  # auth_file: userlist.txt   # Only used with md5/scram-sha-256 modes
+  #
+  # When using passthrough mode, the node username/password below is only
+  # used for health check probes — client queries use the client's own
+  # credentials. No config changes needed when adding new database users.
+  #
+  # Security: enable client-facing TLS when using passthrough to protect
+  # credentials in transit:
+  # tls_cert: /etc/trident/server.crt
+  # tls_key: /etc/trident/server.key
 
 nodes:
-  # `password` is optional (see DEPLOYMENT.md 第 2 节). It is used by both
-  # pooled backend connections and health probes. PostgreSQL Cleartext,
-  # MD5, and SCRAM-SHA-256 password authentication are supported.
-  # Two ways to avoid plaintext here:
+  # `password` is optional (see DEPLOYMENT.md). It is used by health probes
+  # to verify backend connectivity. In passthrough mode, client queries use
+  # the client's own credentials — these node credentials are ONLY for
+  # health checks. PostgreSQL Cleartext, MD5, and SCRAM-SHA-256 backend
+  # authentication are all supported.
+  #
+  # Two ways to avoid plaintext passwords here:
   # - "${ENV_VAR}" placeholder (used below): resolved from the process
   #   environment at load time, e.g. export TRIDENT_PRIMARY_PASSWORD=... .
   # - omit the field entirely: looked up from a .pgpass-format file
