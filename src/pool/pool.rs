@@ -131,8 +131,26 @@ pub trait ConnectionPool: Send + Sync {
     fn release_session(&self, session_id: &str) -> Vec<PooledConnection>;
 
     /// The current number of active connections (used for load balancing
-    /// and capacity monitoring).
+    /// and capacity monitoring). Includes idle, checked-out, session-bound,
+    /// and pinned connections — i.e. every physical connection the pool owns.
     fn active_connections(&self) -> i64;
+
+    /// The number of connections currently sitting idle in the pool.
+    /// `active_connections() - idle_connections()` gives the number of
+    /// connections actively in use by clients. Used by the eviction logic
+    /// to determine if a pool is truly unused (all connections idle, none
+    /// checked out).
+    fn idle_connections(&self) -> i64 {
+        0
+    }
+
+    /// Returns the backend PIDs of all connections known to this pool
+    /// (idle, checked-out, pinned, session-bound). Used when a pool is
+    /// being shut down/evicted so the caller can also close the
+    /// corresponding sockets in the ConnectionRegistry.
+    fn known_pids(&self) -> Vec<i32> {
+        Vec::new()
+    }
 }
 
 /// Runtime controls for a single node pool. Durations are applied lazily
@@ -537,6 +555,14 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
 
     fn active_connections(&self) -> i64 {
         self.active_connections.load(Ordering::SeqCst) as i64
+    }
+
+    fn idle_connections(&self) -> i64 {
+        self.idle.lock().len() as i64
+    }
+
+    fn known_pids(&self) -> Vec<i32> {
+        self.known_connections.lock().iter().copied().collect()
     }
 }
 

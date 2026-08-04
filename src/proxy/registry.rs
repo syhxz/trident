@@ -53,20 +53,32 @@ pub type BackendStream = BufReader<MaybeTlsStream>;
 const BACKEND_READ_BUF_SIZE: usize = 8 * 1024;
 
 /// Maps `(node_id, backend_pid)` to the live `BackendStream` for that backend
-/// connection.
+/// connection. Uses a per-node generation counter to prevent stale handlers
+/// from re-inserting sockets for nodes that have been dynamically removed.
 #[derive(Default)]
 pub struct ConnectionRegistry {
     sockets: Mutex<HashMap<(String, i32), BackendStream>>,
+    /// Generation counter per node_id. Incremented on `remove_by_node`.
+    /// Inserts are only accepted if no generation is recorded (new node)
+    /// or the node has not been removed since it was last active.
+    removed_nodes: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ConnectionRegistry {
     pub fn new() -> Self {
         ConnectionRegistry {
             sockets: Mutex::new(HashMap::new()),
+            removed_nodes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
     pub fn insert(&self, node_id: &str, backend_pid: i32, stream: BackendStream) {
+        // Reject inserts for nodes that have been removed (prevents
+        // stale handlers from re-inserting sockets after node deletion).
+        if self.removed_nodes.lock().contains(node_id) {
+            tracing::debug!(node_id, backend_pid, "rejecting socket insert for removed node");
+            return;
+        }
         let mut sockets = self.sockets.lock();
         sockets.insert((node_id.to_string(), backend_pid), stream);
     }
@@ -96,12 +108,20 @@ impl ConnectionRegistry {
         sockets.remove(&(node_id.to_string(), backend_pid));
     }
 
-    /// Removes and drops ALL sockets belonging to a given node. Used when
-    /// a node is dynamically removed to prevent FD/socket leaks from idle
-    /// connections that would otherwise never be reclaimed.
+    /// Removes and drops ALL sockets belonging to a given node and marks
+    /// the node as removed. Subsequent `insert` calls for this node are
+    /// silently rejected, preventing stale in-flight handlers from
+    /// re-inserting sockets after a dynamic node removal.
     pub fn remove_by_node(&self, node_id: &str) {
+        self.removed_nodes.lock().insert(node_id.to_string());
         let mut sockets = self.sockets.lock();
         sockets.retain(|(n, _), _| n != node_id);
+    }
+
+    /// Re-enables inserts for a node_id. Called when a node is
+    /// dynamically (re-)added after having been previously removed.
+    pub fn allow_node(&self, node_id: &str) {
+        self.removed_nodes.lock().remove(node_id);
     }
 }
 

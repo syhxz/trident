@@ -60,7 +60,19 @@ proxy:
 | Read-Only SELECT | 38,117 TPS | 32,542 TPS |
 | TPC-B Mixed R/W | 2,832 TPS | 2,991 TPS |
 
-**Security recommendation:** Enable client-facing TLS (`proxy.tls_cert`/`proxy.tls_key`) when using passthrough mode, since credentials are transmitted as cleartext between client and proxy before the TLS layer.
+**Security recommendation:** Enable client-facing TLS (`proxy.tls_cert`/`proxy.tls_key`) when using passthrough mode, since credentials are transmitted as cleartext between client and proxy before the TLS layer. Trident enforces this at config validation — passthrough without TLS is only allowed on loopback interfaces.
+
+**Security features:**
+- Credentials are verified against the backend Writer **before** telling the client authentication succeeded
+- Pool credential fingerprints use HMAC-SHA-256 with constant-time comparison (no timing side-channel)
+- Concurrent pool creation race conditions are handled safely (no auth bypass)
+- Per-user pool limits prevent resource exhaustion (`pool.max_user_pools`, `pool.max_user_connections`)
+- Client IP is injected into `application_name` for backend audit visibility (format: `trident:<client_ip>:<app_name>`)
+
+**Backend SSL modes:** Connections from Trident to PostgreSQL support:
+- `disable` / `prefer` / `require` (encryption only, no certificate verification)
+- `verify-ca` (verify server certificate chain against system CAs)
+- `verify-full` (verify chain + hostname — prevents MITM)
 
 ## Quick Start
 

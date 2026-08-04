@@ -42,6 +42,13 @@ nodes:
     database: mydb
     username: proxy_user
     password: "${TRIDENT_PRIMARY_PASSWORD}"
+    # Backend SSL mode for proxy-to-PostgreSQL connections:
+    #   disable      - plaintext only (default)
+    #   prefer       - try SSL, fall back to plaintext
+    #   require      - SSL mandatory, no certificate verification
+    #   verify-ca    - SSL + verify server cert chain against system CAs
+    #   verify-full  - SSL + verify cert chain + hostname match (most secure)
+    # ssl_mode: require
 
   - name: reader-1
     host: 10.0.1.11
@@ -138,6 +145,18 @@ pool:
   # Maximum time allowed to create and authenticate a backend connection.
   connection_timeout: 5s
   max_lifetime: 30m
+  # --- Passthrough mode per-user pool limits ---
+  # These apply only when client_auth is "passthrough". Each unique
+  # (node, user, database, session-params) combination creates a separate
+  # pool. These global caps prevent resource exhaustion from many users.
+  #
+  # Maximum distinct per-user pools. Default: 1000. 0 = unlimited.
+  # max_user_pools: 1000
+  #
+  # Maximum total backend connections across all per-user pools.
+  # Default: 500. 0 = unlimited. Should not exceed the backend
+  # PostgreSQL's max_connections minus headroom for admin/health probes.
+  # max_user_connections: 500
 
 health:
   check_interval: 3s

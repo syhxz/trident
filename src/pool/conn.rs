@@ -161,7 +161,7 @@ pub async fn establish_connection(
     // --- SSL negotiation ---
     let mut stream = match target.ssl_mode {
         SslMode::Disable => MaybeTlsStream::Plain(tcp_stream),
-        SslMode::Prefer | SslMode::Require => {
+        SslMode::Prefer | SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
             send_ssl_request(&mut tcp_stream).await?;
             tracing::debug!(node_id, "SSLRequest sent");
             let response = read_ssl_response(&mut tcp_stream).await?;
@@ -169,16 +169,25 @@ pub async fn establish_connection(
             match response {
                 b'S' => {
                     // Server accepts SSL -- perform TLS handshake
-                    let tls_stream = upgrade_to_tls(tcp_stream, &target.host).await?;
+                    let tls_stream = match target.ssl_mode {
+                        SslMode::VerifyCa => {
+                            upgrade_to_tls_verified(tcp_stream, &target.host, false).await?
+                        }
+                        SslMode::VerifyFull => {
+                            upgrade_to_tls_verified(tcp_stream, &target.host, true).await?
+                        }
+                        _ => upgrade_to_tls(tcp_stream, &target.host).await?,
+                    };
                     tracing::debug!(node_id, "TLS handshake complete");
                     MaybeTlsStream::Tls(Box::new(tls_stream))
                 }
                 b'N' => {
                     // Server declines SSL
-                    if target.ssl_mode == SslMode::Require {
-                        return Err(ConnError::AuthFailed(
-                            "server does not support SSL but ssl_mode=require".to_string(),
-                        ));
+                    if target.ssl_mode != SslMode::Prefer {
+                        return Err(ConnError::AuthFailed(format!(
+                            "server does not support SSL but ssl_mode={:?}",
+                            target.ssl_mode
+                        )));
                     }
                     // ssl_mode=prefer: fall back to plaintext
                     MaybeTlsStream::Plain(tcp_stream)
@@ -283,6 +292,56 @@ async fn upgrade_to_tls(
         .connect(server_name, tcp_stream)
         .await
         .map_err(|e| ConnError::AuthFailed(format!("TLS handshake failed: {}", e)))
+}
+
+/// Establishes a TLS connection with certificate verification using the
+/// system's trusted root certificates. When `verify_hostname` is true
+/// (verify-full), the server's CN/SAN must match `host`; when false
+/// (verify-ca), only the certificate chain is validated.
+async fn upgrade_to_tls_verified(
+    tcp_stream: TcpStream,
+    host: &str,
+    verify_hostname: bool,
+) -> Result<TlsStream<TcpStream>, ConnError> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    // Load system/platform root certificates
+    let native_certs = rustls_native_certs::load_native_certs();
+    for cert in native_certs.certs {
+        let _ = root_store.add(cert);
+    }
+
+    if root_store.is_empty() {
+        return Err(ConnError::AuthFailed(
+            "no trusted CA certificates found for TLS verification".to_string(),
+        ));
+    }
+
+    let config = if verify_hostname {
+        // verify-full: standard rustls verification (chain + hostname)
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    } else {
+        // verify-ca: verify cert chain but skip hostname check
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| ConnError::AuthFailed(format!("failed to build cert verifier: {}", e)))?;
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth()
+    };
+
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| ConnError::AuthFailed(format!("invalid TLS server name '{}': {}", host, e)))?;
+
+    connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| ConnError::AuthFailed(format!("TLS handshake failed (certificate verification): {}", e)))
 }
 
 /// A TLS certificate verifier that accepts any server certificate.

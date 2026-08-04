@@ -237,6 +237,10 @@ where
     pub cancel_connect_timeout: std::time::Duration,
     /// Client idle timeout. Zero = disabled.
     pub client_idle_timeout: std::time::Duration,
+    /// Timeout for the entire startup + authentication phase (after TLS).
+    /// Zero = disabled. Protects against clients that stall during the
+    /// Startup/Auth exchange to exhaust max_clients slots.
+    pub startup_timeout: std::time::Duration,
 }
 
 /// Abstraction over `Router::route` used by the handler, so the handler
@@ -310,6 +314,7 @@ where
             slow_query_buffer: None,
             cancel_connect_timeout: std::time::Duration::ZERO,
             client_idle_timeout: std::time::Duration::ZERO,
+            startup_timeout: std::time::Duration::ZERO,
         }
     }
 
@@ -337,6 +342,7 @@ where
             slow_query_buffer: None,
             cancel_connect_timeout: std::time::Duration::ZERO,
             client_idle_timeout: std::time::Duration::ZERO,
+            startup_timeout: std::time::Duration::ZERO,
         }
     }
 
@@ -365,6 +371,13 @@ where
     ) -> Self {
         self.cancel_connect_timeout = cancel_connect_timeout;
         self.client_idle_timeout = client_idle_timeout;
+        self
+    }
+
+    /// Sets the startup (authentication) timeout. This covers the entire
+    /// Startup + Authentication exchange after TLS negotiation.
+    pub fn with_startup_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.startup_timeout = timeout;
         self
     }
 
@@ -427,55 +440,203 @@ where
         S: AsyncRead + AsyncWrite + Unpin + Send,
         SH: StartupHandler,
     {
-        // --- Startup phase: Startup / CancelRequest / SSL/GSSENC --------
+        // --- Startup phase with unified deadline --------------------------
         //
-        // PostgreSQL clients commonly probe transport encryption before
-        // sending the real StartupMessage. Trident currently supports
-        // plaintext client transport only, so reject each probe with the
-        // protocol-mandated one-byte `N` and continue on the same socket.
-        // Bound the negotiation loop to avoid an unbounded request stream.
-        const MAX_ENCRYPTION_NEGOTIATIONS: usize = 2;
-        let mut negotiation_count = 0;
-        let startup_msg = loop {
-            match read_startup_packet(&mut client_stream).await? {
-                StartupPacket::Startup(msg) => break msg,
-                StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
-                    if negotiation_count >= MAX_ENCRYPTION_NEGOTIATIONS {
-                        return Err(ProxyError::Protocol(ProtocolError::Malformed(
-                            "too many startup encryption negotiation requests".into(),
-                        )));
+        // The startup_timeout covers the entire StartupMessage negotiation
+        // (SSLRequest/GssEncRequest probing) AND the authentication
+        // exchange. A client that stalls at any point during this phase
+        // (e.g. sending only partial Startup data, or never responding to
+        // the auth challenge) cannot hold a max_clients slot indefinitely.
+        let startup_fut = async {
+            // --- Startup phase: Startup / CancelRequest / SSL/GSSENC ------
+            const MAX_ENCRYPTION_NEGOTIATIONS: usize = 2;
+            let mut negotiation_count = 0;
+            let startup_msg = loop {
+                match read_startup_packet(&mut client_stream).await? {
+                    StartupPacket::Startup(msg) => break msg,
+                    StartupPacket::SslRequest | StartupPacket::GssEncRequest => {
+                        if negotiation_count >= MAX_ENCRYPTION_NEGOTIATIONS {
+                            return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                                "too many startup encryption negotiation requests".into(),
+                            )));
+                        }
+                        negotiation_count += 1;
+                        client_stream
+                            .write_all(b"N")
+                            .await
+                            .map_err(ProtocolError::Io)?;
+                        client_stream.flush().await.map_err(ProtocolError::Io)?;
                     }
-                    negotiation_count += 1;
-                    client_stream
-                        .write_all(b"N")
-                        .await
-                        .map_err(ProtocolError::Io)?;
-                    client_stream.flush().await.map_err(ProtocolError::Io)?;
+                    StartupPacket::Cancel {
+                        backend_pid,
+                        secret_key,
+                    } => {
+                        self.handle_cancel_request(backend_pid, secret_key).await;
+                        return Ok(None);
+                    }
                 }
-                StartupPacket::Cancel {
-                    backend_pid,
-                    secret_key,
-                } => {
-                    self.handle_cancel_request(backend_pid, secret_key).await;
-                    return Ok(());
+            };
+
+            // --- Authentication -------------------------------------------
+            let auth_outcome = startup_handler
+                .handle_startup_with_stream(startup_msg, &mut client_stream)
+                .await
+                .map_err(ProxyError::Protocol)?;
+
+            // --- Passthrough pre-verification -----------------------------
+            //
+            // When using passthrough authentication, the proxy captured the
+            // client's real database password but has NOT yet verified it
+            // against any backend. Before telling the client "AuthenticationOk",
+            // we must prove these credentials work. Otherwise:
+            //   - Wrong-password clients see success, then fail on first query
+            //   - Invalid credentials get stored in the user pool table
+            //
+            // Strategy: find the Writer node (the authoritative auth source),
+            // create/get the per-user pool, and acquire+release one connection.
+            // The pool's ConnFactory calls establish_connection() which does
+            // the real PostgreSQL Startup+Auth against the backend. If the
+            // backend rejects the credentials, we send an ErrorResponse to the
+            // client and abort — the client never sees AuthenticationOk.
+            if let Some(ref creds) = auth_outcome.client_credentials {
+                let all_nodes = self.pool_manager.snapshot();
+                let writer_node = all_nodes.iter().find(|n| {
+                    n.node_type == NodeType::Writer && n.healthy
+                });
+                if let Some(writer) = writer_node {
+                    let pool = self.pool_manager.pool_for_user(
+                        &writer.node_id,
+                        &creds.username,
+                        &creds.password,
+                        creds.database.as_deref(),
+                        &creds.extra_params,
+                    );
+                    match pool {
+                        Some(p) => {
+                            // Acquire a connection — triggers establish_connection()
+                            // which does the real PostgreSQL backend authentication.
+                            let verify_session = format!("__verify_{}", session_id);
+                            match p.acquire(&verify_session).await {
+                                Ok(conn) => {
+                                    // Credentials verified! Discard the verification
+                                    // connection — in Transaction mode it returns to
+                                    // idle, in Session mode it stays bound to the
+                                    // verify session_id forever. Using discard()
+                                    // cleanly frees the slot and socket in both modes.
+                                    // The first real query will acquire a fresh
+                                    // connection from the pool (or create a new one).
+                                    let _ = p.discard(conn);
+                                }
+                                Err(pool_err) => {
+                                    // Backend rejected credentials or connect failed.
+                                    // Remove the pool from the map so it doesn't
+                                    // pollute future attempts with correct credentials.
+                                    self.pool_manager.remove_user_pool(
+                                        &writer.node_id,
+                                        &creds.username,
+                                        creds.database.as_deref(),
+                                        &creds.extra_params,
+                                    );
+                                    metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
+                                    tracing::warn!(
+                                        username = %creds.username,
+                                        error = %pool_err,
+                                        "passthrough credential verification failed against backend"
+                                    );
+                                    let pg_err = PgError::simple(
+                                        "FATAL",
+                                        "28P01",
+                                        &format!(
+                                            "password authentication failed for user \"{}\"",
+                                            creds.username
+                                        ),
+                                    );
+                                    send_pg_error_response(&mut client_stream, pg_err).await?;
+                                    client_stream.flush().await.map_err(|e| {
+                                        ProxyError::Protocol(ProtocolError::Io(e))
+                                    })?;
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        None => {
+                            metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
+                            tracing::warn!(
+                                username = %creds.username,
+                                "passthrough: no pool available for credential verification"
+                            );
+                            let pg_err = PgError::simple(
+                                "FATAL",
+                                "28000",
+                                "authentication failed: no backend available for credential verification",
+                            );
+                            send_pg_error_response(&mut client_stream, pg_err).await?;
+                            client_stream.flush().await.map_err(|e| {
+                                ProxyError::Protocol(ProtocolError::Io(e))
+                            })?;
+                            return Ok(None);
+                        }
+                    }
+                }
+                // If no healthy Writer exists, allow startup to proceed —
+                // the client will get errors on first query anyway, matching
+                // behavior for non-passthrough modes with no healthy backends.
+            }
+
+            send_startup_success(&mut client_stream, &auth_outcome).await?;
+            client_stream.flush().await.map_err(|e| {
+                ProxyError::Protocol(ProtocolError::Io(e))
+            })?;
+
+            Ok(Some(auth_outcome))
+        };
+
+        let auth_outcome = if self.startup_timeout.is_zero() {
+            match startup_fut.await? {
+                Some(outcome) => outcome,
+                None => return Ok(()), // CancelRequest handled
+            }
+        } else {
+            match tokio::time::timeout(self.startup_timeout, startup_fut).await {
+                Ok(Ok(Some(outcome))) => outcome,
+                Ok(Ok(None)) => return Ok(()), // CancelRequest handled
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => {
+                    return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                        "startup/authentication timeout exceeded".into(),
+                    )));
                 }
             }
         };
 
         let mut session = ClientSession::new(session_id.clone(), default_consistency);
 
-        // --- Authentication -----------------------------------------------
-        let auth_outcome = startup_handler
-            .handle_startup_with_stream(startup_msg, &mut client_stream)
-            .await
-            .map_err(ProxyError::Protocol)?;
-        send_startup_success(&mut client_stream, &auth_outcome).await?;
-        client_stream.flush().await.map_err(|e| {
-            ProxyError::Protocol(ProtocolError::Io(e))
-        })?;
-
         // Store client credentials for passthrough pool lookups
         session.client_credentials = auth_outcome.client_credentials.clone();
+
+        // Inject client IP into application_name for backend audit trail.
+        // In passthrough mode, the backend's pg_stat_activity and audit logs
+        // only see the proxy's IP. By prepending the real client IP to
+        // application_name, DBAs can trace queries back to the originator.
+        // Format: "client_ip:original_app_name" or just "client_ip" if none.
+        if let Some(ref mut creds) = session.client_credentials {
+            // Extract client IP from session_id (format: "session-N-IP:PORT")
+            let client_ip = session_id
+                .rsplit_once('-')
+                .and_then(|(_, addr)| addr.rsplit_once(':'))
+                .map(|(ip, _port)| ip)
+                .unwrap_or("unknown");
+            let original_app = creds.extra_params
+                .get("application_name")
+                .cloned()
+                .unwrap_or_default();
+            let enriched_app = if original_app.is_empty() {
+                format!("trident:{}", client_ip)
+            } else {
+                format!("trident:{}:{}", client_ip, original_app)
+            };
+            creds.extra_params.insert("application_name".to_string(), enriched_app);
+        }
 
         // Register the cancel key this proxy just issued to the client (in
         // BackendKeyData above) against this session, so a later
@@ -785,12 +946,18 @@ where
         // enough that routing is impossible; reject it here (the strict
         // parser would previously have rejected it at read time).
         //
-        // FIX: Check ALL Parse messages in the batch, not just the first.
-        // If any Parse requires a Writer (e.g. INSERT, UPDATE), the entire
+        // FIX: Check ALL Parse messages in the batch. If any Parse requires
+        // a Writer (via SQL classification or routing hint), the entire
         // batch must be routed to the Writer. This prevents a batch like
         // [Parse(SELECT), Parse(INSERT)] from being sent to a Reader.
+        // Additionally, if any Parse carries a ForceWriter routing hint,
+        // that takes priority. If there are conflicting force-route hints
+        // (ForceWriter vs ForceReader), Writer wins for safety.
         let mut route_sql: Option<&str> = None;
+        let mut force_writer = false;
         let classifier = KeywordClassifier;
+        let hint_parser = crate::parser::hint::RegexHintParser;
+        use crate::parser::hint::{HintParser as _, RouteHint};
         for frame in batch.iter().filter(|f| f.tag == frontend_tag::PARSE) {
             let sql = frame.parse_sql().ok_or_else(|| {
                 ProxyError::Protocol(ProtocolError::Malformed(
@@ -800,11 +967,15 @@ where
             if route_sql.is_none() {
                 route_sql = Some(sql);
             }
-            // If any Parse in the batch requires a Writer, use that SQL
-            // for routing so the entire batch goes to the Writer.
+            // Check SQL classification
             if requires_writer(&classifier, sql) {
                 route_sql = Some(sql);
-                break;
+                force_writer = true;
+            }
+            // Check routing hint
+            if !force_writer && hint_parser.parse_hint(sql) == RouteHint::ForceWriter {
+                route_sql = Some(sql);
+                force_writer = true;
             }
         }
 
@@ -1212,11 +1383,17 @@ where
         if session.state.tx_state != TxState::Idle || conn.pinned {
             session.held_backend = Some(HeldBackend { conn, socket: backend_socket });
         } else {
-            // Connection returned to pool: any unnamed statement on it is
-            // gone (the physical connection may be handed to another client).
-            // Clear the tracking flag so the next batch with Bind("") doesn't
-            // spuriously trigger the cross-Sync rejection.
-            session.unnamed_parse_node = None;
+            // Connection returned to pool: the unnamed statement that was
+            // parsed on it still logically "exists" for this session's
+            // lifetime (the client may try to Bind("") in the next batch).
+            // However, since the physical connection is going back to the
+            // pool, a cross-Sync Bind("") would land on a *different*
+            // connection that doesn't have it. We KEEP unnamed_parse_node
+            // set so the cross-Sync rejection (line ~833) fires correctly.
+            // It is only cleared by:
+            //   - A new unnamed Parse (overwrites in update_unnamed_parse_tracking)
+            //   - Explicit Close('S', "") from the client
+            //   - Session end
             self.connection_registry
                 .insert(&conn.node_id, conn.backend_pid, backend_socket);
             pool.release(&session.state.id, conn).await?;
@@ -1455,8 +1632,10 @@ where
             let held = session.held_backend.as_ref().unwrap();
             if !held.conn.pinned {
                 let held = session.held_backend.take().unwrap();
-                // Unnamed statement is gone once connection returns to pool.
-                session.unnamed_parse_node = None;
+                // Keep unnamed_parse_node set: the unnamed statement was
+                // parsed on this connection which is now returning to the
+                // pool. A cross-Sync Bind("") must be rejected since a
+                // different connection may be acquired next time.
                 let pool = self.resolve_pool(&held.conn.node_id, session).ok_or_else(|| {
                     ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
                         "pool for '{}' no longer exists",
@@ -2784,6 +2963,9 @@ fn record_statement_routes(session: &mut ClientSession, batch: &[ExtendedFrame],
                 if let Some((b'S', name)) = frame.kind_and_name() {
                     if !name.is_empty() {
                         session.extended_route_tracker.forget_statement(name);
+                    } else {
+                        // Explicit Close of the unnamed statement: clear tracking
+                        session.unnamed_parse_node = None;
                     }
                 }
             }

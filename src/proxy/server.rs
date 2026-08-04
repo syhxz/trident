@@ -357,7 +357,8 @@ where
         )
         .with_lsn_tracking(deps.lsn_tracking.clone())
         .with_slow_query_buffer(deps.slow_queries.clone())
-        .with_timeouts(deps.cancel_connect_timeout, deps.client_idle_timeout);
+        .with_timeouts(deps.cancel_connect_timeout, deps.client_idle_timeout)
+        .with_startup_timeout(deps.startup_timeout);
         // Wrap the client socket in BufReader+BufWriter so:
         // - Reads are buffered: multiple small protocol messages (Bind +
         //   Execute + Sync) typically arrive in one TCP segment but would

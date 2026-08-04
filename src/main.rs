@@ -55,6 +55,9 @@ struct RouterReloadTarget {
     pattern_matcher: Arc<RegexPatternMatcher>,
     custom_rules: Arc<trident::router::custom_rules::CustomRoutingRules>,
     default_consistency: Arc<arc_swap::ArcSwap<trident::config::ConsistencyLevel>>,
+    /// Admin console's routing config snapshot — updated on reload so
+    /// `GET /api/config` reflects the current state even after SIGHUP.
+    admin_routing_config: Option<Arc<arc_swap::ArcSwap<trident::config::RoutingConfig>>>,
 }
 
 impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
@@ -84,6 +87,13 @@ impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
         self.default_consistency
             .store(Arc::new(routing.default_consistency));
 
+        // Sync the admin console's config snapshot so /api/config shows
+        // the reloaded values regardless of whether the reload was
+        // triggered by SIGHUP or POST /reload.
+        if let Some(ref snapshot) = self.admin_routing_config {
+            snapshot.store(Arc::new(routing.clone()));
+        }
+
         Ok(())
     }
 }
@@ -103,6 +113,10 @@ struct LiveNodeManager {
 #[async_trait::async_trait]
 impl admin::NodeManager for LiveNodeManager {
     async fn add_node(&self, config: trident::config::NodeConfig) -> Result<(), String> {
+        // Allow inserts for this node (in case it was previously removed
+        // and the registry is blocking re-insertion).
+        self.connection_registry.allow_node(&config.name);
+
         // Validate: check connectivity first
         let probe = WireProtocolHealthProbe {
             target: ProbeTarget {
@@ -152,16 +166,19 @@ impl admin::NodeManager for LiveNodeManager {
         );
 
         if let Err(e) = pool.warm_up().await {
-            // Rollback: remove from health checker
+            // Rollback: remove from health checker and clean up any sockets
+            // that were registered during the partial warm-up.
             self.health_checker.remove_node(&config.name);
+            self.connection_registry.remove_by_node(&config.name);
             return Err(format!("failed to warm up pool for '{}': {}", config.name, e));
         }
 
         // Add pool to manager
         if !self.pool_manager.add_pool(config.name.clone(), Box::new(pool)) {
             // Should not happen since we checked health_checker first,
-            // but handle gracefully
+            // but handle gracefully. Clean up registered sockets too.
             self.health_checker.remove_node(&config.name);
+            self.connection_registry.remove_by_node(&config.name);
             return Err(format!("node '{}' pool already exists", config.name));
         }
 
@@ -291,6 +308,9 @@ enum StartupError {
 
     #[error("invalid admin.listen_addr '{0}': {1}")]
     InvalidAdminListenAddr(String, std::net::AddrParseError),
+
+    #[error("client TLS configuration error: {0}")]
+    ClientTls(String),
 
     #[error("failed to prewarm connection pool for node '{node}': {source}")]
     PoolWarmup { node: String, source: PoolError },
@@ -556,6 +576,8 @@ async fn run(
         tracing::info!("credential passthrough mode enabled: per-user pools will be created on demand");
     }
 
+    pool_manager.set_connection_registry(registry.clone());
+    pool_manager.set_user_pool_limits(config.pool.max_user_pools, config.pool.max_user_connections);
     let pool_manager = Arc::new(pool_manager);
 
     // --- Router ---
@@ -631,15 +653,13 @@ async fn run(
         match (&config.proxy.tls_cert, &config.proxy.tls_key) {
             (Some(cert_path), Some(key_path)) => {
                 let certs = load_certs(cert_path).map_err(|e| {
-                    StartupError::InvalidAdminListenAddr(
+                    StartupError::ClientTls(
                         format!("failed to load TLS cert '{}': {}", cert_path, e),
-                        "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap_err(),
                     )
                 })?;
                 let key = load_private_key(key_path).map_err(|e| {
-                    StartupError::InvalidAdminListenAddr(
+                    StartupError::ClientTls(
                         format!("failed to load TLS key '{}': {}", key_path, e),
-                        "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap_err(),
                     )
                 })?;
 
@@ -647,9 +667,8 @@ async fn run(
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
                     .map_err(|e| {
-                        StartupError::InvalidAdminListenAddr(
+                        StartupError::ClientTls(
                             format!("TLS config error: {}", e),
-                            "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap_err(),
                         )
                     })?;
 
@@ -707,16 +726,28 @@ async fn run(
     // --- Per-user pool idle eviction (passthrough mode) ---
     // Evicts per-user pools that have been idle for longer than
     // max_idle_time (same as pool.max_idle_time). Runs every 60s.
+    // Also emits per-user pool metrics on each tick.
     if config.proxy.client_auth == trident::config::ClientAuthMode::Passthrough {
         let pool_manager_for_eviction = pool_manager.clone();
         let eviction_max_idle = parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(300));
+        let max_user_pools_cfg = config.pool.max_user_pools;
+        let max_user_conns_cfg = config.pool.max_user_connections;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            // Emit static config limits once at startup
+            metrics::gauge!("trident_user_pools_max").set(max_user_pools_cfg as f64);
+            metrics::gauge!("trident_user_connections_max").set(max_user_conns_cfg as f64);
             loop {
                 ticker.tick().await;
                 let evicted = pool_manager_for_eviction.evict_idle_user_pools(eviction_max_idle);
+                let current_pools = pool_manager_for_eviction.user_pool_count();
+                // Emit user pool gauges
+                metrics::gauge!("trident_user_pools_total").set(current_pools as f64);
+                metrics::gauge!("trident_user_connections_total")
+                    .set(pool_manager_for_eviction.user_connection_count() as f64);
                 if evicted > 0 {
-                    tracing::info!(evicted, remaining = pool_manager_for_eviction.user_pool_count(), "evicted idle per-user pools");
+                    metrics::counter!("trident_user_pools_evicted_total").increment(evicted as u64);
+                    tracing::info!(evicted, remaining = current_pools, "evicted idle per-user pools");
                 }
             }
         });
@@ -726,11 +757,13 @@ async fn run(
     // subset of settings considered safe to change without a restart
     // (Router settings, analytics_patterns, default_consistency) -- see
     // `trident::reload` and DEPLOYMENT.md's hot-reload section.
+    let routing_config_snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(config.routing.clone())));
     let reload_target: Arc<dyn trident::reload::RoutingReloadTarget> = Arc::new(RouterReloadTarget {
         router: router.clone(),
         pattern_matcher,
         custom_rules: custom_rules.clone(),
         default_consistency: default_consistency.clone(),
+        admin_routing_config: Some(routing_config_snapshot.clone()),
     });
     tokio::spawn(trident::reload::watch_sighup(
         config_path.clone(),
@@ -760,7 +793,7 @@ async fn run(
         let config_path_for_admin = config_path.clone();
         let custom_rules_for_admin = custom_rules.clone();
         let client_stats_for_admin = client_stats.clone();
-        let routing_config_snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(config.routing.clone())));
+        let routing_config_for_admin = routing_config_snapshot.clone();
         let lsn_tracking_for_admin = config.lsn_tracking.clone();
         let max_pool_size_for_admin = config.pool.max_pool_size;
         let pool_mode_for_admin = config.pool.mode;
@@ -778,7 +811,7 @@ async fn run(
                 Some((config_path_for_admin, reload_target)),
                 Some(custom_rules_for_admin),
                 client_stats_for_admin,
-                routing_config_snapshot,
+                routing_config_for_admin,
                 lsn_tracking_for_admin,
                 max_pool_size_for_admin,
                 pool_mode_for_admin,

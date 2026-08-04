@@ -450,13 +450,18 @@ impl StartupHandler for ScramStartupHandler {
             ProtocolError::Malformed(format!("unknown user: {}", username))
         })?.clone();
 
-        // Parse or derive the SCRAM verifier
+        // Parse or derive the SCRAM verifier. When deriving from a plaintext
+        // password, PBKDF2 is CPU-intensive and must not block the Tokio
+        // worker thread. Use spawn_blocking to offload it.
         let verifier = if credential.starts_with("SCRAM-SHA-256$") {
             ScramVerifier::parse(&credential).ok_or_else(|| {
                 ProtocolError::Malformed("invalid SCRAM verifier format in auth_file".into())
             })?
         } else {
-            ScramVerifier::from_password(&credential)
+            let cred_clone = credential.clone();
+            tokio::task::spawn_blocking(move || ScramVerifier::from_password(&cred_clone))
+                .await
+                .map_err(|e| ProtocolError::Malformed(format!("SCRAM derivation failed: {}", e)))?
         };
 
         // Step 1: Send AuthenticationSASL (offer SCRAM-SHA-256)
@@ -484,13 +489,37 @@ impl StartupHandler for ScramStartupHandler {
         let mech_end = body.iter().position(|&b| b == 0).ok_or_else(|| {
             ProtocolError::Malformed("SASLInitialResponse missing mechanism terminator".into())
         })?;
+        // Validate the mechanism is SCRAM-SHA-256
+        let mechanism = std::str::from_utf8(&body[..mech_end]).map_err(|_| {
+            ProtocolError::Malformed("SASLInitialResponse mechanism is not UTF-8".into())
+        })?;
+        if mechanism != "SCRAM-SHA-256" {
+            return Err(ProtocolError::Malformed(format!(
+                "unsupported SASL mechanism '{}', only SCRAM-SHA-256 is supported",
+                mechanism
+            )));
+        }
         let rest = &body[mech_end + 1..];
         if rest.len() < 4 {
             return Err(ProtocolError::Malformed("SASLInitialResponse too short".into()));
         }
-        let data_len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        if rest.len() < 4 + data_len {
+        let data_len_i32 = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        if data_len_i32 < 0 {
+            return Err(ProtocolError::Malformed(
+                "SASLInitialResponse has negative data length".into(),
+            ));
+        }
+        let data_len = data_len_i32 as usize;
+        let total_len = 4usize.checked_add(data_len).ok_or_else(|| {
+            ProtocolError::Malformed("SASLInitialResponse data length overflow".into())
+        })?;
+        if rest.len() < total_len {
             return Err(ProtocolError::Malformed("SASLInitialResponse data truncated".into()));
+        }
+        if rest.len() != total_len {
+            return Err(ProtocolError::Malformed(
+                "SASLInitialResponse has trailing data after SASL payload".into(),
+            ));
         }
         let client_first = std::str::from_utf8(&rest[4..4 + data_len]).map_err(|_| {
             ProtocolError::Malformed("client-first-message is not UTF-8".into())
@@ -542,6 +571,34 @@ impl StartupHandler for ScramStartupHandler {
             ProtocolError::Malformed("client-final-message is not UTF-8".into())
         })?;
         let client_final = client_final.trim_end_matches('\0');
+
+        // Validate channel binding: must be "c=biws" (base64 of "n,,")
+        // for the no-channel-binding case (gs2-header = "n,,").
+        let channel_binding = client_final
+            .split(',')
+            .find_map(|part| part.strip_prefix("c="))
+            .ok_or_else(|| {
+                ProtocolError::Malformed("client-final-message missing channel binding 'c='".into())
+            })?;
+        if channel_binding != "biws" {
+            return Err(ProtocolError::Malformed(
+                "client-final-message channel binding must be 'biws' (no channel binding)".into(),
+            ));
+        }
+
+        // Validate nonce: client-final's "r=" must equal the combined_nonce
+        // we sent in server-first-message.
+        let final_nonce = client_final
+            .split(',')
+            .find_map(|part| part.strip_prefix("r="))
+            .ok_or_else(|| {
+                ProtocolError::Malformed("client-final-message missing nonce 'r='".into())
+            })?;
+        if final_nonce != combined_nonce {
+            return Err(ProtocolError::Malformed(
+                "client-final-message nonce does not match server combined nonce".into(),
+            ));
+        }
 
         // Extract proof
         let proof_b64 = client_final

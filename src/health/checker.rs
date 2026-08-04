@@ -67,6 +67,30 @@ impl HealthCheckResult {
     pub fn is_success(&self) -> bool {
         !self.timed_out && self.tcp_reachable && self.select_1_ok
     }
+
+    /// Role-aware success check. In addition to the basic connectivity
+    /// checks, verifies that the node's `pg_is_in_recovery()` status
+    /// matches its configured role:
+    /// - Writer: must NOT be in recovery (`is_in_recovery == false`)
+    /// - Reader: must be in recovery (`is_in_recovery == true`)
+    /// - Analytics: no additional role constraint
+    ///
+    /// If `is_in_recovery` could not be obtained (e.g. the query failed),
+    /// this falls back to the basic `is_success()` check — connectivity
+    /// success without role confirmation is still better than false negative.
+    pub fn is_success_for_role(&self, node_type: NodeType) -> bool {
+        if !self.is_success() {
+            return false;
+        }
+        match (node_type, self.is_in_recovery) {
+            // Writer must NOT be a standby
+            (NodeType::Writer, Some(true)) => false,
+            // Reader must be a standby
+            (NodeType::Reader, Some(false)) => false,
+            // Analytics, or is_in_recovery unknown: accept basic success
+            _ => true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -248,7 +272,7 @@ async fn upgrade_probe_stream(
 
     match target.ssl_mode {
         SslMode::Disable => Ok(MaybeTlsStream::Plain(tcp_stream)),
-        SslMode::Prefer | SslMode::Require => {
+        SslMode::Prefer | SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
             // Send SSLRequest (8 bytes: length=8, code=80877103)
             let msg: [u8; 8] = [
                 0x00, 0x00, 0x00, 0x08,
@@ -265,12 +289,41 @@ async fn upgrade_probe_stream(
                     use std::sync::Arc;
                     use tokio_rustls::TlsConnector;
 
-                    let config = rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(
-                            crate::pool::conn::NoVerifier,
-                        ))
-                        .with_no_client_auth();
+                    let config = match target.ssl_mode {
+                        SslMode::VerifyCa | SslMode::VerifyFull => {
+                            // Use system root certs for verification
+                            let mut root_store = rustls::RootCertStore::empty();
+                            let native_certs = rustls_native_certs::load_native_certs();
+                            for cert in native_certs.certs {
+                                let _ = root_store.add(cert);
+                            }
+                            if target.ssl_mode == SslMode::VerifyFull {
+                                rustls::ClientConfig::builder()
+                                    .with_root_certificates(root_store)
+                                    .with_no_client_auth()
+                            } else {
+                                // verify-ca: verify chain but not hostname
+                                let verifier = rustls::client::WebPkiServerVerifier::builder(
+                                    Arc::new(root_store),
+                                )
+                                .build()
+                                .map_err(|_| ())?;
+                                rustls::ClientConfig::builder()
+                                    .dangerous()
+                                    .with_custom_certificate_verifier(verifier)
+                                    .with_no_client_auth()
+                            }
+                        }
+                        _ => {
+                            // require/prefer: no verification
+                            rustls::ClientConfig::builder()
+                                .dangerous()
+                                .with_custom_certificate_verifier(Arc::new(
+                                    crate::pool::conn::NoVerifier,
+                                ))
+                                .with_no_client_auth()
+                        }
+                    };
                     let connector = TlsConnector::from(Arc::new(config));
 
                     let server_name =
@@ -284,7 +337,7 @@ async fn upgrade_probe_stream(
                     Ok(MaybeTlsStream::Tls(Box::new(tls_stream)))
                 }
                 b'N' => {
-                    if target.ssl_mode == SslMode::Require {
+                    if target.ssl_mode != SslMode::Prefer {
                         return Err(());
                     }
                     Ok(MaybeTlsStream::Plain(tcp_stream))
@@ -526,17 +579,28 @@ impl<P: HealthProbe> HealthChecker<P> {
     }
 
     fn apply_result(&self, node_id: &str, result: HealthCheckResult) {
+        let node_type = {
+            let nodes = self.nodes.lock().expect("nodes lock poisoned");
+            nodes.get(node_id).map(|n| n.node_type)
+        };
+
+        // Use role-aware success check when we know the node type
+        let success = match node_type {
+            Some(nt) => result.is_success_for_role(nt),
+            None => result.is_success(),
+        };
+
         metrics::counter!(
             "trident_health_checks_total",
             "node_id" => node_id.to_string(),
-            "result" => if result.is_success() { "success" } else { "failure" }
+            "result" => if success { "success" } else { "failure" }
         )
         .increment(1);
 
         let mut nodes = self.nodes.lock().expect("nodes lock poisoned");
         if let Some(node) = nodes.get_mut(node_id) {
             let was_healthy = node.state.healthy();
-            node.state.observe(result.is_success());
+            node.state.observe(success);
             let is_healthy_now = node.state.healthy();
             if was_healthy != is_healthy_now {
                 metrics::counter!(

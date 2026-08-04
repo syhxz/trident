@@ -32,6 +32,14 @@ pub enum SslMode {
     Prefer,
     /// SSL is mandatory; fail if the server declines.
     Require,
+    /// SSL is mandatory and the server's certificate must be signed by a
+    /// trusted CA (configured via `ssl_ca_cert`). Does NOT verify hostname.
+    #[serde(rename = "verify-ca")]
+    VerifyCa,
+    /// SSL is mandatory, the server's certificate must be signed by a
+    /// trusted CA, AND the certificate's CN/SAN must match the `host`.
+    #[serde(rename = "verify-full")]
+    VerifyFull,
 }
 
 /// Consistency level
@@ -276,6 +284,24 @@ pub struct PoolConfig {
     pub max_idle_time: String,
     pub connection_timeout: String,
     pub max_lifetime: String,
+    /// Maximum number of per-user pools across all nodes (passthrough mode).
+    /// Each unique (node, user, database, params) gets its own pool.
+    /// 0 = unlimited. Default: 1000.
+    #[serde(default = "default_max_user_pools")]
+    pub max_user_pools: usize,
+    /// Maximum total backend connections across ALL per-user pools.
+    /// Prevents unbounded FD/memory consumption from many distinct users.
+    /// 0 = unlimited. Default: 500.
+    #[serde(default = "default_max_user_connections")]
+    pub max_user_connections: u32,
+}
+
+fn default_max_user_pools() -> usize {
+    1000
+}
+
+fn default_max_user_connections() -> u32 {
+    500
 }
 
 /// Health check configuration
@@ -560,6 +586,46 @@ impl AppConfig {
             ));
         }
 
+        // Passthrough authentication sends real database passwords over the
+        // client connection. Without TLS, these are transmitted in cleartext.
+        // Warn loudly unless the proxy is listening on a local-only interface.
+        // This is a warning rather than a hard error because VPC/security-group
+        // protected environments may intentionally run without client TLS.
+        if self.proxy.client_auth == ClientAuthMode::Passthrough
+            && self.proxy.tls_cert.is_none()
+        {
+            let listen_host = self.proxy.listen_addr.rsplit_once(':')
+                .map(|(h, _)| h)
+                .unwrap_or(&self.proxy.listen_addr);
+            let is_local = matches!(
+                listen_host,
+                "127.0.0.1" | "::1" | "localhost"
+            );
+            if !is_local {
+                tracing::warn!(
+                    "client_auth 'passthrough' is configured WITHOUT client-facing TLS on a \
+                     non-loopback interface ({}). Database passwords will be transmitted in \
+                     cleartext between clients and the proxy. Consider enabling TLS \
+                     (proxy.tls_cert + proxy.tls_key) or restricting to a loopback address.",
+                    self.proxy.listen_addr,
+                );
+            }
+        }
+
+        // health.check_interval must not parse to zero; a zero interval
+        // creates a tight spin loop that saturates CPU and panics
+        // tokio::time::interval.
+        if self.health.check_interval == "0"
+            || self.health.check_interval == "0s"
+            || self.health.check_interval == "0ms"
+            || self.health.check_interval == "0m"
+            || self.health.check_interval == "0h"
+        {
+            return Err(ConfigError::Validation(
+                "health.check_interval must be greater than 0".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -686,6 +752,8 @@ mod tests {
                 max_idle_time: "5m".to_string(),
                 connection_timeout: "5s".to_string(),
                 max_lifetime: "30m".to_string(),
+                max_user_pools: 1000,
+                max_user_connections: 500,
             },
             health: HealthConfig {
                 check_interval: "3s".to_string(),
@@ -874,6 +942,9 @@ mod tests {
                 let is_invalid_pool_size_err =
                     matches!(result, Err(ConfigError::InvalidPoolSize { .. }));
                 prop_assert!(is_invalid_pool_size_err);
+            } else if max == 0 {
+                // max_pool_size == 0 is separately rejected
+                prop_assert!(result.is_err());
             } else {
                 prop_assert!(result.is_ok());
             }
