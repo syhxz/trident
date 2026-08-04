@@ -678,7 +678,7 @@ impl StartupHandler for ScramStartupHandler {
 /// does NOT verify the password locally — the real authentication happens
 /// when the proxy opens a backend connection using the client's credentials.
 ///
-/// This enables the PolarDB-style credential passthrough model where each
+/// This enables the credential passthrough model where each
 /// client retains its database-level identity, RBAC, and audit trail.
 ///
 /// The handler sends an AuthenticationCleartextPassword challenge to the

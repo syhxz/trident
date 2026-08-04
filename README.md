@@ -14,7 +14,7 @@ A high-performance PostgreSQL read/write splitting proxy with connection pooling
 - **Hot Reload** — Update routing rules via SIGHUP or HTTP without restart
 - **Observability** — Prometheus metrics, admin HTTP API, slow query log, client statistics, embedded web console
 - **Protocol Support** — Simple Query and Extended Query (Parse/Bind/Execute) protocols, COPY, Cleartext/MD5/SCRAM-SHA-256 auth
-- **Credential Passthrough** — PolarDB-style authentication where clients use their own database credentials; per-user connection pools preserve RBAC and audit identity
+- **Credential Passthrough** — Transparent authentication where clients use their own database credentials; per-user connection pools preserve RBAC and audit identity
 
 ## Client Authentication Modes
 
@@ -29,7 +29,7 @@ Trident supports four client-facing authentication modes via `proxy.client_auth`
 
 ### Passthrough Mode
 
-In passthrough mode, Trident acts as a transparent credential proxy — similar to PolarDB Proxy:
+In passthrough mode, Trident acts as a transparent credential proxy:
 
 ```yaml
 proxy:

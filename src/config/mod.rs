@@ -146,7 +146,7 @@ pub enum PoolMode {
 /// - `Passthrough`: proxy captures the client's username and password from
 ///   the startup handshake and uses them to authenticate against the
 ///   backend PostgreSQL nodes. Each unique username gets its own connection
-///   pool. This is the PolarDB proxy model — full credential passthrough
+///   pool. Full credential passthrough
 ///   preserving database-level RBAC and audit identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
