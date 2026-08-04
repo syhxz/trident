@@ -68,6 +68,18 @@ pub trait ConnCleaner: Send + Sync {
         conn: &PooledConnection,
     ) -> impl std::future::Future<Output = Result<(), PoolError>> + Send;
 
+    /// Validates that an idle connection is still usable by executing a
+    /// lightweight query (configured via `pool.check_query`). Called
+    /// periodically by the background idle-connection probe task.
+    /// Returns Ok(()) if the connection is alive; Err if it should be
+    /// discarded. The default always returns Ok (no validation).
+    fn validate(
+        &self,
+        _conn: &PooledConnection,
+    ) -> impl std::future::Future<Output = Result<(), PoolError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Permanently drops any external resource associated with a pooled
     /// connection (notably its socket in `ConnectionRegistry`). The
     /// default is suitable for metadata-only test pools.
@@ -153,6 +165,12 @@ pub trait ConnectionPool: Send + Sync {
     /// corresponding sockets in the ConnectionRegistry.
     fn known_pids(&self) -> Vec<i32> {
         Vec::new()
+    }
+
+    /// Validates all idle connections and discards dead ones. Returns
+    /// the number discarded. Called periodically by a background task.
+    async fn validate_idle(&self) -> usize {
+        0
     }
 }
 
@@ -355,6 +373,61 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             conn.idle_since = None;
             return Some(conn);
         }
+    }
+
+    /// Validates all idle connections by executing the check query against
+    /// each. Connections that fail validation are discarded and their
+    /// slots freed. Returns the number of connections discarded.
+    ///
+    /// Called periodically by a background task (e.g. every 30s). This
+    /// ensures stale connections (silently closed by the backend, killed
+    /// by a firewall, or broken by a network blip) are detected and
+    /// removed *before* a client query hits them.
+    pub async fn validate_idle_connections(&self) -> usize {
+        // Determine how many idle connections to validate this round.
+        // Take them one at a time to minimize the window where the idle
+        // queue appears empty to concurrent acquires.
+        let count = self.idle.lock().len();
+        let mut discarded = 0;
+
+        for _ in 0..count {
+            let conn = { self.idle.lock().pop_front() };
+            let mut conn = match conn {
+                Some(c) => c,
+                None => break, // queue drained by concurrent acquires
+            };
+
+            if self.is_expired(&conn, Instant::now()) {
+                self.cleaner.discard(&conn);
+                self.release_known_slot(&conn);
+                discarded += 1;
+                continue;
+            }
+
+            match self.cleaner.validate(&conn).await {
+                Ok(()) => {
+                    // Connection is alive — put it back at the end
+                    conn.idle_since = Some(Instant::now());
+                    self.idle.lock().push_back(conn);
+                }
+                Err(_) => {
+                    // Connection is dead — discard it
+                    self.cleaner.discard(&conn);
+                    self.release_known_slot(&conn);
+                    discarded += 1;
+                }
+            }
+        }
+
+        if discarded > 0 {
+            // Notify waiters that slots freed up
+            self.release_notify.notify_waiters();
+            metrics::counter!(
+                "trident_pool_idle_validation_discarded_total",
+                "node_id" => self.node_id.clone()
+            ).increment(discarded as u64);
+        }
+        discarded
     }
 
     /// Establishes reusable idle connections up to `min_pool_size`.
@@ -701,6 +774,10 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
 
     fn known_pids(&self) -> Vec<i32> {
         self.known_connections.lock().iter().copied().collect()
+    }
+
+    async fn validate_idle(&self) -> usize {
+        self.validate_idle_connections().await
     }
 }
 

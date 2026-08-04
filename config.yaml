@@ -145,18 +145,37 @@ pool:
   # Maximum time allowed to create and authenticate a backend connection.
   connection_timeout: 5s
   max_lifetime: 30m
+  # --- Connection validation ---
+  # Query used to periodically validate idle connections. Dead connections
+  # (backend restarted, firewall killed, network blip) are detected and
+  # discarded before a client query hits them. Default: "SELECT 1".
+  # Set to empty string to disable.
+  # check_query: "SELECT 1"
+  #
+  # Interval between idle connection validation rounds. Default: "30s".
+  # Set to "0s" to disable periodic validation entirely.
+  # idle_check_interval: 30s
+  #
+  # --- Wait queue ---
+  # When the pool is full, clients wait up to this duration for a
+  # connection to be released, instead of immediate rejection.
+  # Default: 0 (disabled — immediate PoolError::Exhausted).
+  # acquire_timeout: 5s
+  #
+  # --- Connection leak detection ---
+  # If a connection is checked out longer than this threshold, a WARN log
+  # and trident_pool_leak_detections_total metric are emitted.
+  # Default: 0 (disabled).
+  # leak_detection_threshold: 60s
+  #
   # --- Passthrough mode per-user pool limits ---
   # These apply only when client_auth is "passthrough". Each unique
   # (node, user, database, session-params) combination creates a separate
   # pool. These global caps prevent resource exhaustion from many users.
   #
   # Maximum distinct per-user pools. Default: 1000. 0 = unlimited.
+  # Total backend connection cap = max_user_pools × max_pool_size.
   # max_user_pools: 1000
-  #
-  # Maximum total backend connections across all per-user pools.
-  # Default: 500. 0 = unlimited. Should not exceed the backend
-  # PostgreSQL's max_connections minus headroom for admin/health probes.
-  # max_user_connections: 500
 
 health:
   check_interval: 3s

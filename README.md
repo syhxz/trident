@@ -6,7 +6,7 @@ A high-performance PostgreSQL read/write splitting proxy with connection pooling
 
 - **Read/Write Splitting** — Routes writes to Writer, reads to Reader(s), and analytics queries to dedicated Analytics nodes
 - **Transaction Splitting** — Starts read-first transactions on Reader; automatically upgrades to Writer upon encountering a write statement
-- **Connection Pooling** — Transaction-level and session-level multiplexing with pre-warmed connections
+- **Connection Pooling** — Transaction-level and session-level multiplexing with pre-warmed connections, wait queue, idle connection validation, leak detection, and graceful drain
 - **Multi-level Consistency** — Eventual, Session (LSN-based), and Global consistency modes
 - **Intelligent Routing** — Hint-based, cost-based, regex pattern matching, and custom per-table/function rules
 - **Load Balancing** — Weighted round-robin / least-connections across read replicas
@@ -66,7 +66,7 @@ proxy:
 - Credentials are verified against the backend Writer **before** telling the client authentication succeeded
 - Pool credential fingerprints use HMAC-SHA-256 with constant-time comparison (no timing side-channel)
 - Concurrent pool creation race conditions are handled safely (no auth bypass)
-- Per-user pool limits prevent resource exhaustion (`pool.max_user_pools`, `pool.max_user_connections`)
+- Per-user pool limits prevent resource exhaustion (`pool.max_user_pools`; total connection cap = max_user_pools × max_pool_size)
 - Client IP is injected into `application_name` for backend audit visibility (format: `trident:<client_ip>:<app_name>`)
 
 **Backend SSL modes:** Connections from Trident to PostgreSQL support:
@@ -234,6 +234,50 @@ Three deployment options are provided:
 | Kubernetes | Production clusters | `deploy/k8s/` |
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed instructions.
+
+## Connection Pool
+
+Trident's pool supports both Transaction mode (connections shared across clients between transactions) and Session mode (one connection per client session).
+
+### Key Configuration
+
+```yaml
+pool:
+  mode: transaction          # transaction | session
+  max_pool_size: 50          # per node, per Trident instance
+  min_pool_size: 5           # pre-warmed at startup
+  connection_timeout: 5s     # backend connect timeout
+  max_idle_time: 5m          # idle connection expiry
+  max_lifetime: 30m          # absolute connection lifetime
+  acquire_timeout: 5s        # wait queue timeout (0 = disabled)
+  check_query: "SELECT 1"   # idle validation query (empty = disabled)
+  idle_check_interval: 30s   # validation probe frequency (0 = disabled)
+  leak_detection_threshold: 60s  # checkout duration warning (0 = disabled)
+  max_user_pools: 1000       # passthrough mode: max distinct user pools
+```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Wait queue** | When pool is full, clients wait up to `acquire_timeout` instead of immediate rejection |
+| **Idle validation** | Background task periodically runs `check_query` against idle connections; dead ones are discarded |
+| **Leak detection** | Warns when a connection is held longer than `leak_detection_threshold` |
+| **Online resize** | `max_pool_size` can be changed at runtime via admin API |
+| **Graceful drain** | Pool can reject new acquires while letting active connections finish |
+| **Connection cleanup** | `DISCARD ALL` on return to reset session state |
+
+### Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `trident_pool_active_connections{node_id}` | gauge | Connections currently owned by the pool |
+| `trident_pool_idle_validation_discarded_total{node_id}` | counter | Stale connections found during validation |
+| `trident_pool_leak_detections_total{node_id}` | counter | Connections held beyond leak threshold |
+| `trident_user_pools_total` | gauge | Per-user pools (passthrough mode) |
+| `trident_user_pools_max` | gauge | Configured max_user_pools |
+| `trident_user_pool_rejected_total{reason}` | counter | Pool creation rejections |
+| `trident_passthrough_auth_failures_total` | counter | Backend credential verification failures |
 
 ## Hint Routing
 

@@ -293,24 +293,32 @@ pub struct PoolConfig {
     /// are emitted. 0 or omitted = disabled. Default: disabled.
     #[serde(default)]
     pub leak_detection_threshold: Option<String>,
+    /// Query used to validate idle connections periodically. Set to empty
+    /// string to disable idle validation. Default: "SELECT 1".
+    #[serde(default = "default_check_query")]
+    pub check_query: String,
+    /// Interval between idle connection validation rounds. Default: "30s".
+    /// Set to "0s" to disable periodic validation entirely.
+    #[serde(default = "default_check_interval")]
+    pub idle_check_interval: String,
     /// Maximum number of per-user pools across all nodes (passthrough mode).
     /// Each unique (node, user, database, params) gets its own pool.
+    /// Total backend connection cap = max_user_pools × max_pool_size.
     /// 0 = unlimited. Default: 1000.
     #[serde(default = "default_max_user_pools")]
     pub max_user_pools: usize,
-    /// Maximum total backend connections across ALL per-user pools.
-    /// Prevents unbounded FD/memory consumption from many distinct users.
-    /// 0 = unlimited. Default: 500.
-    #[serde(default = "default_max_user_connections")]
-    pub max_user_connections: u32,
 }
 
 fn default_max_user_pools() -> usize {
     1000
 }
 
-fn default_max_user_connections() -> u32 {
-    500
+fn default_check_query() -> String {
+    "SELECT 1".to_string()
+}
+
+fn default_check_interval() -> String {
+    "30s".to_string()
 }
 
 /// Health check configuration
@@ -763,8 +771,9 @@ mod tests {
                 max_lifetime: "30m".to_string(),
                 acquire_timeout: None,
                 leak_detection_threshold: None,
+                check_query: "SELECT 1".to_string(),
+                idle_check_interval: "30s".to_string(),
                 max_user_pools: 1000,
-                max_user_connections: 500,
             },
             health: HealthConfig {
                 check_interval: "3s".to_string(),

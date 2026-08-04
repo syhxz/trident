@@ -140,9 +140,7 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         target: connect_target,
         registry: registry.clone(),
     };
-    let cleaner = DiscardAllCleaner {
-        registry: registry.clone(),
-    };
+    let cleaner = DiscardAllCleaner::new(registry.clone());
     let mut pools: std::collections::HashMap<String, Box<dyn ConnectionPool>> = std::collections::HashMap::new();
     pools.insert(
         "primary".to_string(),

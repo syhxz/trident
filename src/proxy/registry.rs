@@ -147,9 +147,27 @@ fn conn_error_to_pool_error(e: ConnError) -> PoolError {
 }
 
 /// `ConnCleaner` that runs `DISCARD ALL` against the connection's registered
-/// socket before it is returned to the pool's idle queue.
+/// socket before it is returned to the pool's idle queue. Also supports
+/// periodic validation of idle connections via a configurable check query.
 pub struct DiscardAllCleaner {
     pub registry: Arc<ConnectionRegistry>,
+    /// Query used to validate idle connections. Default: "SELECT 1".
+    /// Set to empty string to disable validation.
+    pub check_query: String,
+}
+
+impl DiscardAllCleaner {
+    pub fn new(registry: Arc<ConnectionRegistry>) -> Self {
+        DiscardAllCleaner {
+            registry,
+            check_query: "SELECT 1".to_string(),
+        }
+    }
+
+    pub fn with_check_query(mut self, query: String) -> Self {
+        self.check_query = query;
+        self
+    }
 }
 
 impl ConnCleaner for DiscardAllCleaner {
@@ -177,6 +195,48 @@ impl ConnCleaner for DiscardAllCleaner {
             }
         }
 
+        self.registry.insert(&conn.node_id, conn.backend_pid, stream);
+        Ok(())
+    }
+
+    async fn validate(&self, conn: &PooledConnection) -> Result<(), PoolError> {
+        if self.check_query.is_empty() {
+            return Ok(());
+        }
+
+        let mut stream = self
+            .registry
+            .take(&conn.node_id, conn.backend_pid)
+            .ok_or_else(|| {
+                PoolError::CleanupFailed("connection socket missing from registry for validation".into())
+            })?;
+
+        let bytes = encode_query(&self.check_query);
+        if let Err(e) = stream.write_all(&bytes).await {
+            // Socket is broken — don't put it back
+            return Err(PoolError::CleanupFailed(e.to_string()));
+        }
+        if let Err(e) = stream.flush().await {
+            return Err(PoolError::CleanupFailed(e.to_string()));
+        }
+
+        loop {
+            match read_backend_message(&mut stream).await {
+                Ok(BackendMessage::ReadyForQuery(_)) => break,
+                Ok(BackendMessage::ErrorResponse(_)) => {
+                    // Query failed but connection might still be usable;
+                    // wait for ReadyForQuery before deciding.
+                    continue;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    // Connection is dead
+                    return Err(PoolError::CleanupFailed(e.to_string()));
+                }
+            }
+        }
+
+        // Connection alive — put it back
         self.registry.insert(&conn.node_id, conn.backend_pid, stream);
         Ok(())
     }
@@ -495,9 +555,7 @@ mod tests {
         let registry = Arc::new(ConnectionRegistry::new());
         registry.insert_raw("writer", 42, MaybeTlsStream::Plain(client_side));
 
-        let cleaner = DiscardAllCleaner {
-            registry: registry.clone(),
-        };
+        let cleaner = DiscardAllCleaner::new(registry.clone());
         let conn = PooledConnection::new("writer", 42, 999);
 
         let backend_task = tokio::spawn(async move {

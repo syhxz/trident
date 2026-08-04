@@ -113,10 +113,6 @@ pub struct InMemoryPoolManager {
     /// reached, new pool creation is refused (returns None from pool_for_user).
     /// 0 = unlimited.
     max_user_pools: usize,
-    /// Maximum total backend connections across ALL per-user pools. Prevents
-    /// unbounded FD/memory consumption even when individual pool sizes are small.
-    /// 0 = unlimited.
-    max_user_connections: u32,
     /// Optional reference to the connection registry, used to close sockets
     /// when pools are evicted or removed. Without this, eviction only drops
     /// pool metadata while sockets linger in the registry.
@@ -232,29 +228,21 @@ impl InMemoryPoolManager {
             user_pools: parking_lot::Mutex::new(HashMap::new()),
             node_config_updater: None,
             max_user_pools: 0,
-            max_user_connections: 0,
             connection_registry: None,
         }
     }
 
-    /// Sets the global limits for per-user pools. `max_pools` limits the
-    /// number of distinct (node, user, database) pools; `max_connections`
-    /// limits the total backend connections across all user pools.
-    /// Either value of 0 means unlimited.
-    pub fn set_user_pool_limits(&mut self, max_pools: usize, max_connections: u32) {
+    /// Sets the global limit for per-user pools. `max_pools` limits the
+    /// number of distinct (node, user, database) pools.
+    /// Value of 0 means unlimited.
+    pub fn set_user_pool_limits(&mut self, max_pools: usize) {
         self.max_user_pools = max_pools;
-        self.max_user_connections = max_connections;
     }
 
     /// Sets the connection registry reference so eviction can close
     /// the physical sockets associated with removed pools.
     pub fn set_connection_registry(&mut self, registry: Arc<crate::proxy::registry::ConnectionRegistry>) {
         self.connection_registry = Some(registry);
-    }
-
-    /// Returns the total number of backend connections across all per-user pools.
-    fn total_user_connections(&self, pools: &HashMap<String, UserPoolEntry>) -> i64 {
-        pools.values().map(|e| e.pool.active_connections()).sum()
     }
 
     /// Installs a `UserPoolFactory` to enable per-user pool creation
@@ -321,12 +309,6 @@ impl InMemoryPoolManager {
     /// Returns the current number of per-user pools (for metrics/admin).
     pub fn user_pool_count(&self) -> usize {
         self.user_pools.lock().len()
-    }
-
-    /// Returns the total backend connections across all per-user pools.
-    pub fn user_connection_count(&self) -> i64 {
-        let pools = self.user_pools.lock();
-        self.total_user_connections(&pools)
     }
 
     /// Dynamically adds a new pool for a node. Returns `false` if the
@@ -478,20 +460,6 @@ impl PoolManager for InMemoryPoolManager {
                 );
                 metrics::counter!("trident_user_pool_rejected_total", "reason" => "max_pools").increment(1);
                 return None;
-            }
-            if self.max_user_connections > 0 {
-                let total_conns = self.total_user_connections(&pools);
-                if total_conns >= self.max_user_connections as i64 {
-                    tracing::warn!(
-                        node_id,
-                        username,
-                        max_user_connections = self.max_user_connections,
-                        current = total_conns,
-                        "global user connection limit reached, rejecting new pool creation"
-                    );
-                    metrics::counter!("trident_user_pool_rejected_total", "reason" => "max_connections").increment(1);
-                    return None;
-                }
             }
         }
 

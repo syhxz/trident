@@ -153,9 +153,7 @@ impl admin::NodeManager for LiveNodeManager {
             target,
             registry: self.connection_registry.clone(),
         };
-        let cleaner = DiscardAllCleaner {
-            registry: self.connection_registry.clone(),
-        };
+        let cleaner = DiscardAllCleaner::new(self.connection_registry.clone());
         let pool = NodePool::with_settings(
             config.name.clone(),
             self.pool_mode,
@@ -417,9 +415,7 @@ async fn run(
             target,
             registry: registry.clone(),
         };
-        let cleaner = DiscardAllCleaner {
-            registry: registry.clone(),
-        };
+        let cleaner = DiscardAllCleaner::new(registry.clone());
         let pool = NodePool::with_settings(
             node.name.clone(),
             config.pool.mode,
@@ -508,9 +504,7 @@ async fn run(
                     target,
                     registry: self.registry.clone(),
                 };
-                let cleaner = DiscardAllCleaner {
-                    registry: self.registry.clone(),
-                };
+                let cleaner = DiscardAllCleaner::new(self.registry.clone());
                 // Per-user pools use min_pool_size=0 (no prewarming since
                 // we cannot predict which users will connect) and a smaller
                 // max_pool_size to prevent total connection explosion.
@@ -585,7 +579,7 @@ async fn run(
     }
 
     pool_manager.set_connection_registry(registry.clone());
-    pool_manager.set_user_pool_limits(config.pool.max_user_pools, config.pool.max_user_connections);
+    pool_manager.set_user_pool_limits(config.pool.max_user_pools);
     let pool_manager = Arc::new(pool_manager);
 
     // --- Router ---
@@ -739,26 +733,52 @@ async fn run(
         let pool_manager_for_eviction = pool_manager.clone();
         let eviction_max_idle = parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(300));
         let max_user_pools_cfg = config.pool.max_user_pools;
-        let max_user_conns_cfg = config.pool.max_user_connections;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            // Emit static config limits once at startup
+            // Emit static config limit once at startup
             metrics::gauge!("trident_user_pools_max").set(max_user_pools_cfg as f64);
-            metrics::gauge!("trident_user_connections_max").set(max_user_conns_cfg as f64);
             loop {
                 ticker.tick().await;
                 let evicted = pool_manager_for_eviction.evict_idle_user_pools(eviction_max_idle);
                 let current_pools = pool_manager_for_eviction.user_pool_count();
-                // Emit user pool gauges
                 metrics::gauge!("trident_user_pools_total").set(current_pools as f64);
-                metrics::gauge!("trident_user_connections_total")
-                    .set(pool_manager_for_eviction.user_connection_count() as f64);
                 if evicted > 0 {
                     metrics::counter!("trident_user_pools_evicted_total").increment(evicted as u64);
                     tracing::info!(evicted, remaining = current_pools, "evicted idle per-user pools");
                 }
             }
         });
+    }
+
+    // --- Idle connection validation task ---
+    // Periodically validates idle connections in each node pool by executing
+    // the configured check_query. Dead connections are discarded so clients
+    // never hit a stale socket.
+    {
+        let idle_check_interval = parse_duration_or(&config.pool.idle_check_interval, Duration::from_secs(30));
+        if !idle_check_interval.is_zero() {
+            let pool_manager_for_validation = pool_manager.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(idle_check_interval);
+                ticker.tick().await; // skip the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    let snapshot = pool_manager_for_validation.snapshot();
+                    for node in &snapshot {
+                        if let Some(pool) = pool_manager_for_validation.pool_for(&node.node_id) {
+                            let discarded = pool.validate_idle().await;
+                            if discarded > 0 {
+                                tracing::debug!(
+                                    node_id = %node.node_id,
+                                    discarded,
+                                    "idle connection validation discarded stale connections"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // --- Hot reload: SIGHUP re-reads the config file and applies the
