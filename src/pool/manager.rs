@@ -21,23 +21,120 @@ pub trait PoolManager: Send + Sync {
     /// the node does not exist.
     fn pool_for(&self, node_id: &str) -> Option<Arc<dyn ConnectionPool>>;
 
+    /// Looks up (or lazily creates) a connection pool for a specific
+    /// (node, user) pair. Used in passthrough authentication mode where
+    /// each database user gets its own pool of backend connections
+    /// authenticated with their credentials.
+    ///
+    /// Default: delegates to `pool_for` (service-account mode ignores the
+    /// user identity and shares one pool per node across all clients).
+    fn pool_for_user(
+        &self,
+        node_id: &str,
+        _username: &str,
+        _password: &str,
+        _database: Option<&str>,
+        _extra_params: &HashMap<String, String>,
+    ) -> Option<Arc<dyn ConnectionPool>> {
+        self.pool_for(node_id)
+    }
+
     /// Aggregates the `BackendNodeSnapshot` for every node (including the
     /// health state, replay LSN, and replication lag produced by the
     /// Health module, plus the `active_connections` maintained by this
     /// manager), for use by the Router/Balancer.
     fn snapshot(&self) -> Vec<BackendNodeSnapshot>;
+
+    /// Looks up an existing per-user pool without creating one. Returns
+    /// `None` if no pool exists for this (node, user, database) triple.
+    /// Used during session cleanup to avoid creating pools needlessly.
+    fn pool_for_user_existing(
+        &self,
+        node_id: &str,
+        _username: &str,
+        _database: Option<&str>,
+    ) -> Option<Arc<dyn ConnectionPool>> {
+        self.pool_for(node_id)
+    }
+}
+
+/// Factory trait for creating per-user connection pools. Implemented by
+/// the application layer (main.rs) which has access to the node addresses,
+/// registry, SSL config, and pool settings needed to construct a real pool.
+pub trait UserPoolFactory: Send + Sync {
+    /// Creates a new `ConnectionPool` for the given (node, user, password, database).
+    /// `extra_params` are additional startup parameters from the client
+    /// (e.g. `application_name`, `options`) to forward to the backend.
+    /// Called lazily the first time a user connects through a node.
+    fn create_pool(
+        &self,
+        node_id: &str,
+        username: &str,
+        password: &str,
+        database: Option<&str>,
+        extra_params: &HashMap<String, String>,
+    ) -> Option<Box<dyn ConnectionPool>>;
 }
 
 /// Default `PoolManager` implementation based on an in-memory `HashMap`.
 ///
 /// Stores each node's pool as an `Arc<dyn ConnectionPool>`, allowing
 /// dynamic addition/removal of nodes at runtime via atomic swap.
+///
+/// When a `UserPoolFactory` is installed (via `set_user_pool_factory`),
+/// `pool_for_user` creates per-user pools on demand for credential
+/// passthrough mode. Without a factory, `pool_for_user` delegates to
+/// `pool_for` (service-account mode).
 pub struct InMemoryPoolManager {
     pools: ArcSwap<HashMap<String, Arc<dyn ConnectionPool>>>,
     /// The data source providing the latest health-check snapshot
     /// (excluding `active_connections`); typically a closure wrapping
     /// `health::HealthChecker::snapshot`.
     health_snapshots: Box<dyn Fn() -> Vec<BackendNodeSnapshot> + Send + Sync>,
+    /// Optional factory for per-user pools (passthrough mode).
+    user_pool_factory: Option<Box<dyn UserPoolFactory + Send + Sync>>,
+    /// Per-user pools: key = "node_id\0username\0database", value = (pool, last_access_time).
+    user_pools: parking_lot::Mutex<HashMap<String, UserPoolEntry>>,
+    /// Callback to notify the factory when a node is added/removed,
+    /// so it can update its internal node address map.
+    node_config_updater: Option<Arc<dyn NodeConfigUpdater + Send + Sync>>,
+}
+
+/// Allows the pool manager to notify the UserPoolFactory of node changes.
+pub trait NodeConfigUpdater: Send + Sync {
+    fn add_node(&self, node_id: &str, host: &str, port: u16, database: &str, ssl_mode: crate::config::SslMode);
+    fn remove_node(&self, node_id: &str);
+}
+
+/// Entry in the per-user pool map, tracking last access for idle eviction.
+struct UserPoolEntry {
+    pool: Arc<dyn ConnectionPool>,
+    last_access: std::time::Instant,
+    /// Hash of the password used to create this pool. If a new request
+    /// arrives with a different password (user changed their credentials),
+    /// the old pool is replaced — but only if the cooldown period has
+    /// passed (to prevent DoS via rapid password-mismatch requests).
+    password_hash: u64,
+    /// Earliest time at which this pool may be replaced due to a password
+    /// change. Prevents an attacker from repeatedly destroying a pool with
+    /// wrong passwords. Reset after each successful replacement.
+    replace_cooldown_until: std::time::Instant,
+}
+
+/// Minimum interval between pool replacements due to password changes.
+/// Within this window, mismatched passwords are silently ignored (the
+/// existing pool is returned). This prevents a DoS attack where an
+/// attacker sends wrong passwords to force pool destruction.
+const POOL_REPLACE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Computes a fast, non-cryptographic hash of the password for change
+/// detection. This is NOT used for security — only to detect "is this
+/// the same password that created the pool?".
+fn hash_password(password: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    password.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl InMemoryPoolManager {
@@ -52,7 +149,54 @@ impl InMemoryPoolManager {
         InMemoryPoolManager {
             pools: ArcSwap::new(Arc::new(arc_pools)),
             health_snapshots: Box::new(health_snapshots),
+            user_pool_factory: None,
+            user_pools: parking_lot::Mutex::new(HashMap::new()),
+            node_config_updater: None,
         }
+    }
+
+    /// Installs a `UserPoolFactory` to enable per-user pool creation
+    /// (passthrough credential mode). Once set, `pool_for_user` will
+    /// lazily create pools for each unique (node, user) pair.
+    pub fn set_user_pool_factory(
+        &mut self,
+        factory: Box<dyn UserPoolFactory + Send + Sync>,
+    ) {
+        self.user_pool_factory = Some(factory);
+    }
+
+    /// Installs a `NodeConfigUpdater` that gets called when nodes are
+    /// dynamically added/removed, so the UserPoolFactory can update its
+    /// internal node address map.
+    pub fn set_node_config_updater(
+        &mut self,
+        updater: Arc<dyn NodeConfigUpdater + Send + Sync>,
+    ) {
+        self.node_config_updater = Some(updater);
+    }
+
+    /// Evicts per-user pools that have not been accessed for longer than
+    /// `max_idle`. Only pools with zero active connections are evicted —
+    /// a pool still servicing checked-out connections is never removed,
+    /// even if its last access timestamp is stale.
+    ///
+    /// Returns the number of pools evicted. Intended to be called
+    /// periodically from a background task (e.g. once per minute).
+    pub fn evict_idle_user_pools(&self, max_idle: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        let mut pools = self.user_pools.lock();
+        let before = pools.len();
+        pools.retain(|_key, entry| {
+            let idle = now.duration_since(entry.last_access);
+            // Keep if: recently accessed OR still has active connections
+            idle < max_idle || entry.pool.active_connections() > 0
+        });
+        before - pools.len()
+    }
+
+    /// Returns the current number of per-user pools (for metrics/admin).
+    pub fn user_pool_count(&self) -> usize {
+        self.user_pools.lock().len()
     }
 
     /// Dynamically adds a new pool for a node. Returns `false` if the
@@ -74,6 +218,21 @@ impl InMemoryPoolManager {
         added
     }
 
+    /// Notifies the node config updater (if any) that a node was added.
+    /// Call this after `add_pool` with the node's connection info.
+    pub fn notify_node_added(
+        &self,
+        node_id: &str,
+        host: &str,
+        port: u16,
+        database: &str,
+        ssl_mode: crate::config::SslMode,
+    ) {
+        if let Some(updater) = &self.node_config_updater {
+            updater.add_node(node_id, host, port, database, ssl_mode);
+        }
+    }
+
     /// Dynamically removes a node's pool. Returns `false` if the node
     /// does not exist. The pool (and its connections) remain alive until
     /// all existing Arc references are dropped.
@@ -90,6 +249,16 @@ impl InMemoryPoolManager {
                 Arc::new(new_pools)
             }
         });
+        // Also remove any per-user pools for this node
+        if removed {
+            let prefix = format!("{}\0", node_id);
+            let mut user_pools = self.user_pools.lock();
+            user_pools.retain(|k, _| !k.starts_with(&prefix));
+            // Notify factory so it won't try to create pools for this node
+            if let Some(updater) = &self.node_config_updater {
+                updater.remove_node(node_id);
+            }
+        }
         removed
     }
 }
@@ -100,13 +269,120 @@ impl PoolManager for InMemoryPoolManager {
         pools.get(node_id).cloned()
     }
 
+    fn pool_for_user(
+        &self,
+        node_id: &str,
+        username: &str,
+        password: &str,
+        database: Option<&str>,
+        extra_params: &HashMap<String, String>,
+    ) -> Option<Arc<dyn ConnectionPool>> {
+        let factory = match &self.user_pool_factory {
+            Some(f) => f,
+            None => return self.pool_for(node_id),
+        };
+
+        // Check that the node exists (either in the base pools or known to
+        // the factory). This prevents phantom pool creation for dynamically
+        // removed nodes.
+        if self.pools.load().get(node_id).is_none() {
+            return None;
+        }
+
+        // Key includes database so the same user connecting to different
+        // databases gets separate pools (each pool's connections target one
+        // specific database).
+        let db = database.unwrap_or("");
+        let key = format!("{}\0{}\0{}", node_id, username, db);
+        let now = std::time::Instant::now();
+        let pw_hash = hash_password(password);
+
+        // Fast path: pool already exists
+        {
+            let mut pools = self.user_pools.lock();
+            if let Some(entry) = pools.get_mut(&key) {
+                if entry.password_hash == pw_hash {
+                    // Same password — reuse pool
+                    entry.last_access = now;
+                    return Some(Arc::clone(&entry.pool));
+                }
+                // Password mismatch detected. Only replace the pool if the
+                // cooldown period has passed. This prevents a DoS where an
+                // attacker sends wrong passwords to repeatedly destroy pools.
+                if now < entry.replace_cooldown_until {
+                    // Within cooldown — do NOT return the pool to a client
+                    // with the wrong password. They'll get a pool-exhausted
+                    // error, which is safer than giving them access to
+                    // authenticated connections. The pool stays intact for
+                    // clients with the correct password.
+                    tracing::warn!(
+                        node_id,
+                        username,
+                        "password mismatch within cooldown, rejecting"
+                    );
+                    return None;
+                }
+                // Cooldown expired — allow replacement
+                tracing::info!(
+                    node_id,
+                    username,
+                    "password change detected, replacing per-user pool"
+                );
+                pools.remove(&key);
+            }
+        }
+
+        // Slow path: create a new pool for this (node, user) pair
+        let new_pool = factory.create_pool(node_id, username, password, database, extra_params)?;
+        let pool_arc: Arc<dyn ConnectionPool> = Arc::from(new_pool);
+
+        let mut pools = self.user_pools.lock();
+        // Double-check: another task may have created it concurrently
+        let entry = pools.entry(key).or_insert_with(|| UserPoolEntry {
+            pool: Arc::clone(&pool_arc),
+            last_access: now,
+            password_hash: pw_hash,
+            replace_cooldown_until: now + POOL_REPLACE_COOLDOWN,
+        });
+        entry.last_access = now;
+        Some(Arc::clone(&entry.pool))
+    }
+
+    fn pool_for_user_existing(
+        &self,
+        node_id: &str,
+        username: &str,
+        database: Option<&str>,
+    ) -> Option<Arc<dyn ConnectionPool>> {
+        if self.user_pool_factory.is_none() {
+            return self.pool_for(node_id);
+        }
+        let db = database.unwrap_or("");
+        let key = format!("{}\0{}\0{}", node_id, username, db);
+        let pools = self.user_pools.lock();
+        pools.get(&key).map(|entry| Arc::clone(&entry.pool))
+    }
+
     fn snapshot(&self) -> Vec<BackendNodeSnapshot> {
         let pools = self.pools.load();
+        let user_pools = self.user_pools.lock();
+
         (self.health_snapshots)()
             .into_iter()
             .map(|mut snap| {
+                // Base pool connections (service-account, used for health checks)
                 if let Some(pool) = pools.get(&snap.node_id) {
                     snap.active_connections = pool.active_connections();
+                }
+                // Add per-user pool connections for this node
+                if self.user_pool_factory.is_some() {
+                    let prefix = format!("{}\0", snap.node_id);
+                    let user_active: i64 = user_pools
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .map(|(_, entry)| entry.pool.active_connections())
+                        .sum();
+                    snap.active_connections = user_active;
                 }
                 snap
             })
@@ -142,6 +418,9 @@ pub fn emit_pool_metrics(snapshot: &[BackendNodeSnapshot], max_pool_size: u32) {
         }
     }
 }
+
+/// Credential passthrough pool manager is now integrated directly into
+/// `InMemoryPoolManager` via `set_user_pool_factory`. See `pool_for_user`.
 
 #[cfg(test)]
 mod tests {

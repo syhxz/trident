@@ -133,6 +133,7 @@ impl admin::NodeManager for LiveNodeManager {
             username: config.username.clone(),
             password: config.password.clone(),
             ssl_mode: config.ssl_mode,
+            extra_startup_params: HashMap::new(),
         };
         let factory = LiveConnFactory {
             target,
@@ -177,6 +178,16 @@ impl admin::NodeManager for LiveNodeManager {
             );
             Arc::new(new_map)
         });
+
+        // Notify passthrough factory of the new node so per-user pools
+        // can be created for it.
+        self.pool_manager.notify_node_added(
+            &config.name,
+            &config.host,
+            config.port,
+            &config.database,
+            config.ssl_mode,
+        );
 
         tracing::info!(node = %config.name, node_type = ?config.node_type, host = %config.host, "dynamically added backend node");
         Ok(())
@@ -372,6 +383,7 @@ async fn run(
             username: node.username.clone(),
             password: node.password.clone(),
             ssl_mode: node.ssl_mode,
+            extra_startup_params: HashMap::new(),
         };
         let factory = LiveConnFactory {
             target,
@@ -410,9 +422,141 @@ async fn run(
     let cancel_registry = Arc::new(CancelRegistry::new());
 
     let health_checker_for_snapshot = health_checker.clone();
-    let pool_manager = Arc::new(InMemoryPoolManager::new(pools, move || {
+    let mut pool_manager = InMemoryPoolManager::new(pools, move || {
         health_checker_for_snapshot.snapshot()
-    }));
+    });
+
+    // --- Passthrough mode: install UserPoolFactory ---
+    if config.proxy.client_auth == trident::config::ClientAuthMode::Passthrough {
+        use trident::pool::manager::UserPoolFactory;
+        use trident::pool::NodeConfigUpdater;
+
+        /// Factory that creates per-user connection pools with real
+        /// backend authentication using the client's credentials.
+        struct LiveUserPoolFactory {
+            /// Node addresses: node_id -> (host, port, database, ssl_mode).
+            /// Wrapped in ArcSwap so dynamic add/remove_node can update it.
+            node_configs: Arc<arc_swap::ArcSwap<HashMap<String, NodeConnInfo>>>,
+            registry: Arc<ConnectionRegistry>,
+            pool_mode: trident::config::PoolMode,
+            max_pool_size: u32,
+            pool_settings: NodePoolSettings,
+        }
+
+        #[derive(Clone)]
+        struct NodeConnInfo {
+            host: String,
+            port: u16,
+            database: String,
+            ssl_mode: trident::config::SslMode,
+        }
+
+        impl UserPoolFactory for LiveUserPoolFactory {
+            fn create_pool(
+                &self,
+                node_id: &str,
+                username: &str,
+                password: &str,
+                database: Option<&str>,
+                extra_params: &HashMap<String, String>,
+            ) -> Option<Box<dyn ConnectionPool>> {
+                let configs = self.node_configs.load();
+                let node_info = configs.get(node_id)?;
+                let target = ConnectTarget {
+                    host: node_info.host.clone(),
+                    port: node_info.port,
+                    // Use client-specified database if provided, otherwise
+                    // fall back to the node's configured default.
+                    database: database
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or(&node_info.database)
+                        .to_string(),
+                    username: username.to_string(),
+                    password: Some(password.to_string()),
+                    ssl_mode: node_info.ssl_mode,
+                    extra_startup_params: extra_params.clone(),
+                };
+                let factory = LiveConnFactory {
+                    target,
+                    registry: self.registry.clone(),
+                };
+                let cleaner = DiscardAllCleaner {
+                    registry: self.registry.clone(),
+                };
+                // Per-user pools use min_pool_size=0 (no prewarming since
+                // we cannot predict which users will connect) and a smaller
+                // max_pool_size to prevent total connection explosion.
+                let user_settings = NodePoolSettings {
+                    min_pool_size: 0,
+                    ..self.pool_settings
+                };
+                let pool = NodePool::with_settings(
+                    node_id,
+                    self.pool_mode,
+                    self.max_pool_size,
+                    user_settings,
+                    factory,
+                    cleaner,
+                );
+                Some(Box::new(pool))
+            }
+        }
+
+        /// Implements NodeConfigUpdater by updating the ArcSwap of node configs.
+        struct LiveNodeConfigUpdater {
+            node_configs: Arc<arc_swap::ArcSwap<HashMap<String, NodeConnInfo>>>,
+        }
+
+        impl NodeConfigUpdater for LiveNodeConfigUpdater {
+            fn add_node(&self, node_id: &str, host: &str, port: u16, database: &str, ssl_mode: trident::config::SslMode) {
+                self.node_configs.rcu(|current| {
+                    let mut new_map = (**current).clone();
+                    new_map.insert(node_id.to_string(), NodeConnInfo {
+                        host: host.to_string(),
+                        port,
+                        database: database.to_string(),
+                        ssl_mode,
+                    });
+                    Arc::new(new_map)
+                });
+            }
+
+            fn remove_node(&self, node_id: &str) {
+                self.node_configs.rcu(|current| {
+                    let mut new_map = (**current).clone();
+                    new_map.remove(node_id);
+                    Arc::new(new_map)
+                });
+            }
+        }
+
+        let mut node_configs_map = HashMap::new();
+        for node in &config.nodes {
+            node_configs_map.insert(node.name.clone(), NodeConnInfo {
+                host: node.host.clone(),
+                port: node.port,
+                database: node.database.clone(),
+                ssl_mode: node.ssl_mode,
+            });
+        }
+        let passthrough_node_configs = Arc::new(arc_swap::ArcSwap::new(Arc::new(node_configs_map)));
+
+        pool_manager.set_user_pool_factory(Box::new(LiveUserPoolFactory {
+            node_configs: passthrough_node_configs.clone(),
+            registry: registry.clone(),
+            pool_mode: config.pool.mode,
+            max_pool_size: config.pool.max_pool_size,
+            pool_settings,
+        }));
+
+        pool_manager.set_node_config_updater(Arc::new(LiveNodeConfigUpdater {
+            node_configs: passthrough_node_configs,
+        }));
+
+        tracing::info!("credential passthrough mode enabled: per-user pools will be created on demand");
+    }
+
+    let pool_manager = Arc::new(pool_manager);
 
     // --- Router ---
     //
@@ -448,6 +592,7 @@ async fn run(
         username: explain_node.username.clone(),
         password: explain_node.password.clone(),
         ssl_mode: explain_node.ssl_mode,
+        extra_startup_params: HashMap::new(),
     };
     let explain_runner = PoolExplainRunner::new(explain_target);
 
@@ -555,6 +700,24 @@ async fn run(
                 ticker.tick().await;
                 let snapshot = pool_manager_for_metrics.snapshot();
                 trident::pool::emit_pool_metrics(&snapshot, max_pool_size);
+            }
+        });
+    }
+
+    // --- Per-user pool idle eviction (passthrough mode) ---
+    // Evicts per-user pools that have been idle for longer than
+    // max_idle_time (same as pool.max_idle_time). Runs every 60s.
+    if config.proxy.client_auth == trident::config::ClientAuthMode::Passthrough {
+        let pool_manager_for_eviction = pool_manager.clone();
+        let eviction_max_idle = parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(300));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                let evicted = pool_manager_for_eviction.evict_idle_user_pools(eviction_max_idle);
+                if evicted > 0 {
+                    tracing::info!(evicted, remaining = pool_manager_for_eviction.user_pool_count(), "evicted idle per-user pools");
+                }
             }
         });
     }
@@ -734,6 +897,19 @@ async fn run(
                         backend_pid: pid,
                         secret_key: generate_cancel_secret(),
                         credentials: credentials_for_factory.clone(),
+                    }
+                })
+                .await?;
+        }
+        trident::config::ClientAuthMode::Passthrough => {
+            use trident::protocol::startup::PassthroughStartupHandler;
+
+            server
+                .run(deps, move || {
+                    let pid = next_backend_pid.fetch_add(1, Ordering::SeqCst);
+                    PassthroughStartupHandler {
+                        backend_pid: pid,
+                        secret_key: generate_cancel_secret(),
                     }
                 })
                 .await?;

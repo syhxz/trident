@@ -135,6 +135,11 @@ pub enum PoolMode {
 ///   using PostgreSQL MD5 password protocol. The proxy still uses the
 ///   configured service account when connecting to backends (no credential
 ///   passthrough). This is the PgBouncer "auth_file" model.
+/// - `Passthrough`: proxy captures the client's username and password from
+///   the startup handshake and uses them to authenticate against the
+///   backend PostgreSQL nodes. Each unique username gets its own connection
+///   pool. This is the PolarDB proxy model — full credential passthrough
+///   preserving database-level RBAC and audit identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientAuthMode {
@@ -142,6 +147,7 @@ pub enum ClientAuthMode {
     Md5,
     #[serde(rename = "scram-sha-256")]
     ScramSha256,
+    Passthrough,
 }
 
 fn default_client_auth() -> ClientAuthMode {

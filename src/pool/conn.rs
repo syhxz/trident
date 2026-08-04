@@ -118,6 +118,10 @@ pub struct ConnectTarget {
     pub username: String,
     pub password: Option<String>,
     pub ssl_mode: SslMode,
+    /// Extra startup parameters to send to the backend (e.g.
+    /// `application_name`, `options`, `search_path`). Forwarded from the
+    /// client's StartupMessage in passthrough mode.
+    pub extra_startup_params: HashMap<String, String>,
 }
 
 /// Physical connection establishment error
@@ -192,6 +196,9 @@ pub async fn establish_connection(
     let mut params = HashMap::new();
     params.insert("user".to_string(), target.username.clone());
     params.insert("database".to_string(), target.database.clone());
+    for (k, v) in &target.extra_startup_params {
+        params.insert(k.clone(), v.clone());
+    }
     let startup = StartupMessage {
         protocol_version: 196_608, // 3.0
         params,

@@ -122,6 +122,38 @@ pub async fn read_startup_packet<R: AsyncRead + Unpin + Send>(
 pub struct AuthOutcome {
     pub backend_pid: i32,
     pub secret_key: i32,
+    /// When passthrough mode is active, the client's credentials are
+    /// captured here so the proxy can use them to authenticate against
+    /// backend nodes on behalf of this client session.
+    pub client_credentials: Option<ClientCredentials>,
+}
+
+/// Client credentials captured during passthrough authentication.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientCredentials {
+    pub username: String,
+    pub password: String,
+    /// Database name from the client's StartupMessage. In passthrough mode,
+    /// backend connections should use this database instead of the node's
+    /// default.
+    pub database: Option<String>,
+    /// Extra startup parameters from the client's StartupMessage (e.g.
+    /// `application_name`, `options`, `search_path`, `TimeZone`,
+    /// `client_encoding`). These are forwarded to the backend when
+    /// establishing per-user connections, preserving JDBC/libpq driver
+    /// behavior.
+    pub extra_params: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ClientCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("database", &self.database)
+            .field("extra_params", &self.extra_params)
+            .finish()
+    }
 }
 
 /// Startup/authentication flow handling.
@@ -168,6 +200,7 @@ impl StartupHandler for TrustStartupHandler {
         Ok(AuthOutcome {
             backend_pid: self.backend_pid,
             secret_key: self.secret_key,
+            client_credentials: None,
         })
     }
 }
@@ -294,6 +327,7 @@ impl StartupHandler for Md5PasswordStartupHandler {
         Ok(AuthOutcome {
             backend_pid: self.backend_pid,
             secret_key: self.secret_key,
+            client_credentials: None,
         })
     }
 }
@@ -576,6 +610,100 @@ impl StartupHandler for ScramStartupHandler {
         Ok(AuthOutcome {
             backend_pid: self.backend_pid,
             secret_key: self.secret_key,
+            client_credentials: None,
+        })
+    }
+}
+
+/// Passthrough authentication handler: captures the client's cleartext
+/// password and stores it in `AuthOutcome::client_credentials` so the proxy
+/// can use it to authenticate against backend PostgreSQL nodes. The proxy
+/// does NOT verify the password locally — the real authentication happens
+/// when the proxy opens a backend connection using the client's credentials.
+///
+/// This enables the PolarDB-style credential passthrough model where each
+/// client retains its database-level identity, RBAC, and audit trail.
+///
+/// The handler sends an AuthenticationCleartextPassword challenge to the
+/// client, receives the password, and stores both username and password
+/// for later use by the pool layer.
+pub struct PassthroughStartupHandler {
+    pub backend_pid: i32,
+    pub secret_key: i32,
+}
+
+impl StartupHandler for PassthroughStartupHandler {
+    async fn handle_startup(&mut self, _msg: StartupMessage) -> Result<AuthOutcome, ProtocolError> {
+        Err(ProtocolError::Malformed(
+            "Passthrough auth requires stream access; internal error".into(),
+        ))
+    }
+
+    async fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+        &mut self,
+        msg: StartupMessage,
+        stream: &mut S,
+    ) -> Result<AuthOutcome, ProtocolError> {
+        use tokio::io::AsyncWriteExt;
+
+        let username = msg
+            .params
+            .get("user")
+            .cloned()
+            .unwrap_or_default();
+
+        if username.is_empty() {
+            return Err(ProtocolError::Malformed(
+                "passthrough auth requires a 'user' parameter in StartupMessage".into(),
+            ));
+        }
+
+        // Send AuthenticationCleartextPassword (type=3)
+        let mut auth_msg = Vec::with_capacity(9);
+        auth_msg.push(b'R');
+        // length: 4 (len field) + 4 (auth type) = 8
+        auth_msg.extend_from_slice(&8i32.to_be_bytes());
+        // AuthType = 3 (CleartextPassword)
+        auth_msg.extend_from_slice(&3i32.to_be_bytes());
+
+        stream
+            .write_all(&auth_msg)
+            .await
+            .map_err(ProtocolError::Io)?;
+        stream.flush().await.map_err(ProtocolError::Io)?;
+
+        // Read PasswordMessage ('p')
+        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        if tag != b'p' {
+            return Err(ProtocolError::Malformed(format!(
+                "expected PasswordMessage ('p'), got '{}'",
+                tag as char
+            )));
+        }
+
+        // Extract the password C-string from body
+        let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+        let password = std::str::from_utf8(&body[..end])
+            .map_err(|_| ProtocolError::Malformed("password is not valid UTF-8".into()))?
+            .to_string();
+
+        if password.is_empty() {
+            return Err(ProtocolError::Malformed(
+                "passthrough auth received empty password".into(),
+            ));
+        }
+
+        Ok(AuthOutcome {
+            backend_pid: self.backend_pid,
+            secret_key: self.secret_key,
+            client_credentials: Some(ClientCredentials {
+                username: username.clone(),
+                password,
+                database: msg.params.get("database").cloned(),
+                extra_params: msg.params.into_iter()
+                    .filter(|(k, _)| k != "user" && k != "database")
+                    .collect(),
+            }),
         })
     }
 }
@@ -741,6 +869,7 @@ mod tests {
             AuthOutcome {
                 backend_pid: 42,
                 secret_key: 99,
+                client_credentials: None,
             }
         );
     }
@@ -749,6 +878,69 @@ mod tests {
     // Robustness: malformed Startup packets never panic (in the same
     // spirit as Property 51)
     // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn passthrough_handler_captures_credentials() {
+        let mut handler = PassthroughStartupHandler {
+            backend_pid: 10,
+            secret_key: 20,
+        };
+        let mut params = HashMap::new();
+        params.insert("user".to_string(), "app_user".to_string());
+        let msg = StartupMessage {
+            protocol_version: 196608,
+            params,
+        };
+
+        // Simulate: handler sends AuthCleartextPassword, client replies.
+        // We use an in-memory buffer:
+        // - handler writes auth request (R + len + type=3) to the stream
+        // - then reads password message ('p' + len + "secret\0")
+        //
+        // Build the stream: pre-fill with the password response the handler
+        // will read, and capture what it writes.
+        let password_msg = {
+            let mut buf = Vec::new();
+            buf.push(b'p');
+            let password_with_nul = b"my_secret\0";
+            let len = (4 + password_with_nul.len()) as i32;
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(password_with_nul);
+            buf
+        };
+
+        // Use a duplex stream: one side for reading (handler reads password),
+        // one for writing (handler writes auth challenge).
+        let (client_side, server_side) = tokio::io::duplex(1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client_side);
+
+        // Spawn a task that writes the password message after reading the
+        // auth challenge from the handler.
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Read the AuthenticationCleartextPassword message (9 bytes: R + 8 + 3)
+            let mut auth_challenge = [0u8; 9];
+            client_read.read_exact(&mut auth_challenge).await.unwrap();
+            assert_eq!(auth_challenge[0], b'R');
+            // Write password response
+            client_write.write_all(&password_msg).await.unwrap();
+            client_write.flush().await.unwrap();
+        });
+
+        let mut server_stream = server_side;
+        let outcome = handler
+            .handle_startup_with_stream(msg, &mut server_stream)
+            .await
+            .unwrap();
+
+        client_task.await.unwrap();
+
+        assert_eq!(outcome.backend_pid, 10);
+        assert_eq!(outcome.secret_key, 20);
+        let creds = outcome.client_credentials.unwrap();
+        assert_eq!(creds.username, "app_user");
+        assert_eq!(creds.password, "my_secret");
+    }
 
     proptest! {
         #[test]

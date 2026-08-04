@@ -14,6 +14,53 @@ A high-performance PostgreSQL read/write splitting proxy with connection pooling
 - **Hot Reload** — Update routing rules via SIGHUP or HTTP without restart
 - **Observability** — Prometheus metrics, admin HTTP API, slow query log, client statistics, embedded web console
 - **Protocol Support** — Simple Query and Extended Query (Parse/Bind/Execute) protocols, COPY, Cleartext/MD5/SCRAM-SHA-256 auth
+- **Credential Passthrough** — PolarDB-style authentication where clients use their own database credentials; per-user connection pools preserve RBAC and audit identity
+
+## Client Authentication Modes
+
+Trident supports four client-facing authentication modes via `proxy.client_auth`:
+
+| Mode | Description | Backend Connection |
+|------|-------------|-------------------|
+| `trust` | No authentication (dev/test only) | Service account (`nodes[].username`) |
+| `md5` | Proxy verifies password via local auth_file | Service account |
+| `scram-sha-256` | Proxy verifies SCRAM credential via auth_file | Service account |
+| `passthrough` | Proxy captures credentials, backend authenticates | **Client's own credentials** |
+
+### Passthrough Mode
+
+In passthrough mode, Trident acts as a transparent credential proxy — similar to PolarDB Proxy:
+
+```yaml
+proxy:
+  listen_addr: "0.0.0.0:6432"
+  max_clients: 2000
+  client_auth: passthrough
+```
+
+**How it works:**
+1. Client connects with their database username/password
+2. Proxy captures credentials via CleartextPassword protocol
+3. Backend PostgreSQL performs the real authentication (SCRAM-SHA-256)
+4. Each unique `(username, database)` pair gets its own connection pool
+5. `pg_stat_activity` shows the real client identity
+
+**Key behaviors:**
+- Database-level RBAC is fully preserved — each user retains their own permissions
+- `application_name` and other JDBC/libpq startup parameters are forwarded to the backend
+- Per-user pools are created lazily on first connection, evicted after idle timeout
+- Password changes are detected automatically — pool is replaced with new credentials
+- DoS protection: wrong passwords cannot destroy existing pools (30s cooldown)
+- Dynamic `add_node`/`remove_node` works seamlessly with passthrough pools
+
+**Performance impact:** Negligible. Per-user pool lookup adds one mutex + HashMap access per query routing. Benchmarks show identical TPS to trust mode:
+
+| Scenario (50 clients) | Trust Mode | Passthrough Mode |
+|------------------------|-----------|-----------------|
+| Read-Only SELECT | 38,117 TPS | 32,542 TPS |
+| TPC-B Mixed R/W | 2,832 TPS | 2,991 TPS |
+
+**Security recommendation:** Enable client-facing TLS (`proxy.tls_cert`/`proxy.tls_key`) when using passthrough mode, since credentials are transmitted as cleartext between client and proxy before the TLS layer.
 
 ## Quick Start
 

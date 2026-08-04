@@ -9,7 +9,7 @@ pub mod pinning;
 pub mod pool;
 
 pub use conn::{establish_connection, ConnectTarget, ConnError, MaybeTlsStream, PooledConnection};
-pub use manager::{emit_pool_metrics, InMemoryPoolManager, PoolManager};
+pub use manager::{emit_pool_metrics, InMemoryPoolManager, NodeConfigUpdater, PoolManager, UserPoolFactory};
 pub use pinning::{detects_pinning_trigger, PinningTrigger};
 pub use pool::{
     ConnCleaner, ConnFactory, ConnectionPool, NodePool, PoolError, DISCARD_ALL_STATEMENT,

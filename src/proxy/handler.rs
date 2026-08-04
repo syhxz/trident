@@ -14,6 +14,7 @@
 //! 13.4, 13.5).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -26,6 +27,7 @@ use crate::parser::hint::HintParser;
 use crate::pool::conn::PooledConnection;
 use crate::pool::manager::PoolManager;
 use crate::pool::pinning::detects_pinning_trigger;
+use crate::pool::pool::ConnectionPool;
 use crate::protocol::message::{BackendMessage, FrontendMessage, PgError, TransactionStatus};
 use crate::protocol::reader::{frontend_tag, parse_frontend_body, read_tagged_frame};
 use crate::protocol::startup::{read_startup_packet, AuthOutcome, StartupHandler, StartupPacket};
@@ -75,6 +77,9 @@ pub struct ClientSession {
     /// `allow_cross_sync_unnamed` is enabled, the proxy instead holds the
     /// connection until the Bind arrives.
     unnamed_parse_node: Option<String>,
+    /// Client credentials captured during passthrough authentication. When
+    /// present, pool lookups use `pool_for_user` instead of `pool_for`.
+    client_credentials: Option<crate::protocol::startup::ClientCredentials>,
 }
 
 /// A backend connection checked out exclusively by this client. It is
@@ -189,6 +194,7 @@ impl ClientSession {
             aurora_initialized_backend_pid: None,
             extended_route_tracker: ExtendedQueryRouteTracker::new(),
             unnamed_parse_node: None,
+            client_credentials: None,
         }
     }
 }
@@ -362,6 +368,50 @@ where
         self
     }
 
+    /// Resolves the pool for a node, using per-user pools when the session
+    /// has passthrough credentials, or the shared service-account pool
+    /// otherwise. This is the single dispatch point so all 30+ call sites
+    /// of `pool_for` benefit from passthrough support automatically.
+    fn resolve_pool(
+        &self,
+        node_id: &str,
+        session: &ClientSession,
+    ) -> Option<Arc<dyn ConnectionPool>> {
+        if let Some(creds) = &session.client_credentials {
+            self.pool_manager.pool_for_user(
+                node_id,
+                &creds.username,
+                &creds.password,
+                creds.database.as_deref(),
+                &creds.extra_params,
+            )
+        } else {
+            self.pool_manager.pool_for(node_id)
+        }
+    }
+
+    /// Like `resolve_pool` but never creates a new per-user pool. Used
+    /// during session cleanup where we only need to release connections
+    /// from an existing pool, not trigger creation of a new one.
+    fn resolve_pool_existing(
+        &self,
+        node_id: &str,
+        session: &ClientSession,
+    ) -> Option<Arc<dyn ConnectionPool>> {
+        if let Some(creds) = &session.client_credentials {
+            // Look up without creating. If the pool was evicted, any
+            // session bindings in it are already gone (Arc dropped), so
+            // there's nothing to release.
+            self.pool_manager.pool_for_user_existing(
+                node_id,
+                &creds.username,
+                creds.database.as_deref(),
+            )
+        } else {
+            self.pool_manager.pool_for(node_id)
+        }
+    }
+
     /// Handles a single client connection end-to-end. `startup_handler`
     /// performs the Startup/authentication handshake with the client;
     /// `session_id` uniquely identifies this connection for pool/LSN
@@ -424,6 +474,9 @@ where
             ProxyError::Protocol(ProtocolError::Io(e))
         })?;
 
+        // Store client credentials for passthrough pool lookups
+        session.client_credentials = auth_outcome.client_credentials.clone();
+
         // Register the cancel key this proxy just issued to the client (in
         // BackendKeyData above) against this session, so a later
         // CancelRequest bearing it can be attributed back correctly
@@ -443,7 +496,7 @@ where
         // the session rather than the registry. Discard it first so both
         // the physical socket and the pool capacity slot are released.
         if let Some(held) = session.held_backend.take() {
-            if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
                 if let Err(error) = pool.discard(held.conn) {
                     tracing::warn!(error = %error, "failed to discard held backend connection");
                 }
@@ -459,7 +512,7 @@ where
         self.cancel_registry
             .unregister_session(auth_outcome.backend_pid, auth_outcome.secret_key);
         for node_id in known_node_ids(self.pool_manager) {
-            if let Some(pool) = self.pool_manager.pool_for(&node_id) {
+            if let Some(pool) = self.resolve_pool_existing(&node_id, &session) {
                 for connection in pool.release_session(&session_id) {
                     self.connection_registry
                         .remove(&connection.node_id, connection.backend_pid);
@@ -901,7 +954,7 @@ where
         }
 
         // Acquire a new connection (held_backend case handled by fast path above).
-        let pool = self.pool_manager.pool_for(&target_node_id).ok_or_else(|| {
+        let pool = self.resolve_pool(&target_node_id, session).ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(
                 target_node_id.clone(),
             ))
@@ -1201,7 +1254,7 @@ where
         if let Err(e) = held.socket.write_all(&outbound).await {
             self.cancel_registry.clear_active(&session.state.id);
             let held = session.held_backend.take().unwrap();
-            if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                 let _ = pool.discard(held.conn);
             }
             drop(held.socket);
@@ -1210,7 +1263,7 @@ where
         if let Err(e) = held.socket.flush().await {
             self.cancel_registry.clear_active(&session.state.id);
             let held = session.held_backend.take().unwrap();
-            if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                 let _ = pool.discard(held.conn);
             }
             drop(held.socket);
@@ -1234,7 +1287,7 @@ where
                 Err(e) => {
                     self.cancel_registry.clear_active(&session.state.id);
                     let held = session.held_backend.take().unwrap();
-                    if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                    if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                         let _ = pool.discard(held.conn);
                     }
                     drop(held.socket);
@@ -1248,7 +1301,7 @@ where
                     if body.len() != 1 {
                         self.cancel_registry.clear_active(&session.state.id);
                         let held = session.held_backend.take().unwrap();
-                        if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                        if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                             let _ = pool.discard(held.conn);
                         }
                         drop(held.socket);
@@ -1261,7 +1314,7 @@ where
                         None => {
                             self.cancel_registry.clear_active(&session.state.id);
                             let held = session.held_backend.take().unwrap();
-                            if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                                 let _ = pool.discard(held.conn);
                             }
                             drop(held.socket);
@@ -1307,7 +1360,7 @@ where
                     if let Err(e) = sync_result {
                         self.cancel_registry.clear_active(&session.state.id);
                         let held = session.held_backend.take().unwrap();
-                        if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                        if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                             let _ = pool.discard(held.conn);
                         }
                         drop(held.socket);
@@ -1356,7 +1409,9 @@ where
                     held.conn.dirty = true;
                 }
                 if !held.conn.pinned {
-                    if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                    let node_id = held.conn.node_id.clone();
+                    if let Some(pool) = self.resolve_pool(&node_id, session) {
+                        let held = session.held_backend.as_mut().expect("checked");
                         pool.pin(&session.state.id, &mut held.conn);
                     }
                 }
@@ -1402,7 +1457,7 @@ where
                 let held = session.held_backend.take().unwrap();
                 // Unnamed statement is gone once connection returns to pool.
                 session.unnamed_parse_node = None;
-                let pool = self.pool_manager.pool_for(&held.conn.node_id).ok_or_else(|| {
+                let pool = self.resolve_pool(&held.conn.node_id, session).ok_or_else(|| {
                     ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
                         "pool for '{}' no longer exists",
                         held.conn.node_id
@@ -1551,7 +1606,7 @@ where
             Err(failure) => {
                 session.state.tx_state = TxState::Failed;
                 let held = session.held_backend.take().unwrap();
-                if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                     let _ = pool.discard(held.conn);
                 }
                 drop(held.socket);
@@ -1613,7 +1668,7 @@ where
                 // Keep in held_backend — nothing to do.
             } else {
                 let held = session.held_backend.take().unwrap();
-                let pool = self.pool_manager.pool_for(&held.conn.node_id).ok_or_else(|| {
+                let pool = self.resolve_pool(&held.conn.node_id, session).ok_or_else(|| {
                     ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
                         "pool for '{}' no longer exists",
                         held.conn.node_id
@@ -1630,7 +1685,7 @@ where
         // and must not be reused.
         if !relay_outcome.connection_reusable {
             if let Some(held) = session.held_backend.take() {
-                if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                     let _ = pool.discard(held.conn);
                 }
                 drop(held.socket);
@@ -1648,7 +1703,7 @@ where
 
         self.cancel_registry.clear_active(&session.state.id);
         if let Some(held) = session.held_backend.take() {
-            if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                 if let Err(error) = pool.discard(held.conn) {
                     tracing::warn!(error = %error, "failed to discard aborted transaction connection");
                 }
@@ -1729,12 +1784,12 @@ where
         *target_out = Some(NodeType::Reader);
         metrics::counter!("trident_routing_decisions_total", "target" => "reader").increment(1);
 
-        let pool = self.pool_manager.pool_for(&node_id).ok_or_else(|| {
+        let pool = self.resolve_pool(&node_id, session).ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(node_id.clone()))
         })?;
         let (conn, mut socket) = if let Some(held) = session.held_backend.take() {
             if held.conn.node_id != node_id {
-                if let Some(held_pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                if let Some(held_pool) = self.resolve_pool(&held.conn.node_id, session) {
                     held_pool.discard(held.conn)?;
                 }
                 drop(held.socket);
@@ -1880,7 +1935,7 @@ where
             }
 
             if let Some(held) = session.held_backend.take() {
-                if let Some(pool) = self.pool_manager.pool_for(&held.conn.node_id) {
+                if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
                     let _ = pool.discard(held.conn);
                 }
                 drop(held.socket);
@@ -1888,7 +1943,7 @@ where
             return false;
         }
 
-        let Some(pool) = self.pool_manager.pool_for(&writer_id) else {
+        let Some(pool) = self.resolve_pool(&writer_id, session) else {
             return false;
         };
         let conn = match pool.acquire(&session.state.id).await {
@@ -1957,7 +2012,7 @@ where
         })?;
         let conn = held.conn;
         let mut socket = held.socket;
-        let pool = self.pool_manager.pool_for(&conn.node_id).ok_or_else(|| {
+        let pool = self.resolve_pool(&conn.node_id, session).ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
                 "pool for split transaction node '{}' no longer exists",
                 conn.node_id
@@ -2346,7 +2401,7 @@ where
             };
             let mut reader_conn = held.conn;
             let mut reader_socket = held.socket;
-            let reader_pool = match self.pool_manager.pool_for(&reader_conn.node_id) {
+            let reader_pool = match self.resolve_pool(&reader_conn.node_id, session) {
                 Some(pool) => pool,
                 None => {
                     session.state.tx_state = TxState::Failed;
@@ -2418,7 +2473,7 @@ where
             // the session itself closes).
             (held.conn, held.socket)
         } else {
-            let target_pool = match self.pool_manager.pool_for(&target_node_id) {
+            let target_pool = match self.resolve_pool(&target_node_id, session) {
                 Some(pool) => pool,
                 None => {
                     metrics::counter!("trident_pool_exhausted_total", "node_id" => target_node_id.clone())
@@ -2472,7 +2527,7 @@ where
             (conn, socket)
         };
 
-        let pool = self.pool_manager.pool_for(&conn.node_id).ok_or_else(|| {
+        let pool = self.resolve_pool(&conn.node_id, session).ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
                 "pool for held backend node '{}' no longer exists",
                 conn.node_id
