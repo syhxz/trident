@@ -54,29 +54,64 @@ const BACKEND_READ_BUF_SIZE: usize = 8 * 1024;
 
 /// Maps `(node_id, backend_pid)` to the live `BackendStream` for that backend
 /// connection. Uses a per-node generation counter to prevent stale handlers
-/// from re-inserting sockets for nodes that have been dynamically removed.
+/// from re-inserting sockets for nodes that have been dynamically removed
+/// and re-added.
 #[derive(Default)]
 pub struct ConnectionRegistry {
     sockets: Mutex<HashMap<(String, i32), BackendStream>>,
-    /// Generation counter per node_id. Incremented on `remove_by_node`.
-    /// Inserts are only accepted if no generation is recorded (new node)
-    /// or the node has not been removed since it was last active.
-    removed_nodes: Mutex<std::collections::HashSet<String>>,
+    /// Per-node generation counter. Incremented on each `remove_by_node`.
+    /// `allow_node` increments again so the new generation differs from
+    /// any in-flight inserts that captured the pre-remove generation.
+    /// Inserts carry a generation token and are rejected if it doesn't
+    /// match the current generation for that node.
+    node_generations: Mutex<HashMap<String, u64>>,
 }
 
 impl ConnectionRegistry {
     pub fn new() -> Self {
         ConnectionRegistry {
             sockets: Mutex::new(HashMap::new()),
-            removed_nodes: Mutex::new(std::collections::HashSet::new()),
+            node_generations: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Returns the current generation for a node. Callers (ConnFactory)
+    /// should capture this at connection-creation time and pass it back
+    /// to `insert_with_generation` to ensure stale connections from a
+    /// previous generation are rejected.
+    pub fn node_generation(&self, node_id: &str) -> u64 {
+        let gens = self.node_generations.lock();
+        gens.get(node_id).copied().unwrap_or(0)
+    }
+
     pub fn insert(&self, node_id: &str, backend_pid: i32, stream: BackendStream) {
-        // Reject inserts for nodes that have been removed (prevents
-        // stale handlers from re-inserting sockets after node deletion).
-        if self.removed_nodes.lock().contains(node_id) {
-            tracing::debug!(node_id, backend_pid, "rejecting socket insert for removed node");
+        // Unconditional insert — used by code paths that don't track
+        // generations (e.g. legacy or non-passthrough paths). For
+        // generation-aware inserts, use `insert_with_generation`.
+        let mut sockets = self.sockets.lock();
+        sockets.insert((node_id.to_string(), backend_pid), stream);
+    }
+
+    /// Generation-aware insert. Rejects the socket if the node's current
+    /// generation doesn't match the one captured at connection-creation
+    /// time (meaning the node was removed and possibly re-added since).
+    pub fn insert_with_generation(
+        &self,
+        node_id: &str,
+        backend_pid: i32,
+        stream: BackendStream,
+        expected_generation: u64,
+    ) {
+        let gens = self.node_generations.lock();
+        let current_gen = gens.get(node_id).copied().unwrap_or(0);
+        if current_gen != expected_generation {
+            tracing::debug!(
+                node_id,
+                backend_pid,
+                current_gen,
+                expected_generation,
+                "rejecting socket insert for stale node generation"
+            );
             return;
         }
         let mut sockets = self.sockets.lock();
@@ -90,6 +125,24 @@ impl ConnectionRegistry {
             node_id,
             backend_pid,
             BufReader::with_capacity(BACKEND_READ_BUF_SIZE, stream),
+        );
+    }
+
+    /// Generation-aware variant of `insert_raw`. Rejects the socket if the
+    /// node's current generation doesn't match the expected generation
+    /// (meaning the node was removed since this connection was initiated).
+    pub fn insert_raw_with_generation(
+        &self,
+        node_id: &str,
+        backend_pid: i32,
+        stream: MaybeTlsStream,
+        expected_generation: u64,
+    ) {
+        self.insert_with_generation(
+            node_id,
+            backend_pid,
+            BufReader::with_capacity(BACKEND_READ_BUF_SIZE, stream),
+            expected_generation,
         );
     }
 
@@ -113,15 +166,24 @@ impl ConnectionRegistry {
     /// silently rejected, preventing stale in-flight handlers from
     /// re-inserting sockets after a dynamic node removal.
     pub fn remove_by_node(&self, node_id: &str) {
-        self.removed_nodes.lock().insert(node_id.to_string());
+        // Increment generation so any in-flight insert_with_generation
+        // calls carrying the old generation are rejected.
+        let mut gens = self.node_generations.lock();
+        let gen = gens.entry(node_id.to_string()).or_insert(0);
+        *gen += 1;
+        // Purge all sockets for this node.
         let mut sockets = self.sockets.lock();
         sockets.retain(|(n, _), _| n != node_id);
     }
 
     /// Re-enables inserts for a node_id. Called when a node is
     /// dynamically (re-)added after having been previously removed.
+    /// Increments generation again so stale handlers from the previous
+    /// incarnation cannot pollute the re-added node.
     pub fn allow_node(&self, node_id: &str) {
-        self.removed_nodes.lock().remove(node_id);
+        let mut gens = self.node_generations.lock();
+        let gen = gens.entry(node_id.to_string()).or_insert(0);
+        *gen += 1;
     }
 }
 
@@ -130,6 +192,11 @@ impl ConnectionRegistry {
 pub struct LiveConnFactory {
     pub target: ConnectTarget,
     pub registry: Arc<ConnectionRegistry>,
+    /// The node generation at the time this factory was created. Used to
+    /// prevent stale socket insertion after a node removal race: if the
+    /// node was removed (generation incremented) while a connection was
+    /// being established, the insert will be rejected.
+    pub generation: u64,
 }
 
 impl ConnFactory for LiveConnFactory {
@@ -137,7 +204,12 @@ impl ConnFactory for LiveConnFactory {
         let (meta, stream) = establish_connection(node_id, &self.target)
             .await
             .map_err(conn_error_to_pool_error)?;
-        self.registry.insert_raw(node_id, meta.backend_pid, stream);
+        self.registry.insert_raw_with_generation(
+            node_id,
+            meta.backend_pid,
+            stream,
+            self.generation,
+        );
         Ok(meta)
     }
 }
@@ -179,6 +251,12 @@ impl ConnCleaner for DiscardAllCleaner {
                 PoolError::CleanupFailed("connection socket missing from registry".into())
             })?;
 
+        // Capture the node generation before cleaning. If the node is
+        // removed while DISCARD ALL is in flight, the generation will
+        // advance and we'll drop the socket instead of re-inserting it
+        // (preventing stale sockets from polluting a re-added node).
+        let gen_before = self.registry.node_generation(&conn.node_id);
+
         let bytes = encode_query(DISCARD_ALL_STATEMENT);
         if let Err(e) = stream.write_all(&bytes).await {
             return Err(PoolError::CleanupFailed(e.to_string()));
@@ -195,7 +273,7 @@ impl ConnCleaner for DiscardAllCleaner {
             }
         }
 
-        self.registry.insert(&conn.node_id, conn.backend_pid, stream);
+        self.registry.insert_with_generation(&conn.node_id, conn.backend_pid, stream, gen_before);
         Ok(())
     }
 
@@ -210,6 +288,8 @@ impl ConnCleaner for DiscardAllCleaner {
             .ok_or_else(|| {
                 PoolError::CleanupFailed("connection socket missing from registry for validation".into())
             })?;
+
+        let gen_before = self.registry.node_generation(&conn.node_id);
 
         let bytes = encode_query(&self.check_query);
         if let Err(e) = stream.write_all(&bytes).await {
@@ -236,8 +316,8 @@ impl ConnCleaner for DiscardAllCleaner {
             }
         }
 
-        // Connection alive — put it back
-        self.registry.insert(&conn.node_id, conn.backend_pid, stream);
+        // Connection alive — put it back only if node wasn't removed
+        self.registry.insert_with_generation(&conn.node_id, conn.backend_pid, stream, gen_before);
         Ok(())
     }
 

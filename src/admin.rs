@@ -92,7 +92,7 @@ struct ConsoleAssets;
 
 /// Ring buffer of recent slow queries for the `/api/slow-queries` endpoint.
 pub struct SlowQueryBuffer {
-    entries: std::sync::Mutex<std::collections::VecDeque<SlowQueryEntry>>,
+    entries: parking_lot::Mutex<std::collections::VecDeque<SlowQueryEntry>>,
     capacity: usize,
 }
 
@@ -107,13 +107,13 @@ pub struct SlowQueryEntry {
 impl SlowQueryBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
-            entries: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
+            entries: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
             capacity,
         }
     }
 
     pub fn push(&self, entry: SlowQueryEntry) {
-        let mut entries = self.entries.lock().expect("slow_query_buffer lock poisoned");
+        let mut entries = self.entries.lock();
         if entries.len() >= self.capacity {
             entries.pop_front();
         }
@@ -121,7 +121,7 @@ impl SlowQueryBuffer {
     }
 
     pub fn snapshot(&self) -> Vec<SlowQueryEntry> {
-        let entries = self.entries.lock().expect("slow_query_buffer lock poisoned");
+        let entries = self.entries.lock();
         entries.iter().rev().cloned().collect()
     }
 
@@ -132,7 +132,7 @@ impl SlowQueryBuffer {
     /// window, the overflow was evicted and the count is a floor -- at that
     /// volume the exact number is not the interesting signal anyway.
     pub fn count_since(&self, cutoff_unix_secs: u64) -> usize {
-        let entries = self.entries.lock().expect("slow_query_buffer lock poisoned");
+        let entries = self.entries.lock();
         entries
             .iter()
             .rev()
@@ -329,6 +329,7 @@ async fn auth_middleware(
 /// Builds the admin `axum::Router` (routes only; binding/serving is done
 /// by `run`, kept separate so tests can exercise the routes directly
 /// in-process without a real TCP listener).
+#[allow(clippy::too_many_arguments)]
 fn build_router(
     prometheus_handle: PrometheusHandle,
     snapshot_fn: impl Fn() -> Vec<BackendNodeSnapshot> + Send + Sync + 'static,
@@ -402,6 +403,30 @@ fn build_router(
             .merge(protected_routes)
             .with_state(state)
     } else {
+        // No auth token configured. Restrict mutating operations (POST/PUT/DELETE)
+        // by applying auth middleware unconditionally — all mutating requests will
+        // receive 401 Unauthorized. Read-only GET requests remain accessible.
+        // This prevents accidental exposure of node management and config changes
+        // when the admin console is bound to a non-loopback address without a token.
+        let protected_routes = protected_routes.layer(
+            axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                async move {
+                    // Allow GET and WebSocket upgrade requests without auth
+                    if req.method() == axum::http::Method::GET {
+                        next.run(req).await
+                    } else {
+                        // Block all mutating requests when no auth token is set
+                        axum::response::IntoResponse::into_response((
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::Json(serde_json::json!({
+                                "status": "error",
+                                "message": "admin auth_token not configured; mutating operations are disabled"
+                            })),
+                        ))
+                    }
+                }
+            }),
+        );
         public_routes
             .merge(protected_routes)
             .with_state(state)
@@ -1054,6 +1079,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 ///
 /// `client_stats` backs `GET /client-stats`; always required (see
 /// `AdminState.client_stats` docs).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listen_addr: SocketAddr,
     prometheus_handle: PrometheusHandle,
@@ -1222,7 +1248,7 @@ mod tests {
             "5s".to_string(),
             "30m".to_string(),
             None, // node_manager
-            None, // auth_token
+            Some("test-token".to_string()), // auth_token
         )
     }
 
@@ -1283,6 +1309,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/reload")
+                    .header("Authorization", "Bearer test-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1327,7 +1354,7 @@ mod tests {
             "5s".to_string(),
             "30m".to_string(),
             None, // node_manager
-            None, // auth_token
+            Some("test-token".to_string()), // auth_token
         );
 
         let response = app
@@ -1335,6 +1362,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/reload")
+                    .header("Authorization", "Bearer test-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1368,7 +1396,7 @@ mod tests {
             "5s".to_string(),
             "30m".to_string(),
             None, // node_manager
-            None, // auth_token
+            Some("test-token".to_string()), // auth_token
         );
 
         let response = app
@@ -1376,6 +1404,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/reload")
+                    .header("Authorization", "Bearer test-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -1411,7 +1440,7 @@ mod tests {
             "5s".to_string(),
             "30m".to_string(),
             None, // node_manager
-            None, // auth_token
+            Some("test-token".to_string()), // auth_token
         )
     }
 
@@ -1431,6 +1460,7 @@ mod tests {
                         .method(method)
                         .uri("/custom-rules")
                         .header("content-type", "application/json")
+                        .header("Authorization", "Bearer test-token")
                         .body(body)
                         .unwrap(),
                 )
@@ -1451,6 +1481,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/custom-rules")
+                    .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         r#"{"_name":"sensitive_table","_type":"t","rw_mode":"w"}"#,
@@ -1466,7 +1497,7 @@ mod tests {
         assert!(rules.forces_writer("SELECT * FROM sensitive_table").is_some());
 
         let list_response = app
-            .oneshot(Request::builder().uri("/custom-rules").body(axum::body::Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/custom-rules").header("Authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(list_response.status(), StatusCode::OK);
@@ -1486,6 +1517,7 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/custom-rules")
+                    .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"_name":"t1","_type":"t"}"#))
                     .unwrap(),
@@ -1506,6 +1538,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/custom-rules")
+                    .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(r#"{"_name":"","_type":"t","rw_mode":"w"}"#))
                     .unwrap(),
@@ -1540,7 +1573,7 @@ mod tests {
             "5s".to_string(),
             "30m".to_string(),
             None, // node_manager
-            None, // auth_token
+            Some("test-token".to_string()), // auth_token
         )
     }
 
@@ -1552,7 +1585,7 @@ mod tests {
         let app = router_with_client_stats(stats);
 
         let response = app
-            .oneshot(Request::builder().uri("/client-stats").body(axum::body::Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/client-stats").header("Authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1568,7 +1601,7 @@ mod tests {
         let app = router_with_client_stats(Arc::new(ClientStats::new()));
 
         let response = app
-            .oneshot(Request::builder().uri("/client-stats").body(axum::body::Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/client-stats").header("Authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

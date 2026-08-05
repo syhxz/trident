@@ -347,8 +347,12 @@ async fn upgrade_to_tls_verified(
 /// A TLS certificate verifier that accepts any server certificate.
 /// This matches the behavior of PostgreSQL's `sslmode=require` which
 /// encrypts the connection but does not verify the server's identity.
+///
+/// WARNING: Using this verifier with ssl_mode=require provides encryption
+/// but is vulnerable to MITM attacks. Use `verify-ca` or `verify-full`
+/// for production deployments requiring certificate verification.
 #[derive(Debug)]
-pub struct NoVerifier;
+pub(crate) struct NoVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(

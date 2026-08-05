@@ -108,6 +108,7 @@ struct LiveNodeManager {
     pool_mode: trident::config::PoolMode,
     max_pool_size: u32,
     pool_settings: NodePoolSettings,
+    check_query: String,
 }
 
 #[async_trait::async_trait]
@@ -152,8 +153,10 @@ impl admin::NodeManager for LiveNodeManager {
         let factory = LiveConnFactory {
             target,
             registry: self.connection_registry.clone(),
+            generation: self.connection_registry.node_generation(&config.name),
         };
-        let cleaner = DiscardAllCleaner::new(self.connection_registry.clone());
+        let cleaner = DiscardAllCleaner::new(self.connection_registry.clone())
+            .with_check_query(self.check_query.clone());
         let pool = NodePool::with_settings(
             config.name.clone(),
             self.pool_mode,
@@ -393,8 +396,8 @@ async fn run(
         max_idle_time: parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(5 * 60)),
         max_lifetime: parse_duration_or(&config.pool.max_lifetime, Duration::from_secs(30 * 60)),
         acquire_timeout: parse_duration_or(
-            config.pool.acquire_timeout.as_deref().unwrap_or("0s"),
-            Duration::ZERO,
+            config.pool.acquire_timeout.as_deref().unwrap_or("5s"),
+            Duration::from_secs(5),
         ),
         leak_detection_threshold: parse_duration_or(
             config.pool.leak_detection_threshold.as_deref().unwrap_or("0s"),
@@ -414,8 +417,10 @@ async fn run(
         let factory = LiveConnFactory {
             target,
             registry: registry.clone(),
+            generation: registry.node_generation(&node.name),
         };
-        let cleaner = DiscardAllCleaner::new(registry.clone());
+        let cleaner = DiscardAllCleaner::new(registry.clone())
+            .with_check_query(config.pool.check_query.clone());
         let pool = NodePool::with_settings(
             node.name.clone(),
             config.pool.mode,
@@ -465,6 +470,7 @@ async fn run(
             pool_mode: trident::config::PoolMode,
             max_pool_size: u32,
             pool_settings: NodePoolSettings,
+            check_query: String,
         }
 
         #[derive(Clone)]
@@ -503,8 +509,10 @@ async fn run(
                 let factory = LiveConnFactory {
                     target,
                     registry: self.registry.clone(),
+                    generation: self.registry.node_generation(node_id),
                 };
-                let cleaner = DiscardAllCleaner::new(self.registry.clone());
+                let cleaner = DiscardAllCleaner::new(self.registry.clone())
+                    .with_check_query(self.check_query.clone());
                 // Per-user pools use min_pool_size=0 (no prewarming since
                 // we cannot predict which users will connect) and a smaller
                 // max_pool_size to prevent total connection explosion.
@@ -569,6 +577,7 @@ async fn run(
             pool_mode: config.pool.mode,
             max_pool_size: config.pool.max_pool_size,
             pool_settings,
+            check_query: config.pool.check_query.clone(),
         }));
 
         pool_manager.set_node_config_updater(Arc::new(LiveNodeConfigUpdater {
@@ -713,7 +722,9 @@ async fn run(
     // dashboards/alerting.
     {
         let pool_manager_for_metrics = pool_manager.clone();
-        let interval = check_interval;
+        // Defense-in-depth: if check_interval is somehow zero (config
+        // validation should prevent this), fall back to 3s to avoid panic.
+        let interval = if check_interval.is_zero() { Duration::from_secs(3) } else { check_interval };
         let max_pool_size = config.pool.max_pool_size;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -776,6 +787,14 @@ async fn run(
                             }
                         }
                     }
+                    // Also validate per-user pools (passthrough mode)
+                    let user_discarded = pool_manager_for_validation.validate_idle_user_pools().await;
+                    if user_discarded > 0 {
+                        tracing::debug!(
+                            user_discarded,
+                            "idle connection validation discarded stale user-pool connections"
+                        );
+                    }
                 }
             });
         }
@@ -816,6 +835,7 @@ async fn run(
             pool_mode: config.pool.mode,
             max_pool_size: config.pool.max_pool_size,
             pool_settings,
+            check_query: config.pool.check_query.clone(),
         });
         let admin_snapshot_source = pool_manager.clone();
         let config_path_for_admin = config_path.clone();

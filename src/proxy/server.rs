@@ -328,18 +328,29 @@ where
         // This must happen on the raw TcpStream BEFORE buffering, because the
         // TLS handshake wraps the entire stream.
         //
-        // Apply startup_timeout to the TLS negotiation phase. A client that
-        // connects but never sends data (or stalls during TLS handshake)
-        // should not occupy a slot indefinitely.
-        let client_stream = if deps.startup_timeout.is_zero() {
-            negotiate_client_tls(stream, deps.tls_acceptor.as_deref()).await?
+        // Apply startup_timeout as a shared deadline covering both the TLS
+        // negotiation AND the subsequent Startup/Auth phase. This prevents
+        // the total handshake time from reaching 2× the configured timeout.
+        let deadline = if deps.startup_timeout.is_zero() {
+            None
         } else {
-            tokio::time::timeout(deps.startup_timeout, negotiate_client_tls(stream, deps.tls_acceptor.as_deref()))
+            Some(tokio::time::Instant::now() + deps.startup_timeout)
+        };
+
+        let client_stream = if let Some(dl) = deadline {
+            tokio::time::timeout_at(dl, negotiate_client_tls(stream, deps.tls_acceptor.as_deref()))
                 .await
                 .map_err(|_| crate::proxy::error::ProxyError::Protocol(
                     crate::protocol::ProtocolError::Malformed("startup timeout exceeded during TLS negotiation".into())
                 ))??
+        } else {
+            negotiate_client_tls(stream, deps.tls_acceptor.as_deref()).await?
         };
+
+        // Compute remaining time for auth phase from the shared deadline.
+        let remaining_startup_timeout = deadline
+            .map(|dl| dl.saturating_duration_since(tokio::time::Instant::now()))
+            .unwrap_or(std::time::Duration::ZERO);
 
         // Load the current node address snapshot for this connection's
         // lifetime. Dynamic add/remove updates the ArcSwap, so new
@@ -358,7 +369,7 @@ where
         .with_lsn_tracking(deps.lsn_tracking.clone())
         .with_slow_query_buffer(deps.slow_queries.clone())
         .with_timeouts(deps.cancel_connect_timeout, deps.client_idle_timeout)
-        .with_startup_timeout(deps.startup_timeout);
+        .with_startup_timeout(remaining_startup_timeout);
         // Wrap the client socket in BufReader+BufWriter so:
         // - Reads are buffered: multiple small protocol messages (Bind +
         //   Execute + Sync) typically arrive in one TCP segment but would
@@ -398,15 +409,26 @@ async fn negotiate_client_tls(
     // Peek at the first 8 bytes to check if it's an SSLRequest.
     // Use MSG_PEEK so the bytes remain in the kernel buffer for the handler
     // if this is NOT an SSLRequest.
+    // Loop until we have 8 bytes — TCP fragmentation may deliver fewer
+    // bytes on the first peek despite a valid SSLRequest being in flight.
     let mut peek_buf = [0u8; 8];
-    let n = stream.peek(&mut peek_buf).await.map_err(|e| {
-        crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-    })?;
-
-    if n < 8 {
-        // Not enough data for any valid startup packet — let the handler
-        // deal with the short read / EOF.
-        return Ok(ClientStream::Plain(stream));
+    loop {
+        let n = stream.peek(&mut peek_buf).await.map_err(|e| {
+            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+        })?;
+        if n == 0 {
+            // EOF before any complete message — plain stream, let handler
+            // deal with the closed connection.
+            return Ok(ClientStream::Plain(stream));
+        }
+        if n >= 8 {
+            break;
+        }
+        // Not enough data yet; sleep briefly and retry. The kernel buffer
+        // will accumulate more bytes from the TCP stream. Using a short
+        // sleep instead of yield_now() prevents busy-spinning if the
+        // client is slow to send its initial message.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 
     let length = i32::from_be_bytes([peek_buf[0], peek_buf[1], peek_buf[2], peek_buf[3]]);

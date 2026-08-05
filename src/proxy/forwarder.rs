@@ -40,6 +40,10 @@ pub struct ExtendedQueryRouteTracker {
     routes: HashMap<String, String>,
 }
 
+/// Maximum number of named prepared statements tracked per session.
+/// Prevents unbounded memory growth from malicious or buggy clients.
+const MAX_TRACKED_STATEMENTS: usize = 10_000;
+
 impl ExtendedQueryRouteTracker {
     pub fn new() -> Self {
         ExtendedQueryRouteTracker {
@@ -48,10 +52,22 @@ impl ExtendedQueryRouteTracker {
     }
 
     /// Records the routing target decided when a `Parse` message for
-    /// `statement_name` was processed.
-    pub fn record_parse_route(&mut self, statement_name: &str, node_id: &str) {
+    /// `statement_name` was processed. Rejects new entries if the cap is
+    /// reached (existing entries for the same name are always updated).
+    pub fn record_parse_route(&mut self, statement_name: &str, node_id: &str) -> bool {
+        if self.routes.len() >= MAX_TRACKED_STATEMENTS
+            && !self.routes.contains_key(statement_name)
+        {
+            tracing::warn!(
+                statement_name,
+                limit = MAX_TRACKED_STATEMENTS,
+                "named statement tracking limit reached, rejecting Parse"
+            );
+            return false;
+        }
         self.routes
             .insert(statement_name.to_string(), node_id.to_string());
+        true
     }
 
     /// Returns the node id that a `Bind`/`Execute` referencing
@@ -154,6 +170,12 @@ pub struct QueryForwardOptions<'a> {
     /// anything else fails the relay before any client-visible bytes are
     /// written.
     pub begin_prefix: Option<&'a str>,
+    /// SET application_name command pipelined in the same outbound write
+    /// as the user query. The response cycle (CommandComplete + ReadyForQuery)
+    /// is consumed internally and never reaches the client. This eliminates
+    /// the extra backend round trip that a standalone `execute_internal_query`
+    /// would require. Expects the backend to remain in Idle state after SET.
+    pub appname_prefix: Option<&'a str>,
 }
 
 impl Default for QueryForwardOptions<'_> {
@@ -163,6 +185,7 @@ impl Default for QueryForwardOptions<'_> {
             extension_guc: None,
             internal_query_timeout: Duration::from_millis(100),
             begin_prefix: None,
+            appname_prefix: None,
         }
     }
 }
@@ -222,13 +245,19 @@ where
     B: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
     C: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut query_bytes = match options.begin_prefix {
+    let mut query_bytes = Vec::new();
+    // Pipeline SET application_name before everything else (zero extra RTT).
+    if let Some(appname_sql) = options.appname_prefix {
+        query_bytes.extend_from_slice(&encode_query(appname_sql));
+    }
+    match options.begin_prefix {
         Some(begin_sql) => {
-            let mut bytes = encode_query(begin_sql);
-            bytes.extend_from_slice(&encode_query(sql));
-            bytes
+            query_bytes.extend_from_slice(&encode_query(begin_sql));
+            query_bytes.extend_from_slice(&encode_query(sql));
         }
-        None => encode_query(sql),
+        None => {
+            query_bytes.extend_from_slice(&encode_query(sql));
+        }
     };
     if options.pipeline_lsn {
         query_bytes.extend_from_slice(&encode_query("SELECT pg_current_wal_lsn()"));
@@ -244,6 +273,35 @@ where
         source: source.into(),
         error_response_relayed: false,
     })?;
+
+    // Consume the pipelined SET application_name response cycle before
+    // relaying anything to the client. The SET produces CommandComplete("SET")
+    // + ReadyForQuery(Idle). If it fails, we log and continue — application_name
+    // is non-critical metadata and must not abort the user's query.
+    if options.appname_prefix.is_some() {
+        loop {
+            let (tag, _body) = read_tagged_frame(backend)
+                .await
+                .map_err(|source| QueryRelayError {
+                    source,
+                    error_response_relayed: false,
+                })?;
+            match tag {
+                b'Z' => {
+                    // SET completed. We accept any status (Idle expected,
+                    // but don't fail the user query if somehow unexpected).
+                    break;
+                }
+                b'E' => {
+                    // SET application_name failed — non-fatal, just drain
+                    // until ReadyForQuery and continue with user query.
+                    tracing::debug!("pipelined SET application_name returned ErrorResponse, continuing");
+                }
+                // CommandComplete("SET"), NoticeResponse, ParameterStatus: suppress.
+                _ => {}
+            }
+        }
+    }
 
     // Consume the pipelined BEGIN's response cycle before relaying the main
     // statement. Nothing from this cycle reaches the client: the proxy

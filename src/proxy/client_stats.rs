@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -81,7 +81,7 @@ impl ClientStats {
     /// signal that per-IP history is being dropped under high IP churn.
     pub fn record_connect(&self, ip: IpAddr) -> bool {
         let now = now_unix_secs();
-        let mut entries = self.entries.lock().expect("client_stats mutex poisoned");
+        let mut entries = self.entries.lock();
 
         if let Some(entry) = entries.get_mut(&ip) {
             entry.active_connections += 1;
@@ -110,7 +110,7 @@ impl ClientStats {
     /// Records that a connection from `ip` was just closed.
     pub fn record_disconnect(&self, ip: IpAddr) {
         let now = now_unix_secs();
-        let mut entries = self.entries.lock().expect("client_stats mutex poisoned");
+        let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(&ip) {
             entry.active_connections = (entry.active_connections - 1).max(0);
             entry.last_seen_unix_secs = now;
@@ -121,14 +121,14 @@ impl ClientStats {
     /// right now. Safe to expose as a Prometheus gauge value directly
     /// (bounded by `proxy.max_clients`).
     pub fn distinct_active_ip_count(&self) -> usize {
-        let entries = self.entries.lock().expect("client_stats mutex poisoned");
+        let entries = self.entries.lock();
         entries.values().filter(|e| e.active_connections > 0).count()
     }
 
     /// Returns a point-in-time snapshot of every tracked IP's stats, for
     /// `GET /client-stats`.
     pub fn snapshot(&self) -> Vec<ClientStatsEntry> {
-        let entries = self.entries.lock().expect("client_stats mutex poisoned");
+        let entries = self.entries.lock();
         entries
             .iter()
             .map(|(ip, e)| ClientStatsEntry {

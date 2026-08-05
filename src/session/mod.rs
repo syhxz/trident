@@ -1,3 +1,4 @@
+#![allow(clippy::module_inception)]
 //! Session and transaction state module (`session`)
 //!
 //! Maintains, per client connection, the consistency level, LSN, the

@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 pub trait LsnTracker: Send + Sync {
     /// Called after a Writer write operation completes, to update the
@@ -57,7 +57,7 @@ impl InMemoryLsnTracker {
 impl LsnTracker for InMemoryLsnTracker {
     fn record_write(&self, session_id: &str, lsn: u64) {
         {
-            let mut map = self.session_lsn.lock().expect("lsn map lock poisoned");
+            let mut map = self.session_lsn.lock();
             let entry = map.entry(session_id.to_string()).or_insert(0);
             if lsn > *entry {
                 *entry = lsn;
@@ -83,14 +83,12 @@ impl LsnTracker for InMemoryLsnTracker {
     fn remove_session(&self, session_id: &str) {
         self.session_lsn
             .lock()
-            .expect("lsn map lock poisoned")
             .remove(session_id);
     }
 
     fn session_write_lsn(&self, session_id: &str) -> u64 {
         self.session_lsn
             .lock()
-            .expect("lsn map lock poisoned")
             .get(session_id)
             .copied()
             .unwrap_or(0)

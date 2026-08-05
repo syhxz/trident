@@ -9,10 +9,11 @@
 //! threshold.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use parking_lot::{Mutex, RwLock};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -83,11 +84,14 @@ impl HealthCheckResult {
             return false;
         }
         match (node_type, self.is_in_recovery) {
-            // Writer must NOT be a standby
+            // Writer must NOT be a standby — require explicit confirmation
             (NodeType::Writer, Some(true)) => false,
-            // Reader must be a standby
+            // Writer with unknown recovery state: fail-closed to prevent
+            // routing writes to a standby that hasn't been confirmed as primary.
+            (NodeType::Writer, None) => false,
+            // Reader must be in recovery
             (NodeType::Reader, Some(false)) => false,
-            // Analytics, or is_in_recovery unknown: accept basic success
+            // Reader/Analytics with unknown state or correct state: accept
             _ => true,
         }
     }
@@ -560,11 +564,11 @@ impl<P: HealthProbe> HealthChecker<P> {
     /// `run`) according to the "3 consecutive failures/successes" rule.
     pub async fn check_once(&self, node_id: &str) -> Option<HealthCheckResult> {
         let node_type = {
-            let nodes = self.nodes.lock().expect("nodes lock poisoned");
+            let nodes = self.nodes.lock();
             nodes.get(node_id)?.node_type
         };
         let probe = {
-            let probes = self.probes.read().expect("probes lock poisoned");
+            let probes = self.probes.read();
             probes.get(node_id)?.clone()
         };
 
@@ -580,7 +584,7 @@ impl<P: HealthProbe> HealthChecker<P> {
 
     fn apply_result(&self, node_id: &str, result: HealthCheckResult) {
         let node_type = {
-            let nodes = self.nodes.lock().expect("nodes lock poisoned");
+            let nodes = self.nodes.lock();
             nodes.get(node_id).map(|n| n.node_type)
         };
 
@@ -597,7 +601,7 @@ impl<P: HealthProbe> HealthChecker<P> {
         )
         .increment(1);
 
-        let mut nodes = self.nodes.lock().expect("nodes lock poisoned");
+        let mut nodes = self.nodes.lock();
         if let Some(node) = nodes.get_mut(node_id) {
             let was_healthy = node.state.healthy();
             node.state.observe(success);
@@ -636,8 +640,8 @@ impl<P: HealthProbe> HealthChecker<P> {
         P: 'static,
     {
         let checks: Vec<_> = {
-            let nodes = self.nodes.lock().expect("nodes lock poisoned");
-            let probes = self.probes.read().expect("probes lock poisoned");
+            let nodes = self.nodes.lock();
+            let probes = self.probes.read();
             probes
                 .iter()
                 .filter_map(|(node_id, probe)| {
@@ -676,7 +680,7 @@ impl<P: HealthProbe> HealthChecker<P> {
 
     /// Rebuilds the cached snapshot from the current node state.
     fn refresh_cached_snapshot(&self) {
-        let nodes = self.nodes.lock().expect("nodes lock poisoned");
+        let nodes = self.nodes.lock();
         let snap: Vec<BackendNodeSnapshot> = nodes
             .iter()
             .map(|(node_id, node)| {
@@ -706,7 +710,19 @@ impl<P: HealthProbe> HealthChecker<P> {
     where
         P: 'static,
     {
-        let mut ticker = tokio::time::interval(interval);
+        // Defense-in-depth: config validation should reject zero, but if
+        // a zero duration somehow reaches here, use a safe fallback to
+        // avoid tokio::time::interval panic.
+        let safe_interval = if interval.is_zero() {
+            tracing::error!(
+                "health check interval is zero (should have been caught by config validation), \
+                 falling back to 3s"
+            );
+            Duration::from_secs(3)
+        } else {
+            interval
+        };
+        let mut ticker = tokio::time::interval(safe_interval);
         loop {
             ticker.tick().await;
             self.check_all_and_update().await;
@@ -725,7 +741,7 @@ impl<P: HealthProbe> HealthChecker<P> {
     /// The node starts in unhealthy state until the first successful probe.
     /// Returns `false` if a node with the same `node_id` already exists.
     pub fn add_node(&self, node_id: String, node_type: NodeType, weight: u32, probe: P) -> bool {
-        let mut nodes = self.nodes.lock().expect("nodes lock poisoned");
+        let mut nodes = self.nodes.lock();
         if nodes.contains_key(&node_id) {
             return false;
         }
@@ -741,7 +757,7 @@ impl<P: HealthProbe> HealthChecker<P> {
         );
         drop(nodes);
 
-        let mut probes = self.probes.write().expect("probes lock poisoned");
+        let mut probes = self.probes.write();
         probes.insert(node_id.clone(), Arc::new(probe));
         drop(probes);
 
@@ -761,7 +777,7 @@ impl<P: HealthProbe> HealthChecker<P> {
     /// Removes a node with an optional last-writer safety check.
     /// Returns `Err(reason)` if the node cannot be removed.
     pub fn remove_node_checked(&self, node_id: &str, prevent_last_writer: bool) -> Result<(), &'static str> {
-        let mut nodes = self.nodes.lock().expect("nodes lock poisoned");
+        let mut nodes = self.nodes.lock();
 
         if !nodes.contains_key(node_id) {
             return Err("node does not exist");
@@ -780,7 +796,7 @@ impl<P: HealthProbe> HealthChecker<P> {
         nodes.remove(node_id);
         drop(nodes);
 
-        let mut probes = self.probes.write().expect("probes lock poisoned");
+        let mut probes = self.probes.write();
         probes.remove(node_id);
         drop(probes);
 

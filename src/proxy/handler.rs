@@ -32,6 +32,7 @@ use crate::protocol::message::{BackendMessage, FrontendMessage, PgError, Transac
 use crate::protocol::reader::{frontend_tag, parse_frontend_body, read_tagged_frame};
 use crate::protocol::startup::{read_startup_packet, AuthOutcome, StartupHandler, StartupPacket};
 use crate::protocol::writer::encode_backend_message;
+use crate::protocol::writer::encode_query;
 use crate::protocol::ProtocolError;
 use crate::proxy::error::{proxy_error_to_pg_error, ProxyError};
 use crate::proxy::forwarder::{
@@ -80,6 +81,17 @@ pub struct ClientSession {
     /// Client credentials captured during passthrough authentication. When
     /// present, pool lookups use `pool_for_user` instead of `pool_for`.
     client_credentials: Option<crate::protocol::startup::ClientCredentials>,
+    /// Caches the per-node pool references resolved during this session's
+    /// lifetime. Used during cleanup to release connections back to the
+    /// exact pool they were acquired from, avoiding the ambiguous
+    /// prefix-match in `pool_for_user_existing` when multiple parameter
+    /// pools exist for the same (node, user, database).
+    resolved_pools: HashMap<String, Arc<dyn ConnectionPool>>,
+    /// Enriched application_name containing client IP for backend audit
+    /// trail. SET on the backend after each fresh connection checkout so
+    /// pg_stat_activity always shows the real client origin regardless of
+    /// connection pooling. Reset by DISCARD ALL on release.
+    application_name: String,
 }
 
 /// A backend connection checked out exclusively by this client. It is
@@ -195,6 +207,8 @@ impl ClientSession {
             extended_route_tracker: ExtendedQueryRouteTracker::new(),
             unnamed_parse_node: None,
             client_credentials: None,
+            resolved_pools: HashMap::new(),
+            application_name: String::new(),
         }
     }
 }
@@ -385,12 +399,13 @@ where
     /// has passthrough credentials, or the shared service-account pool
     /// otherwise. This is the single dispatch point so all 30+ call sites
     /// of `pool_for` benefit from passthrough support automatically.
+    /// Also caches the resolved pool in the session for exact cleanup later.
     fn resolve_pool(
         &self,
         node_id: &str,
-        session: &ClientSession,
+        session: &mut ClientSession,
     ) -> Option<Arc<dyn ConnectionPool>> {
-        if let Some(creds) = &session.client_credentials {
+        let pool = if let Some(creds) = &session.client_credentials {
             self.pool_manager.pool_for_user(
                 node_id,
                 &creds.username,
@@ -400,17 +415,29 @@ where
             )
         } else {
             self.pool_manager.pool_for(node_id)
+        };
+        // Cache the resolved pool so cleanup can find the exact pool
+        // without ambiguous prefix matching.
+        if let Some(ref p) = pool {
+            session.resolved_pools.insert(node_id.to_string(), Arc::clone(p));
         }
+        pool
     }
 
     /// Like `resolve_pool` but never creates a new per-user pool. Used
     /// during session cleanup where we only need to release connections
     /// from an existing pool, not trigger creation of a new one.
+    /// Checks the session's resolved_pools cache first for an exact match.
     fn resolve_pool_existing(
         &self,
         node_id: &str,
         session: &ClientSession,
     ) -> Option<Arc<dyn ConnectionPool>> {
+        // Prefer cached exact reference — avoids the ambiguous prefix match
+        // in pool_for_user_existing when multiple parameter pools exist.
+        if let Some(pool) = session.resolved_pools.get(node_id) {
+            return Some(Arc::clone(pool));
+        }
         if let Some(creds) = &session.client_credentials {
             // Look up without creating. If the pool was evicted, any
             // session bindings in it are already gone (Arc dropped), so
@@ -419,6 +446,7 @@ where
                 node_id,
                 &creds.username,
                 creds.database.as_deref(),
+                &creds.extra_params,
             )
         } else {
             self.pool_manager.pool_for(node_id)
@@ -500,12 +528,20 @@ where
             // client and abort — the client never sees AuthenticationOk.
             if let Some(ref creds) = auth_outcome.client_credentials {
                 let all_nodes = self.pool_manager.snapshot();
-                let writer_node = all_nodes.iter().find(|n| {
-                    n.node_type == NodeType::Writer && n.healthy
-                });
-                if let Some(writer) = writer_node {
+
+                // Prefer Writer for credential verification (authoritative
+                // source). During failover the Writer may be unhealthy; fall
+                // back to any healthy Reader since streaming replicas share
+                // the same pg_authid catalog and can validate passwords
+                // identically (authentication only reads pg_authid, no
+                // writes required). Fail-closed when no node is available.
+                let verify_node = all_nodes.iter()
+                    .find(|n| n.node_type == NodeType::Writer && n.healthy)
+                    .or_else(|| all_nodes.iter().find(|n| n.node_type == NodeType::Reader && n.healthy));
+
+                if let Some(node) = verify_node {
                     let pool = self.pool_manager.pool_for_user(
-                        &writer.node_id,
+                        &node.node_id,
                         &creds.username,
                         &creds.password,
                         creds.database.as_deref(),
@@ -532,7 +568,7 @@ where
                                     // Remove the pool from the map so it doesn't
                                     // pollute future attempts with correct credentials.
                                     self.pool_manager.remove_user_pool(
-                                        &writer.node_id,
+                                        &node.node_id,
                                         &creds.username,
                                         creds.database.as_deref(),
                                         &creds.extra_params,
@@ -540,6 +576,7 @@ where
                                     metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
                                     tracing::warn!(
                                         username = %creds.username,
+                                        node_id = %node.node_id,
                                         error = %pool_err,
                                         "passthrough credential verification failed against backend"
                                     );
@@ -563,6 +600,7 @@ where
                             metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
                             tracing::warn!(
                                 username = %creds.username,
+                                node_id = %node.node_id,
                                 "passthrough: no pool available for credential verification"
                             );
                             let pg_err = PgError::simple(
@@ -577,10 +615,26 @@ where
                             return Ok(None);
                         }
                     }
+                } else {
+                    // No healthy node at all (neither Writer nor Reader) —
+                    // fail closed. Use SQLSTATE 57P03 (cannot_connect_now) so
+                    // client drivers recognize this as transient/retryable.
+                    metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
+                    tracing::warn!(
+                        username = %creds.username,
+                        "passthrough: no healthy node available for credential verification, rejecting"
+                    );
+                    let pg_err = PgError::simple(
+                        "FATAL",
+                        "57P03",
+                        "authentication unavailable: no healthy backend for credential verification, retry shortly",
+                    );
+                    send_pg_error_response(&mut client_stream, pg_err).await?;
+                    client_stream.flush().await.map_err(|e| {
+                        ProxyError::Protocol(ProtocolError::Io(e))
+                    })?;
+                    return Ok(None);
                 }
-                // If no healthy Writer exists, allow startup to proceed —
-                // the client will get errors on first query anyway, matching
-                // behavior for non-passthrough modes with no healthy backends.
             }
 
             send_startup_success(&mut client_stream, &auth_outcome).await?;
@@ -611,31 +665,30 @@ where
 
         let mut session = ClientSession::new(session_id.clone(), default_consistency);
 
-        // Store client credentials for passthrough pool lookups
+        // Store client credentials for passthrough pool lookups.
         session.client_credentials = auth_outcome.client_credentials.clone();
 
-        // Inject client IP into application_name for backend audit trail.
-        // In passthrough mode, the backend's pg_stat_activity and audit logs
-        // only see the proxy's IP. By prepending the real client IP to
-        // application_name, DBAs can trace queries back to the originator.
-        // Format: "client_ip:original_app_name" or just "client_ip" if none.
-        if let Some(ref mut creds) = session.client_credentials {
-            // Extract client IP from session_id (format: "session-N-IP:PORT")
+        // Compute the enriched application_name for this client session.
+        // This will be SET on the backend after each fresh connection checkout,
+        // ensuring pg_stat_activity always reflects the real client IP
+        // regardless of pool sharing in Transaction mode.
+        {
             let client_ip = session_id
                 .rsplit_once('-')
                 .and_then(|(_, addr)| addr.rsplit_once(':'))
                 .map(|(ip, _port)| ip)
                 .unwrap_or("unknown");
-            let original_app = creds.extra_params
-                .get("application_name")
+            let original_app = session.client_credentials
+                .as_ref()
+                .and_then(|c| c.extra_params.get("application_name"))
                 .cloned()
                 .unwrap_or_default();
-            let enriched_app = if original_app.is_empty() {
+            let sanitized_app = sanitize_application_name(&original_app);
+            session.application_name = if sanitized_app.is_empty() {
                 format!("trident:{}", client_ip)
             } else {
-                format!("trident:{}:{}", client_ip, original_app)
+                format!("trident:{}:{}", client_ip, sanitized_app)
             };
-            creds.extra_params.insert("application_name".to_string(), enriched_app);
         }
 
         // Register the cancel key this proxy just issued to the client (in
@@ -972,10 +1025,27 @@ where
                 route_sql = Some(sql);
                 force_writer = true;
             }
-            // Check routing hint
-            if !force_writer && hint_parser.parse_hint(sql) == RouteHint::ForceWriter {
-                route_sql = Some(sql);
-                force_writer = true;
+            // Check routing hints — ForceWriter wins over ForceReader.
+            // When ForceWriter is triggered, route_sql is set to that SQL
+            // so the Router receives the hint. When ForceReader is triggered
+            // (and no Writer is needed), route_sql is set to the ForceReader
+            // SQL so the Router picks it up.
+            if !force_writer {
+                let hint = hint_parser.parse_hint(sql);
+                match hint {
+                    RouteHint::ForceWriter => {
+                        route_sql = Some(sql);
+                        force_writer = true;
+                    }
+                    RouteHint::ForceReader
+                        if !requires_writer(&classifier, route_sql.unwrap_or("")) =>
+                    {
+                        // Only set route_sql to ForceReader SQL if we haven't
+                        // already committed to a Writer-bound SQL.
+                        route_sql = Some(sql);
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -1144,6 +1214,18 @@ where
             (conn, socket)
         };
 
+        // SET application_name is pipelined with the extended batch below —
+        // the Simple Query frame is prepended to the outbound bytes and its
+        // response cycle is drained before relaying user responses.
+        let appname_sql_ext = if !session.application_name.is_empty() {
+            Some(format!(
+                "SET application_name = '{}'",
+                session.application_name.replace('\'', "''")
+            ))
+        } else {
+            None
+        };
+
         // A named prepared statement lives on this physical connection, not
         // on the node. In Transaction pool mode the connection would
         // otherwise be released and later Bind/Execute could land on a
@@ -1195,7 +1277,16 @@ where
 
         // Send all buffered raw frames + Sync to the backend in one write.
         // No re-encoding: the bytes the client sent are forwarded verbatim.
-        let outbound = assemble_extended_outbound(batch);
+        // If SET application_name is needed, prepend it as a Simple Query
+        // frame so it's sent in the same write (zero extra RTT).
+        let outbound = match appname_sql_ext {
+            Some(ref appname) => {
+                let mut buf = encode_query(appname);
+                buf.extend_from_slice(&assemble_extended_outbound(batch));
+                buf
+            }
+            None => assemble_extended_outbound(batch),
+        };
 
         self.cancel_registry.mark_active(
             &session.state.id,
@@ -1215,6 +1306,31 @@ where
             pool.discard(conn)?;
             drop(backend_socket);
             return Err(ProxyError::Protocol(e.into()));
+        }
+
+        // Drain the pipelined SET application_name response cycle
+        // (CommandComplete + ReadyForQuery) before relaying extended protocol
+        // responses. Non-fatal: if it errors, log and continue.
+        if appname_sql_ext.is_some() {
+            loop {
+                let (tag, _body) = match read_tagged_frame(&mut backend_socket).await {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "failed to drain pipelined SET application_name response");
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        drop(backend_socket);
+                        return Err(ProxyError::Protocol(e));
+                    }
+                };
+                match tag {
+                    b'Z' => break, // ReadyForQuery — SET cycle complete
+                    b'E' => {
+                        tracing::debug!("pipelined SET application_name returned ErrorResponse in extended path");
+                    }
+                    _ => {} // CommandComplete("SET"), ParameterStatus, etc.
+                }
+            }
         }
 
         // Relay backend responses until ReadyForQuery.
@@ -1775,6 +1891,7 @@ where
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
                 begin_prefix: None,
+                appname_prefix: None,
             },
         )
         .await;
@@ -2228,6 +2345,7 @@ where
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
                 begin_prefix: None,
+                appname_prefix: None,
             },
         )
         .await;
@@ -2645,11 +2763,13 @@ where
             }
         }
 
+        let freshly_checked_out;
         let (mut conn, mut backend_socket) = if let Some(held) = session.held_backend.take() {
             // PostgreSQL transaction and session state is connection-local.
             // Once held, route decisions may not move the session to a
             // different physical backend until the transaction ends (or
             // the session itself closes).
+            freshly_checked_out = false;
             (held.conn, held.socket)
         } else {
             let target_pool = match self.resolve_pool(&target_node_id, session) {
@@ -2703,6 +2823,11 @@ where
                     ));
                 }
             };
+
+            // SET application_name is pipelined with the user query below
+            // (via QueryForwardOptions::appname_prefix) — no separate roundtrip.
+            freshly_checked_out = true;
+
             (conn, socket)
         };
 
@@ -2767,6 +2892,16 @@ where
             && pipeline_safe_sql(sql)
             && ((prior_tx_state == TxState::Idle && write_intent) || commit_attempt);
 
+        // Build pipelined SET application_name for freshly checked-out connections.
+        let appname_sql = if freshly_checked_out && !session.application_name.is_empty() {
+            Some(format!(
+                "SET application_name = '{}'",
+                session.application_name.replace('\'', "''")
+            ))
+        } else {
+            None
+        };
+
         // Requirements 7.1-7.3: mark this session as having a query in
         // flight against this exact real backend connection *before*
         // sending it, and always clear that mark once the round trip
@@ -2789,6 +2924,7 @@ where
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
                 begin_prefix: delayed_begin,
+                appname_prefix: appname_sql.as_deref(),
             },
         )
         .await;
@@ -3068,6 +3204,17 @@ fn pipeline_safe_sql(sql: &str) -> bool {
         && !normalized.starts_with("COPY")
         && !normalized.contains(" AND CHAIN")
         && !normalized.contains(" AND NO CHAIN")
+}
+
+/// Sanitizes an application_name string for safe use in a SET statement.
+/// Retains only characters safe for SQL string literals, preventing
+/// injection via backslash sequences (when standard_conforming_strings = off)
+/// or other special characters. Limits length to 128 chars.
+fn sanitize_application_name(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_alphanumeric() || " _-.:@[]()/#".contains(*c))
+        .take(128)
+        .collect()
 }
 
 fn aurora_consistency_sql(consistency: ConsistencyLevel) -> String {

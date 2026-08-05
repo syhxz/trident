@@ -172,6 +172,11 @@ pub trait ConnectionPool: Send + Sync {
     async fn validate_idle(&self) -> usize {
         0
     }
+
+    /// Puts the pool into draining mode: new acquires are rejected,
+    /// existing connections continue until released. Used during dynamic
+    /// node removal to gracefully wind down in-flight work.
+    fn drain(&self) {}
 }
 
 /// Runtime controls for a single node pool. Durations are applied lazily
@@ -475,6 +480,11 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     }
 
     async fn acquire_session_mode(&self, session_id: &str) -> Result<PooledConnection, PoolError> {
+        // Check draining state — reject new session bindings during drain.
+        if self.draining.load(Ordering::SeqCst) {
+            return Err(PoolError::Exhausted(format!("{} (draining)", self.node_id)));
+        }
+
         {
             let bindings = self.session_bindings.lock();
             if let Some(conn) = bindings.get(session_id) {
@@ -778,6 +788,11 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
 
     async fn validate_idle(&self) -> usize {
         self.validate_idle_connections().await
+    }
+
+    fn drain(&self) {
+        self.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(node_id = %self.node_id, "pool entering drain mode (trait)");
     }
 }
 

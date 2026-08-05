@@ -630,17 +630,24 @@ impl AppConfig {
         }
 
         // health.check_interval must not parse to zero; a zero interval
-        // creates a tight spin loop that saturates CPU and panics
-        // tokio::time::interval.
-        if self.health.check_interval == "0"
-            || self.health.check_interval == "0s"
-            || self.health.check_interval == "0ms"
-            || self.health.check_interval == "0m"
-            || self.health.check_interval == "0h"
+        // creates a tight spin loop that saturates CPU and panics in
+        // tokio::time::interval. Check the parsed numeric value rather than
+        // literal strings to catch variants like "00s", "000ms", " 0s", etc.
         {
-            return Err(ConfigError::Validation(
-                "health.check_interval must be greater than 0".to_string(),
-            ));
+            let check_val = self.health.check_interval.trim();
+            let is_zero_duration = check_val
+                .strip_suffix("ms")
+                .or_else(|| check_val.strip_suffix('s'))
+                .or_else(|| check_val.strip_suffix('m'))
+                .or_else(|| check_val.strip_suffix('h'))
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .map(|n| n == 0)
+                .unwrap_or(check_val == "0");
+            if is_zero_duration {
+                return Err(ConfigError::Validation(
+                    "health.check_interval must be greater than 0".to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -1060,6 +1067,33 @@ mod tests {
     #[test]
     fn valid_config_passes_validation() {
         assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn zero_health_check_interval_variants_rejected() {
+        // All of these parse to Duration::ZERO and must be caught.
+        let zero_variants = ["0", "0s", "0ms", "0m", "0h", "00s", "000ms", " 0s", "00h"];
+        for variant in zero_variants {
+            let mut cfg = valid_config();
+            cfg.health.check_interval = variant.to_string();
+            let result = cfg.validate();
+            assert!(
+                matches!(result, Err(ConfigError::Validation(ref msg)) if msg.contains("check_interval")),
+                "expected rejection for check_interval = {:?}, got {:?}",
+                variant,
+                result,
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_health_check_interval_accepted() {
+        let mut cfg = valid_config();
+        cfg.health.check_interval = "1s".to_string();
+        assert!(cfg.validate().is_ok());
+
+        cfg.health.check_interval = "100ms".to_string();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

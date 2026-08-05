@@ -1,3 +1,4 @@
+#![allow(clippy::module_inception)]
 //! Connection pool module (`pool`)
 //!
 //! Handles establishing backend connections, pool management, connection

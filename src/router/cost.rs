@@ -7,7 +7,7 @@
 //! See design.md section 10 and Requirements 10.1-10.5.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -328,7 +328,7 @@ impl<M: PatternMatcher + Send + Sync, E: ExplainRunner> DefaultCostEstimator<M, 
 
     /// Number of distinct query templates currently cached (test/introspection helper).
     pub fn cache_len(&self) -> usize {
-        self.cache.lock().expect("cost cache lock poisoned").len()
+        self.cache.lock().len()
     }
 }
 
@@ -343,7 +343,7 @@ impl<M: PatternMatcher + Send + Sync, E: ExplainRunner> CostEstimator for Defaul
         // Requirement 10.4: reuse a cached decision for the same query template.
         let template = normalize_query_template(sql);
         {
-            let cache = self.cache.lock().expect("cost cache lock poisoned");
+            let cache = self.cache.lock();
             if let Some(cost) = cache.get(&template) {
                 return Ok(*cost);
             }
@@ -352,7 +352,7 @@ impl<M: PatternMatcher + Send + Sync, E: ExplainRunner> CostEstimator for Defaul
         // Requirement 10.2: fall back to EXPLAIN-based cost estimation.
         let cost = self.explain_runner.explain_cost(sql).await?;
 
-        let mut cache = self.cache.lock().expect("cost cache lock poisoned");
+        let mut cache = self.cache.lock();
         if cache.len() < MAX_COST_CACHE_ENTRIES {
             cache.entry(template).or_insert(cost);
         }

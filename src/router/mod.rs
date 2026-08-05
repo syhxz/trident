@@ -1,3 +1,4 @@
+#![allow(clippy::module_inception)]
 //! Router module (`router`)
 //!
 //! Combines hints, transaction state, SQL classification, cost estimation,
