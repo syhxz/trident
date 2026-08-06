@@ -53,6 +53,9 @@ pub struct HealthCheckResult {
     /// The Reader node's replay LSN (`None` means not applicable or
     /// could not be obtained)
     pub replay_lsn: Option<u64>,
+    /// The Writer node's current WAL LSN (`pg_current_wal_lsn()`).
+    /// Used to compute LSN-based replication lag for Reader nodes.
+    pub current_wal_lsn: Option<u64>,
     /// The Reader node's replication lag (milliseconds)
     pub replication_lag_ms: Option<u64>,
     /// Whether this check is treated as a failure due to timing out
@@ -253,7 +256,11 @@ impl HealthProbe for WireProtocolHealthProbe {
             result.is_in_recovery = Some(in_recovery);
         }
 
-        if node_type == NodeType::Reader {
+        if node_type == NodeType::Writer {
+            if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
+                result.current_wal_lsn = Some(lsn);
+            }
+        } else if node_type == NodeType::Reader {
             if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
                 result.replay_lsn = Some(lsn);
             }
@@ -449,6 +456,13 @@ async fn query_replay_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(value.and_then(|v| parse_lsn(&v)))
 }
 
+async fn query_current_wal_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+) -> Result<Option<u64>, ()> {
+    let value = run_simple_query_first_column(stream, "SELECT pg_current_wal_lsn()").await?;
+    Ok(value.and_then(|v| parse_lsn(&v)))
+}
+
 async fn query_replication_lag_ms<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
 ) -> Result<Option<u64>, ()> {
@@ -482,6 +496,8 @@ struct TrackedNode {
     weight: u32,
     state: HealthStateMachine,
     last_replay_lsn: u64,
+    /// Writer: last known `pg_current_wal_lsn()` value.
+    last_current_wal_lsn: u64,
     last_replication_lag_ms: Option<u64>,
 }
 
@@ -531,6 +547,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                     weight,
                     state: HealthStateMachine::with_threshold(true, threshold),
                     last_replay_lsn: 0,
+                    last_current_wal_lsn: 0,
                     last_replication_lag_ms: None,
                 },
             );
@@ -618,6 +635,9 @@ impl<P: HealthProbe> HealthChecker<P> {
             if let Some(lsn) = result.replay_lsn {
                 node.last_replay_lsn = lsn;
             }
+            if let Some(lsn) = result.current_wal_lsn {
+                node.last_current_wal_lsn = lsn;
+            }
             node.last_replication_lag_ms = result.replication_lag_ms;
         }
     }
@@ -681,12 +701,58 @@ impl<P: HealthProbe> HealthChecker<P> {
     /// Rebuilds the cached snapshot from the current node state.
     fn refresh_cached_snapshot(&self) {
         let nodes = self.nodes.lock();
+
+        // Collect the maximum writer WAL LSN across all writer nodes.
+        let writer_wal_lsn: u64 = nodes
+            .values()
+            .filter(|n| n.node_type == NodeType::Writer)
+            .map(|n| n.last_current_wal_lsn)
+            .max()
+            .unwrap_or(0);
+
         let snap: Vec<BackendNodeSnapshot> = nodes
             .iter()
             .map(|(node_id, node)| {
+                // Compute LSN-based lag for Reader nodes. If the writer
+                // LSN is known (non-zero) and the reader has reported a
+                // replay LSN, use the byte difference. This is immune to
+                // the "idle writer" false-positive that plagues the
+                // timestamp-based approach.
+                let effective_lag_ms = if node.node_type == NodeType::Reader {
+                    if writer_wal_lsn > 0 && node.last_replay_lsn > 0 {
+                        let lsn_diff = writer_wal_lsn.saturating_sub(node.last_replay_lsn);
+                        if lsn_diff == 0 {
+                            // LSN fully caught up — override any stale
+                            // timestamp-based lag value.
+                            Some(0)
+                        } else {
+                            // Use the timestamp-based lag if available
+                            // (it gives a time dimension), but cap it: if
+                            // LSN diff is tiny (< 16 MB) and timestamp lag
+                            // is huge, it means the writer has been idle
+                            // and the timestamp is misleading — use 0.
+                            let lsn_lag_threshold = 16 * 1024 * 1024; // 16 MB
+                            if lsn_diff < lsn_lag_threshold {
+                                // Small LSN gap — likely just idle writer,
+                                // not real lag.
+                                Some(0)
+                            } else {
+                                // Genuine lag — use the timestamp value if
+                                // available, otherwise estimate from bytes.
+                                node.last_replication_lag_ms
+                            }
+                        }
+                    } else {
+                        // No writer LSN data yet — fall back to timestamp
+                        node.last_replication_lag_ms
+                    }
+                } else {
+                    None
+                };
+
                 let excluded_by_lag = node.node_type == NodeType::Reader
                     && is_excluded_by_replication_lag(
-                        node.last_replication_lag_ms,
+                        effective_lag_ms,
                         self.max_replication_lag_ms,
                     );
                 BackendNodeSnapshot {
@@ -696,7 +762,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                     replay_lsn: node.last_replay_lsn,
                     active_connections: 0,
                     weight: node.weight,
-                    replication_lag_ms: node.last_replication_lag_ms,
+                    replication_lag_ms: effective_lag_ms,
                 }
             })
             .collect();
@@ -752,6 +818,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                 weight,
                 state: HealthStateMachine::with_threshold(false, self.health_threshold),
                 last_replay_lsn: 0,
+                last_current_wal_lsn: 0,
                 last_replication_lag_ms: None,
             },
         );
@@ -953,6 +1020,7 @@ mod tests {
             select_1_ok: true,
             is_in_recovery: Some(true),
             replay_lsn: Some(100),
+            current_wal_lsn: None,
             replication_lag_ms: Some(50),
             timed_out: false,
         };
@@ -986,6 +1054,7 @@ mod tests {
             select_1_ok: true,
             is_in_recovery: Some(true),
             replay_lsn: Some(100),
+            current_wal_lsn: None,
             replication_lag_ms: Some(5000),
             timed_out: false,
         };

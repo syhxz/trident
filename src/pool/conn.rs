@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -106,6 +106,52 @@ impl PooledConnection {
             created_at: Instant::now(),
             idle_since: None,
         }
+    }
+}
+
+/// The buffer size used for wrapping backend sockets in `BufReader`.
+pub const BACKEND_READ_BUF_SIZE: usize = 8 * 1024;
+
+/// A complete backend connection: metadata + live socket. This is the unit
+/// that flows through the pool: `acquire()` returns one, `release()` takes
+/// one back. No external registry lookup needed on the hot path.
+pub struct BackendConnection {
+    pub meta: PooledConnection,
+    pub stream: BufReader<MaybeTlsStream>,
+    /// The node generation at the time this connection was created. Used
+    /// to reject stale connections after a dynamic node removal.
+    pub generation: u64,
+    /// Cached application_name currently SET on this backend. When the
+    /// next checkout's required appname matches this, the pipelined SET
+    /// can be skipped entirely.
+    pub current_application_name: Option<String>,
+}
+
+impl BackendConnection {
+    pub fn new(meta: PooledConnection, stream: MaybeTlsStream, generation: u64) -> Self {
+        use tokio::io::BufReader;
+        BackendConnection {
+            meta,
+            stream: BufReader::with_capacity(BACKEND_READ_BUF_SIZE, stream),
+            generation,
+            current_application_name: None,
+        }
+    }
+
+    /// Shorthand access to metadata fields.
+    #[inline]
+    pub fn node_id(&self) -> &str {
+        &self.meta.node_id
+    }
+
+    #[inline]
+    pub fn backend_pid(&self) -> i32 {
+        self.meta.backend_pid
+    }
+
+    #[inline]
+    pub fn secret_key(&self) -> i32 {
+        self.meta.secret_key
     }
 }
 

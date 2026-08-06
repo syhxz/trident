@@ -56,6 +56,14 @@ use crate::session::transaction::{
 pub struct ClientSession {
     pub state: SessionState,
     held_backend: Option<HeldBackend>,
+    /// Cached idle backend from the previous autocommit query. When the
+    /// next autocommit query routes to the same node, this connection is
+    /// reused directly — skipping pool.acquire + registry.take +
+    /// registry.insert + pool.release (4 mutex operations). Released when:
+    /// - Next query routes to a different node
+    /// - Session enters an explicit transaction (BEGIN)
+    /// - Session closes
+    cached_idle_backend: Option<HeldBackend>,
     /// A successful write has occurred in the current explicit transaction.
     tx_has_writes: bool,
     /// A committed write has no captured WAL watermark yet. The first read
@@ -199,6 +207,7 @@ impl ClientSession {
         ClientSession {
             state: SessionState::new(session_id, default_consistency),
             held_backend: None,
+            cached_idle_backend: None,
             tx_has_writes: false,
             pending_write: false,
             extension_detected: false,
@@ -209,6 +218,16 @@ impl ClientSession {
             client_credentials: None,
             resolved_pools: HashMap::new(),
             application_name: String::new(),
+        }
+    }
+
+    /// Takes the cached idle backend if it matches the given node_id.
+    /// Returns `None` if no cache exists or node_id doesn't match.
+    fn take_cached_if_matches(&mut self, node_id: &str) -> Option<HeldBackend> {
+        if self.cached_idle_backend.as_ref().is_some_and(|h| h.conn.node_id == node_id) {
+            self.cached_idle_backend.take()
+        } else {
+            None
         }
     }
 }
@@ -450,6 +469,19 @@ where
             )
         } else {
             self.pool_manager.pool_for(node_id)
+        }
+    }
+
+    /// Returns the cached idle backend to the pool and registry. Called
+    /// when the next query routes to a different node, or when an explicit
+    /// transaction begins, or at session close.
+    async fn release_cached_backend(&self, session: &mut ClientSession) {
+        if let Some(held) = session.cached_idle_backend.take() {
+            self.connection_registry
+                .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                let _ = pool.release(&session.state.id, held.conn).await;
+            }
         }
     }
 
@@ -716,6 +748,15 @@ where
                 }
             }
             drop(held.socket);
+        }
+
+        // Release cached idle backend cleanly (it's in a good state).
+        if let Some(held) = session.cached_idle_backend.take() {
+            self.connection_registry
+                .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
+                let _ = pool.release(&session.state.id, held.conn).await;
+            }
         }
 
         // Release metadata still owned by Session-mode bindings or by the
@@ -1200,7 +1241,13 @@ where
                 target_node_id.clone(),
             ))
         })?;
-        let (mut conn, mut backend_socket) = {
+        let (mut conn, mut backend_socket) = if let Some(cached) = session.take_cached_if_matches(&target_node_id) {
+            // Fast path: reuse cached idle connection.
+            (cached.conn, cached.socket)
+        } else {
+            // Release any cached connection to a different node.
+            self.release_cached_backend(session).await;
+
             let conn = pool.acquire(&session.state.id).await?;
             let socket = self
                 .connection_registry
@@ -1498,21 +1545,14 @@ where
         // Return or hold the backend connection.
         if session.state.tx_state != TxState::Idle || conn.pinned {
             session.held_backend = Some(HeldBackend { conn, socket: backend_socket });
-        } else {
-            // Connection returned to pool: the unnamed statement that was
-            // parsed on it still logically "exists" for this session's
-            // lifetime (the client may try to Bind("") in the next batch).
-            // However, since the physical connection is going back to the
-            // pool, a cross-Sync Bind("") would land on a *different*
-            // connection that doesn't have it. We KEEP unnamed_parse_node
-            // set so the cross-Sync rejection (line ~833) fires correctly.
-            // It is only cleared by:
-            //   - A new unnamed Parse (overwrites in update_unnamed_parse_tracking)
-            //   - Explicit Close('S', "") from the client
-            //   - Session end
+        } else if conn.dirty {
+            // Dirty connections cannot be cached — must go through cleaner.
             self.connection_registry
                 .insert(&conn.node_id, conn.backend_pid, backend_socket);
             pool.release(&session.state.id, conn).await?;
+        } else {
+            // Cache for reuse by the next query in this session.
+            session.cached_idle_backend = Some(HeldBackend { conn, socket: backend_socket });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -2771,7 +2811,17 @@ where
             // the session itself closes).
             freshly_checked_out = false;
             (held.conn, held.socket)
+        } else if let Some(cached) = session.take_cached_if_matches(&target_node_id) {
+            // Fast path: reuse the cached idle connection from the
+            // previous autocommit query to the same node. Skips
+            // pool.acquire + registry.take (2 mutex locks avoided).
+            freshly_checked_out = false;
+            (cached.conn, cached.socket)
         } else {
+            // Release any cached connection to a different node before
+            // acquiring from the target pool.
+            self.release_cached_backend(session).await;
+
             let target_pool = match self.resolve_pool(&target_node_id, session) {
                 Some(pool) => pool,
                 None => {
@@ -3013,14 +3063,21 @@ where
                 conn,
                 socket: backend_socket,
             });
-        } else {
-            // At an idle transaction boundary, return a clean reusable
-            // connection to the registry/pool. In Session mode `release`
-            // intentionally retains the binding while the socket remains
-            // registered for this same session's next acquire.
+        } else if conn.dirty {
+            // Dirty connections cannot be cached — must go through the
+            // cleaner (DISCARD ALL) via pool.release.
             self.connection_registry
                 .insert(&conn.node_id, conn.backend_pid, backend_socket);
             pool.release(&session.state.id, conn).await?;
+        } else {
+            // Cache this clean idle connection for potential reuse by the
+            // next query in this session. Avoids pool.release +
+            // registry.insert + registry.take + pool.acquire on the next
+            // query if it routes to the same node.
+            session.cached_idle_backend = Some(HeldBackend {
+                conn,
+                socket: backend_socket,
+            });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await?;
