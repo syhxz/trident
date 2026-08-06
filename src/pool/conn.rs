@@ -1,16 +1,13 @@
 //! Backend connection wrapper (`conn`)
 //!
-//! Defines `PooledConnection` metadata, and the logic for establishing a
-//! physical connection to a backend node and completing authentication.
+//! Defines the complete pooled backend connection and the logic for
+//! establishing and authenticating its physical socket.
 //!
-//! Note: `PooledConnection` (consistent with design.md) contains only the
-//! connection's logical metadata (`node_id`/`backend_pid`/`secret_key`/
-//! `pinned`/`dirty`) and does not hold the actual `TcpStream`.
-//! `establish_connection` establishes the real physical connection and
-//! completes the authentication handshake, then returns the connection
-//! metadata and the underlying socket separately; the layer above
-//! (Proxy/Handler, see task 15) is responsible for associating the two
-//! for actual message forwarding.
+//! `PooledConnection` contains logical metadata. `BackendConnection` is the
+//! ownership unit used by the pool and bundles that metadata with the live
+//! socket, node generation, and backend `application_name` cache. The socket
+//! is never stored in a separate registry or split from its metadata on the
+//! query hot path.
 
 use std::collections::HashMap;
 use std::io;
@@ -115,6 +112,7 @@ pub const BACKEND_READ_BUF_SIZE: usize = 8 * 1024;
 /// A complete backend connection: metadata + live socket. This is the unit
 /// that flows through the pool: `acquire()` returns one, `release()` takes
 /// one back. No external registry lookup needed on the hot path.
+#[derive(Debug)]
 pub struct BackendConnection {
     pub meta: PooledConnection,
     pub stream: BufReader<MaybeTlsStream>,
@@ -152,6 +150,20 @@ impl BackendConnection {
     #[inline]
     pub fn secret_key(&self) -> i32 {
         self.meta.secret_key
+    }
+}
+
+impl std::ops::Deref for BackendConnection {
+    type Target = PooledConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.meta
+    }
+}
+
+impl std::ops::DerefMut for BackendConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.meta
     }
 }
 
@@ -476,6 +488,35 @@ async fn send_query(stream: &mut MaybeTlsStream, sql: &str) -> Result<(), std::i
     use tokio::io::AsyncWriteExt;
     let bytes = encode_query(sql);
     stream.write_all(&bytes).await
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use super::{BackendConnection, MaybeTlsStream, PooledConnection};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Creates a complete backend connection backed by a local TCP pair.
+    /// The peer is kept alive by a detached task until the connection closes.
+    pub async fn mock_backend_connection(
+        node_id: &str,
+        backend_pid: i32,
+    ) -> BackendConnection {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr);
+        let (accepted, client) = tokio::join!(listener.accept(), client);
+        let (mut peer, _) = accepted.unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = [0_u8; 256];
+            while peer.read(&mut buffer).await.unwrap_or(0) != 0 {}
+        });
+        BackendConnection::new(
+            PooledConnection::new(node_id, backend_pid, backend_pid * 1000),
+            MaybeTlsStream::Plain(client.unwrap()),
+            0,
+        )
+    }
 }
 
 #[cfg(test)]

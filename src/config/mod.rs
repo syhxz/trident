@@ -719,6 +719,10 @@ fn is_valid_host_port(addr: &str) -> bool {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::sync::Mutex;
+
+    /// Guard that serializes tests which mutate process-wide environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ---------------------------------------------------------------------
     // Test helper: builds a valid baseline configuration that individual
@@ -1011,6 +1015,7 @@ mod tests {
 
     #[test]
     fn loads_example_config_yaml_successfully() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use the repository root's example config.yaml to verify the
         // successful-load scenario. The example now sources each node's
         // password from a "${ENV_VAR}" placeholder (see NodeConfig's
@@ -1313,6 +1318,7 @@ mod tests {
 
     #[test]
     fn load_from_file_substitutes_env_var_placeholder_in_password() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TRIDENT_TEST_CFG_PW", "env-secret");
         let yaml = minimal_yaml(
             "    password: \"${TRIDENT_TEST_CFG_PW}\"\n",
@@ -1332,6 +1338,7 @@ mod tests {
 
     #[test]
     fn load_from_file_falls_back_to_pgpass_when_password_omitted() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pgpass_path = write_temp_yaml(
             "127.0.0.1:5432:mydb:proxy_user:pgpass-secret\n",
             "pgpassfile",
@@ -1351,6 +1358,7 @@ mod tests {
 
     #[test]
     fn load_from_file_fails_when_no_password_source_resolves() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing_pgpass = std::env::temp_dir().join(format!(
             "trident-test-missing-pgpass-{}.conf",
             std::process::id()
@@ -1370,6 +1378,7 @@ mod tests {
 
     #[test]
     fn load_from_file_fails_when_referenced_env_var_is_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("TRIDENT_TEST_CFG_PW_UNSET");
         let yaml = minimal_yaml(
             "    password: \"${TRIDENT_TEST_CFG_PW_UNSET}\"\n",

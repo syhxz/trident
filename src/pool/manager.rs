@@ -119,10 +119,6 @@ pub struct InMemoryPoolManager {
     /// haven't yet inserted into user_pools. Used to prevent concurrent
     /// bypass of max_user_pools.
     pending_pool_creates: std::sync::atomic::AtomicUsize,
-    /// Optional reference to the connection registry, used to close sockets
-    /// when pools are evicted or removed. Without this, eviction only drops
-    /// pool metadata while sockets linger in the registry.
-    connection_registry: Option<Arc<crate::proxy::registry::ConnectionRegistry>>,
 }
 
 /// Allows the pool manager to notify the UserPoolFactory of node changes.
@@ -236,7 +232,6 @@ impl InMemoryPoolManager {
             node_config_updater: None,
             max_user_pools: 0,
             pending_pool_creates: std::sync::atomic::AtomicUsize::new(0),
-            connection_registry: None,
         }
     }
 
@@ -245,12 +240,6 @@ impl InMemoryPoolManager {
     /// Value of 0 means unlimited.
     pub fn set_user_pool_limits(&mut self, max_pools: usize) {
         self.max_user_pools = max_pools;
-    }
-
-    /// Sets the connection registry reference so eviction can close
-    /// the physical sockets associated with removed pools.
-    pub fn set_connection_registry(&mut self, registry: Arc<crate::proxy::registry::ConnectionRegistry>) {
-        self.connection_registry = Some(registry);
     }
 
     /// Installs a `UserPoolFactory` to enable per-user pool creation
@@ -285,8 +274,7 @@ impl InMemoryPoolManager {
         let now = std::time::Instant::now();
         let mut pools = self.user_pools.lock();
         let before = pools.len();
-        let registry = self.connection_registry.as_ref();
-        pools.retain(|key, entry| {
+        pools.retain(|_key, entry| {
             let idle_duration = now.duration_since(entry.last_access);
             if idle_duration < max_idle {
                 return true; // Recently accessed — keep
@@ -300,15 +288,8 @@ impl InMemoryPoolManager {
             if checked_out > 0 {
                 return true; // Still has checked-out connections — keep
             }
-            // Evicting: close all physical sockets in the registry that
-            // belong to this pool, so FDs are actually freed.
-            if let Some(reg) = registry {
-                // Extract node_id from key (format: "node_id\0user\0db\0params")
-                let node_id = key.split('\0').next().unwrap_or("");
-                for pid in entry.pool.known_pids() {
-                    reg.remove(node_id, pid);
-                }
-            }
+            // Dropping the pool drops every idle BackendConnection and closes
+            // its socket. Checked-out connections keep the pool alive via Arc.
             false // evict
         });
         before - pools.len()
@@ -487,14 +468,12 @@ impl PoolManager for InMemoryPoolManager {
                 );
                 if let Some(old_entry) = pools.remove(&key) {
                     old_entry.pool.drain();
-                    // Close sockets for idle connections in the old pool
-                    if let Some(reg) = &self.connection_registry {
-                        let old_node = key.split('\0').next().unwrap_or("");
-                        for pid in old_entry.pool.known_pids() {
-                            reg.remove(old_node, pid);
-                        }
-                    }
                 }
+                // Replacement creation also reserves an in-flight slot so
+                // pending accounting cannot underflow and concurrent creates
+                // cannot bypass the global cap.
+                self.pending_pool_creates
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             } else {
                 // New pool needed — check limit while still holding the lock.
                 // Include pending (in-flight) creations in the count to
@@ -529,7 +508,6 @@ impl PoolManager for InMemoryPoolManager {
                 return None;
             }
         };
-        self.pending_pool_creates.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         let pool_arc: Arc<dyn ConnectionPool> = Arc::from(new_pool);
 
         let mut pools = self.user_pools.lock();
@@ -542,6 +520,8 @@ impl PoolManager for InMemoryPoolManager {
                 // Same password — reuse the existing pool (our freshly
                 // created one will be dropped).
                 existing.last_access = now;
+                self.pending_pool_creates
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 return Some(Arc::clone(&existing.pool));
             }
             // Password mismatch: another concurrent request created a pool
@@ -552,6 +532,8 @@ impl PoolManager for InMemoryPoolManager {
                     username,
                     "concurrent pool creation race with password mismatch, rejecting (cooldown active)"
                 );
+                self.pending_pool_creates
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 return None;
             }
             // Cooldown expired — replace with our pool (ours has the newer password)
@@ -568,7 +550,19 @@ impl PoolManager for InMemoryPoolManager {
                 password_hash: pw_hash,
                 replace_cooldown_until: now + POOL_REPLACE_COOLDOWN,
             };
+            self.pending_pool_creates
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             return Some(Arc::clone(&pool_arc));
+        }
+
+        // Re-check that the node still exists — it may have been removed
+        // concurrently between the initial check and pool creation. Without
+        // this, a zombie user pool could be inserted for a deleted node.
+        if self.pools.load().get(node_id).is_none() {
+            pool_arc.drain();
+            self.pending_pool_creates
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return None;
         }
 
         // No existing entry — insert ours.
@@ -578,6 +572,8 @@ impl PoolManager for InMemoryPoolManager {
             password_hash: pw_hash,
             replace_cooldown_until: now + POOL_REPLACE_COOLDOWN,
         });
+        self.pending_pool_creates
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         Some(pool_arc)
     }
 
@@ -625,16 +621,9 @@ impl PoolManager for InMemoryPoolManager {
         let key = format!("{}\0{}\0{}\0{}", node_id, username, db, params_key);
         let mut pools = self.user_pools.lock();
         if let Some(old_entry) = pools.remove(&key) {
-            // Drain the old pool so in-flight sessions can finish but no
-            // new connections are handed out.
+            // Draining prevents new checkouts; dropping the final pool Arc
+            // drops all idle BackendConnections and closes their sockets.
             old_entry.pool.drain();
-            // Close sockets for idle connections in the old pool to prevent
-            // resource leaks (socket FDs, capacity slots).
-            if let Some(reg) = &self.connection_registry {
-                for pid in old_entry.pool.known_pids() {
-                    reg.remove(node_id, pid);
-                }
-            }
         }
     }
 
@@ -701,7 +690,7 @@ pub fn emit_pool_metrics(snapshot: &[BackendNodeSnapshot], max_pool_size: u32) {
 mod tests {
     use super::*;
     use crate::config::{NodeType, PoolMode};
-    use crate::pool::conn::PooledConnection;
+    use crate::pool::conn::{test_utils::mock_backend_connection, BackendConnection};
     use crate::pool::pool::{ConnCleaner, ConnFactory, NodePool, PoolError};
     use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -710,15 +699,15 @@ mod tests {
     }
 
     impl ConnFactory for CountingFactory {
-        async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+        async fn create(&self, node_id: &str) -> Result<BackendConnection, PoolError> {
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
-            Ok(PooledConnection::new(node_id, pid, pid * 1000))
+            Ok(mock_backend_connection(node_id, pid).await)
         }
     }
 
     struct NoopCleaner;
     impl ConnCleaner for NoopCleaner {
-        async fn clean(&self, _conn: &PooledConnection) -> Result<(), PoolError> {
+        async fn clean(&self, _conn: &mut BackendConnection) -> Result<(), PoolError> {
             Ok(())
         }
     }

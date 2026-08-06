@@ -158,14 +158,33 @@ graph TB
 <div class="card">
 <table>
 <tr><th>组件</th><th>职责</th><th>关键接口</th></tr>
-<tr><td><strong>ConnectionHandler</strong></td><td>单客户端会话全生命周期：Startup → 消息循环 → 清理</td><td><code>handle()</code></td></tr>
+<tr><td><strong>ConnectionHandler</strong></td><td>单客户端会话全生命周期：Startup → 消息循环 → 清理；查询期间移动并独占一个完整后端连接</td><td><code>handle()</code></td></tr>
 <tr><td><strong>Router</strong></td><td>串联 Hint → 事务状态 → SQL分类 → Cost → 一致性检查 → 负载均衡</td><td><code>route(sql, ctx, readers, analytics)</code></td></tr>
-<tr><td><strong>PoolManager</strong></td><td>按节点管理连接池，Session/Transaction 两种模式</td><td><code>pool_for(node_id)</code>, <code>snapshot()</code></td></tr>
+<tr><td><strong>PoolManager</strong></td><td>按节点管理连接池；idle、Session binding 和 pinned 队列直接拥有完整连接</td><td><code>pool_for(node_id)</code>, <code>snapshot()</code></td></tr>
+<tr><td><strong>BackendConnection</strong></td><td>物理连接所有权单元：metadata + socket + node generation + <code>application_name</code> 缓存</td><td><code>conn.stream</code>, <code>conn.generation</code></td></tr>
+<tr><td><strong>ConnectionRegistry</strong></td><td>仅跟踪动态节点 generation；不保存 socket，也不参与查询热路径</td><td><code>generation_for(node_id)</code></td></tr>
 <tr><td><strong>HealthChecker</strong></td><td>周期性并发探活，连续3次规则触发状态翻转</td><td><code>check_once()</code>, <code>run()</code></td></tr>
 <tr><td><strong>LsnTracker</strong></td><td>Session 级 + Global 级 WAL 水位单调维护</td><td><code>record_write()</code>, <code>session_write_lsn()</code></td></tr>
-<tr><td><strong>Forwarder</strong></td><td>流式消息转发，Pipeline LSN 获取，Extension GUC 捕获</td><td><code>forward_simple_query_with_options()</code></td></tr>
-<tr><td><strong>CancelRegistry</strong></td><td>CANCEL 请求的 key→session→backend 映射</td><td><code>resolve_cancel_target()</code></td></tr>
+<tr><td><strong>Forwarder</strong></td><td>通过 <code>&amp;mut conn.stream</code> 流式转发消息，执行 Pipeline LSN 获取和 Extension GUC 捕获</td><td><code>forward_simple_query_with_options()</code></td></tr>
+<tr><td><strong>CancelRegistry</strong></td><td>CANCEL 请求的 key→session→backend 映射；与连接所有权 registry 独立</td><td><code>resolve_cancel_target()</code></td></tr>
 </table>
+</div>
+
+<div class="card">
+<p class="card-title">后端连接所有权与查询热路径</p>
+<div class="mermaid">
+flowchart LR
+    H["ConnectionHandler"] -->|"acquire()"| P["NodePool<br/>idle / session / pinned"]
+    P -->|"move out"| C["BackendConnection<br/>metadata + socket + generation<br/>application_name cache"]
+    C -->|"&amp;mut conn.stream"| IO["PG Wire 直接转发"]
+    IO -->|"release(conn)"| P
+    C -->|"discard / drain / drop"| Close["关闭自有 socket"]
+    G["ConnectionRegistry<br/>仅 node generation"] -.->|"动态节点替换"| P
+</div>
+<p>连接池 checkout 返回完整的 <code>BackendConnection</code>，Handler 直接在其 socket 上读写，再把同一个对象移回连接池；不再按 <code>(node_id, backend_pid)</code> 执行 <code>ConnectionRegistry::take/insert</code>。Transaction 模式的 idle 队列、Session binding 和 pinned 队列都保存完整连接，Session checkout 使用 move-out/move-back，不复制连接。</p>
+<div class="note">
+<strong>生命周期保证</strong>：draining pool 会拒绝新 checkout、唤醒 waiter，并丢弃随后归还或刚创建完成的连接。清理成功后会清空 <code>application_name</code> 缓存；设置新标签失败时查询不会继续执行。连接或 pool 被 drop 时，其拥有的 socket 自动关闭。
+</div>
 </div>
 
 <!-- ============================================================ -->

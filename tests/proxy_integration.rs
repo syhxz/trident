@@ -55,7 +55,7 @@ use trident::pool::manager::InMemoryPoolManager;
 use trident::pool::pool::ConnectionPool;
 use trident::protocol::message::FrontendMessage;
 use trident::protocol::startup::TrustStartupHandler;
-use trident::proxy::registry::{CancelRegistry, ConnectionRegistry, DiscardAllCleaner, LiveConnFactory};
+use trident::proxy::registry::{CancelRegistry, DiscardAllCleaner, LiveConnFactory};
 use trident::proxy::server::{ProxyDeps, ProxyServer};
 use trident::router::consistency::LsnConsistencyChecker;
 use trident::router::cost::{DefaultCostEstimator, NoOpExplainRunner};
@@ -126,7 +126,6 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         health_checker_bg.run(Duration::from_secs(3)).await;
     });
 
-    let registry = Arc::new(ConnectionRegistry::new());
     let connect_target = ConnectTarget {
         host: "127.0.0.1".to_string(),
         port: writer_port,
@@ -138,10 +137,9 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
     };
     let factory = LiveConnFactory {
         target: connect_target,
-        registry: registry.clone(),
         generation: 0,
     };
-    let cleaner = DiscardAllCleaner::new(registry.clone());
+    let cleaner = DiscardAllCleaner::new();
     let mut pools: std::collections::HashMap<String, Box<dyn ConnectionPool>> = std::collections::HashMap::new();
     pools.insert(
         "primary".to_string(),
@@ -185,7 +183,6 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         router,
         pool_manager,
         lsn_tracker,
-        connection_registry: registry,
         cancel_registry,
         node_addresses,
         default_consistency: Arc::new(arc_swap::ArcSwap::new(Arc::new(ConsistencyLevel::Session))),
@@ -197,6 +194,7 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         startup_timeout: std::time::Duration::ZERO,
         client_idle_timeout: std::time::Duration::ZERO,
         cancel_connect_timeout: std::time::Duration::from_secs(5),
+        connection_registry: Arc::new(trident::proxy::registry::ConnectionRegistry::new()),
     };
 
     tokio::spawn(async move {

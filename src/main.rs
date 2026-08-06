@@ -99,7 +99,7 @@ impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
 }
 
 /// Coordinates dynamic node addition/removal across the HealthChecker,
-/// PoolManager, and ConnectionRegistry at runtime.
+/// PoolManager, and node-generation tracker at runtime.
 struct LiveNodeManager {
     health_checker: Arc<HealthChecker<WireProtocolHealthProbe>>,
     pool_manager: Arc<InMemoryPoolManager>,
@@ -114,10 +114,6 @@ struct LiveNodeManager {
 #[async_trait::async_trait]
 impl admin::NodeManager for LiveNodeManager {
     async fn add_node(&self, config: trident::config::NodeConfig) -> Result<(), String> {
-        // Allow inserts for this node (in case it was previously removed
-        // and the registry is blocking re-insertion).
-        self.connection_registry.allow_node(&config.name);
-
         // Validate: check connectivity first
         let probe = WireProtocolHealthProbe {
             target: ProbeTarget {
@@ -140,6 +136,10 @@ impl admin::NodeManager for LiveNodeManager {
             return Err(format!("node '{}' already exists", config.name));
         }
 
+        // Only advance generation after duplicate detection succeeds. This
+        // keeps the existing node's factory token valid on a failed add.
+        let generation = self.connection_registry.allow_node(&config.name);
+
         // Create and warm up the connection pool
         let target = ConnectTarget {
             host: config.host.clone(),
@@ -152,11 +152,9 @@ impl admin::NodeManager for LiveNodeManager {
         };
         let factory = LiveConnFactory {
             target,
-            registry: self.connection_registry.clone(),
-            generation: self.connection_registry.node_generation(&config.name),
+            generation,
         };
-        let cleaner = DiscardAllCleaner::new(self.connection_registry.clone())
-            .with_check_query(self.check_query.clone());
+        let cleaner = DiscardAllCleaner::new().with_check_query(self.check_query.clone());
         let pool = NodePool::with_settings(
             config.name.clone(),
             self.pool_mode,
@@ -177,7 +175,7 @@ impl admin::NodeManager for LiveNodeManager {
         // Add pool to manager
         if !self.pool_manager.add_pool(config.name.clone(), Box::new(pool)) {
             // Should not happen since we checked health_checker first,
-            // but handle gracefully. Clean up registered sockets too.
+            // but handle gracefully and invalidate this generation.
             self.health_checker.remove_node(&config.name);
             self.connection_registry.remove_by_node(&config.name);
             return Err(format!("node '{}' pool already exists", config.name));
@@ -231,9 +229,8 @@ impl admin::NodeManager for LiveNodeManager {
             Arc::new(new_map)
         });
 
-        // Drain idle sockets for this node from the connection registry
-        // to prevent FD leaks. In-flight connections will be discarded
-        // naturally when their handler completes.
+        // Invalidate factories from the removed node incarnation. Draining
+        // pools discard in-flight connections when they are released.
         self.connection_registry.remove_by_node(node_id);
 
         tracing::info!(node = %node_id, "dynamically removed backend node");
@@ -416,11 +413,10 @@ async fn run(
         };
         let factory = LiveConnFactory {
             target,
-            registry: registry.clone(),
             generation: registry.node_generation(&node.name),
         };
-        let cleaner = DiscardAllCleaner::new(registry.clone())
-            .with_check_query(config.pool.check_query.clone());
+        let cleaner =
+            DiscardAllCleaner::new().with_check_query(config.pool.check_query.clone());
         let pool = NodePool::with_settings(
             node.name.clone(),
             config.pool.mode,
@@ -508,11 +504,10 @@ async fn run(
                 };
                 let factory = LiveConnFactory {
                     target,
-                    registry: self.registry.clone(),
                     generation: self.registry.node_generation(node_id),
                 };
-                let cleaner = DiscardAllCleaner::new(self.registry.clone())
-                    .with_check_query(self.check_query.clone());
+                let cleaner =
+                    DiscardAllCleaner::new().with_check_query(self.check_query.clone());
                 // Per-user pools use min_pool_size=0 (no prewarming since
                 // we cannot predict which users will connect) and a smaller
                 // max_pool_size to prevent total connection explosion.
@@ -587,7 +582,6 @@ async fn run(
         tracing::info!("credential passthrough mode enabled: per-user pools will be created on demand");
     }
 
-    pool_manager.set_connection_registry(registry.clone());
     pool_manager.set_user_pool_limits(config.pool.max_user_pools);
     let pool_manager = Arc::new(pool_manager);
 
@@ -697,7 +691,6 @@ async fn run(
         router: router.clone(),
         pool_manager: pool_manager.clone(),
         lsn_tracker,
-        connection_registry: registry.clone(),
         cancel_registry,
         node_addresses: node_addresses.clone(),
         default_consistency: default_consistency.clone(),
@@ -709,6 +702,7 @@ async fn run(
         startup_timeout: parse_duration_or(&config.proxy.startup_timeout, Duration::from_secs(30)),
         client_idle_timeout: parse_duration_or(&config.proxy.client_idle_timeout, Duration::ZERO),
         cancel_connect_timeout: parse_duration_or(&config.proxy.cancel_connect_timeout, Duration::from_secs(5)),
+        connection_registry: registry.clone(),
     };
 
     // --- Background task: per-node connection pool / replication lag

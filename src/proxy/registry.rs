@@ -1,216 +1,73 @@
 //! Connection registry (`registry`)
 //!
-//! `pool::PooledConnection` is deliberately metadata-only (node_id,
-//! backend_pid, secret_key, pinned, dirty) and does not hold the actual
-//! `TcpStream` -- see `pool::conn` module docs. This module provides the
-//! glue the Proxy layer needs to associate pooled connection metadata with
-//! its live socket:
+//! Backend connection construction, cleanup, generation tracking, and cancel
+//! routing support.
 //!
-//! - `ConnectionRegistry`: a map from `(node_id, backend_pid)` to the
-//!   underlying `TcpStream`, safe to use because the pool guarantees a given
-//!   `PooledConnection` is never handed out to more than one caller at a
-//!   time (so `take`/`insert` never race for the same key).
-//! - `LiveConnFactory`: a `ConnFactory` that establishes a real physical
-//!   connection and registers its socket.
-//! - `DiscardAllCleaner`: a `ConnCleaner` that runs `DISCARD ALL` against the
-//!   registered socket before a dirty connection is returned to the pool.
-//! - `CancelRegistry`: implements correct single-instance handling of
-//!   PostgreSQL `CancelRequest` (Requirements 7.1-7.3). It maps the cancel
-//!   key a client was issued at Startup time (the `BackendKeyData` this
-//!   *proxy* sent it, not the real backend's) to the session that holds
-//!   it, and separately tracks which real backend connection (if any) that
-//!   session currently has a query in flight against. A `CancelRequest` is
-//!   only ever forwarded when both lookups succeed, matching PostgreSQL's
-//!   semantics of silently ignoring stale/unknown cancel keys and CANCELs
-//!   that arrive when the target session has no active query.
-//! - `NodeAddress` + `send_cancel_request`: CANCEL requests must be sent to
-//!   the backend over a brand-new TCP connection (never the session's
-//!   existing connection), per the wire protocol spec.
+//! Live sockets are owned by `pool::BackendConnection`; this module does not
+//! maintain a socket map. `ConnectionRegistry` now tracks only low-frequency
+//! per-node generations used to invalidate factories during dynamic node
+//! replacement. `CancelRegistry` independently tracks PostgreSQL cancel keys.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::pool::conn::{establish_connection, ConnError, ConnectTarget, MaybeTlsStream, PooledConnection};
+use crate::pool::conn::{establish_connection, BackendConnection, ConnError, ConnectTarget};
 use crate::pool::pool::{ConnCleaner, ConnFactory, PoolError, DISCARD_ALL_STATEMENT};
 use crate::protocol::message::{BackendMessage, FrontendMessage};
 use crate::protocol::reader::read_backend_message;
 use crate::protocol::writer::{encode_frontend_message, encode_query};
 
-/// A backend socket wrapped in a `BufReader` to reduce read syscalls.
-/// Multiple small protocol messages (BindComplete + CommandComplete +
-/// ReadyForQuery) typically arrive in one TCP segment; without buffering,
-/// each requires 3 separate `read_exact` syscalls. With an 8KB buffer,
-/// a single syscall reads an entire response cycle from the kernel buffer.
-///
-/// `BufReader<MaybeTlsStream>` implements both `AsyncRead` (buffered) and
-/// `AsyncWrite` (passed through directly to the inner stream).
-pub type BackendStream = BufReader<MaybeTlsStream>;
-
-const BACKEND_READ_BUF_SIZE: usize = 8 * 1024;
-
-/// Maps `(node_id, backend_pid)` to the live `BackendStream` for that backend
-/// connection. Uses a per-node generation counter to prevent stale handlers
-/// from re-inserting sockets for nodes that have been dynamically removed
-/// and re-added.
+/// Low-frequency node generation tracker. Connections capture the generation
+/// of the factory that created them; draining the old pool drops stale
+/// connections instead of returning them to a replacement pool.
 #[derive(Default)]
 pub struct ConnectionRegistry {
-    sockets: Mutex<HashMap<(String, i32), BackendStream>>,
-    /// Per-node generation counter. Incremented on each `remove_by_node`.
-    /// `allow_node` increments again so the new generation differs from
-    /// any in-flight inserts that captured the pre-remove generation.
-    /// Inserts carry a generation token and are rejected if it doesn't
-    /// match the current generation for that node.
     node_generations: Mutex<HashMap<String, u64>>,
 }
 
 impl ConnectionRegistry {
     pub fn new() -> Self {
-        ConnectionRegistry {
-            sockets: Mutex::new(HashMap::new()),
-            node_generations: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
-    /// Returns the current generation for a node. Callers (ConnFactory)
-    /// should capture this at connection-creation time and pass it back
-    /// to `insert_with_generation` to ensure stale connections from a
-    /// previous generation are rejected.
     pub fn node_generation(&self, node_id: &str) -> u64 {
-        let gens = self.node_generations.lock();
-        gens.get(node_id).copied().unwrap_or(0)
+        self.node_generations
+            .lock()
+            .get(node_id)
+            .copied()
+            .unwrap_or(0)
     }
 
-    pub fn insert(&self, node_id: &str, backend_pid: i32, stream: BackendStream) {
-        // Unconditional insert — used by code paths that don't track
-        // generations (e.g. legacy or non-passthrough paths). For
-        // generation-aware inserts, use `insert_with_generation`.
-        let mut sockets = self.sockets.lock();
-        sockets.insert((node_id.to_string(), backend_pid), stream);
-    }
-
-    /// Generation-aware insert. Rejects the socket if the node's current
-    /// generation doesn't match the one captured at connection-creation
-    /// time (meaning the node was removed and possibly re-added since).
-    pub fn insert_with_generation(
-        &self,
-        node_id: &str,
-        backend_pid: i32,
-        stream: BackendStream,
-        expected_generation: u64,
-    ) {
-        let gens = self.node_generations.lock();
-        let current_gen = gens.get(node_id).copied().unwrap_or(0);
-        if current_gen != expected_generation {
-            tracing::debug!(
-                node_id,
-                backend_pid,
-                current_gen,
-                expected_generation,
-                "rejecting socket insert for stale node generation"
-            );
-            return;
-        }
-        let mut sockets = self.sockets.lock();
-        sockets.insert((node_id.to_string(), backend_pid), stream);
-    }
-
-    /// Wraps a raw `MaybeTlsStream` in a `BufReader` and inserts it into the
-    /// registry. Used when a new physical connection is established.
-    pub fn insert_raw(&self, node_id: &str, backend_pid: i32, stream: MaybeTlsStream) {
-        self.insert(
-            node_id,
-            backend_pid,
-            BufReader::with_capacity(BACKEND_READ_BUF_SIZE, stream),
-        );
-    }
-
-    /// Generation-aware variant of `insert_raw`. Rejects the socket if the
-    /// node's current generation doesn't match the expected generation
-    /// (meaning the node was removed since this connection was initiated).
-    pub fn insert_raw_with_generation(
-        &self,
-        node_id: &str,
-        backend_pid: i32,
-        stream: MaybeTlsStream,
-        expected_generation: u64,
-    ) {
-        self.insert_with_generation(
-            node_id,
-            backend_pid,
-            BufReader::with_capacity(BACKEND_READ_BUF_SIZE, stream),
-            expected_generation,
-        );
-    }
-
-    /// Removes and returns the socket for the given connection identity, if
-    /// present. The caller is responsible for reinserting it via `insert`
-    /// once finished using it (unless the connection is being discarded).
-    pub fn take(&self, node_id: &str, backend_pid: i32) -> Option<BackendStream> {
-        let mut sockets = self.sockets.lock();
-        sockets.remove(&(node_id.to_string(), backend_pid))
-    }
-
-    /// Removes and drops the socket for the given connection identity
-    /// (used when a connection is being discarded rather than reused).
-    pub fn remove(&self, node_id: &str, backend_pid: i32) {
-        let mut sockets = self.sockets.lock();
-        sockets.remove(&(node_id.to_string(), backend_pid));
-    }
-
-    /// Removes and drops ALL sockets belonging to a given node and marks
-    /// the node as removed. Subsequent `insert` calls for this node are
-    /// silently rejected, preventing stale in-flight handlers from
-    /// re-inserting sockets after a dynamic node removal.
+    /// Invalidates factories and connections from the current incarnation.
     pub fn remove_by_node(&self, node_id: &str) {
-        // Increment generation so any in-flight insert_with_generation
-        // calls carrying the old generation are rejected.
-        let mut gens = self.node_generations.lock();
-        let gen = gens.entry(node_id.to_string()).or_insert(0);
-        *gen += 1;
-        // Purge all sockets for this node.
-        let mut sockets = self.sockets.lock();
-        sockets.retain(|(n, _), _| n != node_id);
+        let mut generations = self.node_generations.lock();
+        *generations.entry(node_id.to_string()).or_insert(0) += 1;
     }
 
-    /// Re-enables inserts for a node_id. Called when a node is
-    /// dynamically (re-)added after having been previously removed.
-    /// Increments generation again so stale handlers from the previous
-    /// incarnation cannot pollute the re-added node.
-    pub fn allow_node(&self, node_id: &str) {
-        let mut gens = self.node_generations.lock();
-        let gen = gens.entry(node_id.to_string()).or_insert(0);
-        *gen += 1;
+    /// Starts a new node incarnation and returns its generation token.
+    pub fn allow_node(&self, node_id: &str) -> u64 {
+        let mut generations = self.node_generations.lock();
+        let generation = generations.entry(node_id.to_string()).or_insert(0);
+        *generation += 1;
+        *generation
     }
 }
 
-/// `ConnFactory` that establishes a real physical connection to a backend
-/// node and registers its socket in a shared `ConnectionRegistry`.
+/// `ConnFactory` that establishes and returns a complete backend connection.
 pub struct LiveConnFactory {
     pub target: ConnectTarget,
-    pub registry: Arc<ConnectionRegistry>,
-    /// The node generation at the time this factory was created. Used to
-    /// prevent stale socket insertion after a node removal race: if the
-    /// node was removed (generation incremented) while a connection was
-    /// being established, the insert will be rejected.
     pub generation: u64,
 }
 
 impl ConnFactory for LiveConnFactory {
-    async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+    async fn create(&self, node_id: &str) -> Result<BackendConnection, PoolError> {
         let (meta, stream) = establish_connection(node_id, &self.target)
             .await
             .map_err(conn_error_to_pool_error)?;
-        self.registry.insert_raw_with_generation(
-            node_id,
-            meta.backend_pid,
-            stream,
-            self.generation,
-        );
-        Ok(meta)
+        Ok(BackendConnection::new(meta, stream, self.generation))
     }
 }
 
@@ -218,20 +75,17 @@ fn conn_error_to_pool_error(e: ConnError) -> PoolError {
     PoolError::ConnectFailed(e.to_string())
 }
 
-/// `ConnCleaner` that runs `DISCARD ALL` against the connection's registered
-/// socket before it is returned to the pool's idle queue. Also supports
-/// periodic validation of idle connections via a configurable check query.
+/// `ConnCleaner` that operates directly on the socket owned by a pooled
+/// `BackendConnection`.
 pub struct DiscardAllCleaner {
-    pub registry: Arc<ConnectionRegistry>,
     /// Query used to validate idle connections. Default: "SELECT 1".
     /// Set to empty string to disable validation.
     pub check_query: String,
 }
 
 impl DiscardAllCleaner {
-    pub fn new(registry: Arc<ConnectionRegistry>) -> Self {
+    pub fn new() -> Self {
         DiscardAllCleaner {
-            registry,
             check_query: "SELECT 1".to_string(),
         }
     }
@@ -242,87 +96,74 @@ impl DiscardAllCleaner {
     }
 }
 
+impl Default for DiscardAllCleaner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnCleaner for DiscardAllCleaner {
-    async fn clean(&self, conn: &PooledConnection) -> Result<(), PoolError> {
-        let mut stream = self
-            .registry
-            .take(&conn.node_id, conn.backend_pid)
-            .ok_or_else(|| {
-                PoolError::CleanupFailed("connection socket missing from registry".into())
-            })?;
-
-        // Capture the node generation before cleaning. If the node is
-        // removed while DISCARD ALL is in flight, the generation will
-        // advance and we'll drop the socket instead of re-inserting it
-        // (preventing stale sockets from polluting a re-added node).
-        let gen_before = self.registry.node_generation(&conn.node_id);
-
+    async fn clean(&self, conn: &mut BackendConnection) -> Result<(), PoolError> {
         let bytes = encode_query(DISCARD_ALL_STATEMENT);
-        if let Err(e) = stream.write_all(&bytes).await {
-            return Err(PoolError::CleanupFailed(e.to_string()));
-        }
-        if let Err(e) = stream.flush().await {
-            return Err(PoolError::CleanupFailed(e.to_string()));
-        }
+        conn.stream
+            .write_all(&bytes)
+            .await
+            .map_err(|error| PoolError::CleanupFailed(error.to_string()))?;
+        conn.stream
+            .flush()
+            .await
+            .map_err(|error| PoolError::CleanupFailed(error.to_string()))?;
 
         loop {
-            match read_backend_message(&mut stream).await {
+            match read_backend_message(&mut conn.stream).await {
                 Ok(BackendMessage::ReadyForQuery(_)) => break,
+                Ok(BackendMessage::ErrorResponse(error)) => {
+                    return Err(PoolError::CleanupFailed(
+                        error.message().unwrap_or("DISCARD ALL failed").to_string(),
+                    ));
+                }
                 Ok(_) => continue,
-                Err(e) => return Err(PoolError::CleanupFailed(e.to_string())),
+                Err(error) => return Err(PoolError::CleanupFailed(error.to_string())),
             }
         }
 
-        self.registry.insert_with_generation(&conn.node_id, conn.backend_pid, stream, gen_before);
+        conn.current_application_name = None;
         Ok(())
     }
 
-    async fn validate(&self, conn: &PooledConnection) -> Result<(), PoolError> {
+    async fn validate(&self, conn: &mut BackendConnection) -> Result<(), PoolError> {
         if self.check_query.is_empty() {
             return Ok(());
         }
 
-        let mut stream = self
-            .registry
-            .take(&conn.node_id, conn.backend_pid)
-            .ok_or_else(|| {
-                PoolError::CleanupFailed("connection socket missing from registry for validation".into())
-            })?;
-
-        let gen_before = self.registry.node_generation(&conn.node_id);
-
         let bytes = encode_query(&self.check_query);
-        if let Err(e) = stream.write_all(&bytes).await {
-            // Socket is broken — don't put it back
-            return Err(PoolError::CleanupFailed(e.to_string()));
-        }
-        if let Err(e) = stream.flush().await {
-            return Err(PoolError::CleanupFailed(e.to_string()));
-        }
+        conn.stream
+            .write_all(&bytes)
+            .await
+            .map_err(|error| PoolError::CleanupFailed(error.to_string()))?;
+        conn.stream
+            .flush()
+            .await
+            .map_err(|error| PoolError::CleanupFailed(error.to_string()))?;
 
+        let mut query_error = None;
         loop {
-            match read_backend_message(&mut stream).await {
+            match read_backend_message(&mut conn.stream).await {
                 Ok(BackendMessage::ReadyForQuery(_)) => break,
-                Ok(BackendMessage::ErrorResponse(_)) => {
-                    // Query failed but connection might still be usable;
-                    // wait for ReadyForQuery before deciding.
-                    continue;
+                Ok(BackendMessage::ErrorResponse(error)) => {
+                    query_error = Some(
+                        error.message().unwrap_or("validation query failed").to_string(),
+                    );
                 }
                 Ok(_) => continue,
-                Err(e) => {
-                    // Connection is dead
-                    return Err(PoolError::CleanupFailed(e.to_string()));
-                }
+                Err(error) => return Err(PoolError::CleanupFailed(error.to_string())),
             }
         }
 
-        // Connection alive — put it back only if node wasn't removed
-        self.registry.insert_with_generation(&conn.node_id, conn.backend_pid, stream, gen_before);
-        Ok(())
-    }
-
-    fn discard(&self, conn: &PooledConnection) {
-        self.registry.remove(&conn.node_id, conn.backend_pid);
+        match query_error {
+            Some(error) => Err(PoolError::CleanupFailed(error)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -489,6 +330,7 @@ pub async fn send_cancel_request_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::conn::{MaybeTlsStream, PooledConnection};
     use proptest::prelude::*;
     use tokio::net::TcpListener;
 
@@ -532,23 +374,13 @@ mod tests {
         (accept_result.unwrap().0, connect_result.unwrap())
     }
 
-    #[tokio::test]
-    async fn take_returns_previously_inserted_socket() {
-        let (a, _b) = connected_pair().await;
+    #[test]
+    fn node_generation_advances_when_allowed_and_removed() {
         let registry = ConnectionRegistry::new();
-        registry.insert_raw("writer", 100, MaybeTlsStream::Plain(a));
-        assert!(registry.take("writer", 100).is_some());
-        // Second take should find nothing (already removed).
-        assert!(registry.take("writer", 100).is_none());
-    }
-
-    #[tokio::test]
-    async fn remove_drops_socket_without_returning_it() {
-        let (a, _b) = connected_pair().await;
-        let registry = ConnectionRegistry::new();
-        registry.insert_raw("writer", 100, MaybeTlsStream::Plain(a));
-        registry.remove("writer", 100);
-        assert!(registry.take("writer", 100).is_none());
+        assert_eq!(registry.node_generation("writer"), 0);
+        assert_eq!(registry.allow_node("writer"), 1);
+        registry.remove_by_node("writer");
+        assert_eq!(registry.node_generation("writer"), 2);
     }
 
     #[test]
@@ -632,11 +464,13 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let (client_side, mut backend_side) = connected_pair().await;
-        let registry = Arc::new(ConnectionRegistry::new());
-        registry.insert_raw("writer", 42, MaybeTlsStream::Plain(client_side));
-
-        let cleaner = DiscardAllCleaner::new(registry.clone());
-        let conn = PooledConnection::new("writer", 42, 999);
+        let cleaner = DiscardAllCleaner::new();
+        let mut conn = BackendConnection::new(
+            PooledConnection::new("writer", 42, 999),
+            MaybeTlsStream::Plain(client_side),
+            7,
+        );
+        conn.current_application_name = Some("client-a".to_string());
 
         let backend_task = tokio::spawn(async move {
             // Consume whatever bytes the cleaner sent (the DISCARD ALL Query
@@ -651,10 +485,9 @@ mod tests {
             backend_side.write_all(&ready).await.unwrap();
         });
 
-        let result = cleaner.clean(&conn).await;
+        let result = cleaner.clean(&mut conn).await;
         backend_task.await.unwrap();
         assert!(result.is_ok());
-        // Socket should have been reinserted into the registry after cleanup.
-        assert!(registry.take("writer", 42).is_some());
+        assert_eq!(conn.current_application_name, None);
     }
 }

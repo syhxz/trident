@@ -102,7 +102,6 @@ pub struct ProxyDeps<RTR, PM, LSN> {
     pub router: Arc<RTR>,
     pub pool_manager: Arc<PM>,
     pub lsn_tracker: Arc<LSN>,
-    pub connection_registry: Arc<ConnectionRegistry>,
     pub cancel_registry: Arc<CancelRegistry>,
     pub node_addresses: Arc<ArcSwap<HashMap<String, NodeAddress>>>,
     /// The default consistency level assigned to a session at connection
@@ -124,7 +123,7 @@ pub struct ProxyDeps<RTR, PM, LSN> {
     pub client_stats: Arc<ClientStats>,
     /// Per-statement query logging / slow-query threshold behavior (see
     /// `handler::QueryLogSettings` docs). Plain `Copy` value, not an
-    /// `Arc`/`ArcSwap` -- `config.logging.query_log`/`slow_query` are not
+    /// `Arc`/`ArcSwap` -- `config.logging.query_trace`/`slow_query` are not
     /// part of the hot-reloadable settings set (see `trident::reload`
     /// module docs for what is/isn't hot-reloadable), so this is fixed
     /// for the lifetime of the process, same as `proxy.listen_addr`.
@@ -147,6 +146,8 @@ pub struct ProxyDeps<RTR, PM, LSN> {
     pub client_idle_timeout: std::time::Duration,
     /// Cancel request TCP connect timeout. Zero = disabled.
     pub cancel_connect_timeout: std::time::Duration,
+    /// Node-generation tracker for invalidating stale cached connections.
+    pub connection_registry: Arc<ConnectionRegistry>,
 }
 
 impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
@@ -155,7 +156,6 @@ impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
             router: self.router.clone(),
             pool_manager: self.pool_manager.clone(),
             lsn_tracker: self.lsn_tracker.clone(),
-            connection_registry: self.connection_registry.clone(),
             cancel_registry: self.cancel_registry.clone(),
             node_addresses: self.node_addresses.clone(),
             default_consistency: self.default_consistency.clone(),
@@ -167,6 +167,7 @@ impl<RTR, PM, LSN> Clone for ProxyDeps<RTR, PM, LSN> {
             startup_timeout: self.startup_timeout,
             client_idle_timeout: self.client_idle_timeout,
             cancel_connect_timeout: self.cancel_connect_timeout,
+            connection_registry: self.connection_registry.clone(),
         }
     }
 }
@@ -361,7 +362,6 @@ where
             deps.router.as_ref(),
             deps.pool_manager.as_ref(),
             deps.lsn_tracker.as_ref(),
-            deps.connection_registry.as_ref(),
             deps.cancel_registry.as_ref(),
             node_addresses_snapshot.as_ref(),
             deps.query_log,
@@ -369,7 +369,8 @@ where
         .with_lsn_tracking(deps.lsn_tracking.clone())
         .with_slow_query_buffer(deps.slow_queries.clone())
         .with_timeouts(deps.cancel_connect_timeout, deps.client_idle_timeout)
-        .with_startup_timeout(remaining_startup_timeout);
+        .with_startup_timeout(remaining_startup_timeout)
+        .with_connection_registry(deps.connection_registry.as_ref());
         // Wrap the client socket in BufReader+BufWriter so:
         // - Reads are buffered: multiple small protocol messages (Bind +
         //   Execute + Sync) typically arrive in one TCP segment but would
@@ -477,7 +478,7 @@ mod tests {
     use crate::parser::classifier::KeywordClassifier;
     use crate::parser::hint::RegexHintParser;
     use crate::parser::pattern::RegexPatternMatcher;
-    use crate::pool::conn::PooledConnection;
+    use crate::pool::conn::{test_utils::mock_backend_connection, BackendConnection};
     use crate::pool::manager::InMemoryPoolManager;
     use crate::pool::pool::{ConnCleaner, ConnFactory, NodePool, PoolError};
     use crate::protocol::message::BackendMessage;
@@ -492,15 +493,15 @@ mod tests {
         next_pid: AtomicI32,
     }
     impl ConnFactory for CountingFactory {
-        async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+        async fn create(&self, node_id: &str) -> Result<BackendConnection, PoolError> {
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
-            Ok(PooledConnection::new(node_id, pid, pid * 1000))
+            Ok(mock_backend_connection(node_id, pid).await)
         }
     }
 
     struct NoopCleaner;
     impl ConnCleaner for NoopCleaner {
-        async fn clean(&self, _conn: &PooledConnection) -> Result<(), PoolError> {
+        async fn clean(&self, _conn: &mut BackendConnection) -> Result<(), PoolError> {
             Ok(())
         }
     }
@@ -571,7 +572,6 @@ mod tests {
         let router = Arc::new(make_router());
         let pool_manager = Arc::new(make_pool_manager());
         let lsn_tracker = Arc::new(InMemoryLsnTracker::new());
-        let connection_registry = Arc::new(ConnectionRegistry::new());
         let cancel_registry = Arc::new(CancelRegistry::new());
         let node_addresses = Arc::new(ArcSwap::new(Arc::new(HashMap::new())));
 
@@ -579,7 +579,6 @@ mod tests {
             router,
             pool_manager,
             lsn_tracker,
-            connection_registry,
             cancel_registry,
             node_addresses,
             default_consistency: Arc::new(ArcSwap::new(Arc::new(ConsistencyLevel::Session))),
@@ -591,6 +590,7 @@ mod tests {
             startup_timeout: std::time::Duration::ZERO,
             client_idle_timeout: std::time::Duration::ZERO,
             cancel_connect_timeout: std::time::Duration::from_secs(5),
+            connection_registry: Arc::new(ConnectionRegistry::new()),
         };
 
         let server_task = tokio::spawn({

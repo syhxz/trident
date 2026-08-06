@@ -158,14 +158,33 @@ graph TB
 <div class="card">
 <table>
 <tr><th>Component</th><th>Responsibility</th><th>Key Interface</th></tr>
-<tr><td><strong>ConnectionHandler</strong></td><td>Full lifecycle of a single client session: Startup &rarr; message loop &rarr; cleanup</td><td><code>handle()</code></td></tr>
+<tr><td><strong>ConnectionHandler</strong></td><td>Full lifecycle of a single client session: Startup &rarr; message loop &rarr; cleanup; moves and exclusively owns one complete backend connection while a query runs</td><td><code>handle()</code></td></tr>
 <tr><td><strong>Router</strong></td><td>Chains Hint &rarr; Tx state &rarr; SQL classification &rarr; Cost &rarr; Consistency &rarr; Load balancing</td><td><code>route(sql, ctx, readers, analytics)</code></td></tr>
-<tr><td><strong>PoolManager</strong></td><td>Per-node connection pool management, Session/Transaction modes</td><td><code>pool_for(node_id)</code>, <code>snapshot()</code></td></tr>
+<tr><td><strong>PoolManager</strong></td><td>Per-node pool management; idle, Session-binding, and pinned queues directly own complete connections</td><td><code>pool_for(node_id)</code>, <code>snapshot()</code></td></tr>
+<tr><td><strong>BackendConnection</strong></td><td>Physical connection ownership unit: metadata + socket + node generation + cached <code>application_name</code></td><td><code>conn.stream</code>, <code>conn.generation</code></td></tr>
+<tr><td><strong>ConnectionRegistry</strong></td><td>Tracks dynamic-node generations only; stores no sockets and is absent from the query hot path</td><td><code>generation_for(node_id)</code></td></tr>
 <tr><td><strong>HealthChecker</strong></td><td>Periodic concurrent probing; 3-consecutive-failures rule triggers state transitions</td><td><code>check_once()</code>, <code>run()</code></td></tr>
 <tr><td><strong>LsnTracker</strong></td><td>Monotonic WAL watermark maintenance at Session + Global levels</td><td><code>record_write()</code>, <code>session_write_lsn()</code></td></tr>
-<tr><td><strong>Forwarder</strong></td><td>Streaming message relay, Pipeline LSN capture, Extension GUC interception</td><td><code>forward_simple_query_with_options()</code></td></tr>
-<tr><td><strong>CancelRegistry</strong></td><td>CANCEL request key &rarr; session &rarr; backend mapping</td><td><code>resolve_cancel_target()</code></td></tr>
+<tr><td><strong>Forwarder</strong></td><td>Streams messages through <code>&amp;mut conn.stream</code>, captures Pipeline LSNs, and intercepts Extension GUC reports</td><td><code>forward_simple_query_with_options()</code></td></tr>
+<tr><td><strong>CancelRegistry</strong></td><td>CANCEL request key &rarr; session &rarr; backend mapping; independent of connection ownership</td><td><code>resolve_cancel_target()</code></td></tr>
 </table>
+</div>
+
+<div class="card">
+<p class="card-title">Backend Connection Ownership and Query Hot Path</p>
+<div class="mermaid">
+flowchart LR
+    H["ConnectionHandler"] -->|"acquire()"| P["NodePool<br/>idle / session / pinned"]
+    P -->|"move out"| C["BackendConnection<br/>metadata + socket + generation<br/>application_name cache"]
+    C -->|"&amp;mut conn.stream"| IO["Direct PG Wire forwarding"]
+    IO -->|"release(conn)"| P
+    C -->|"discard / drain / drop"| Close["Close owned socket"]
+    G["ConnectionRegistry<br/>node generation only"] -.->|"dynamic node replacement"| P
+</div>
+<p>Pool checkout returns a complete <code>BackendConnection</code>. The Handler reads and writes its socket directly, then moves the same object back into the pool; no <code>ConnectionRegistry::take/insert</code> lookup by <code>(node_id, backend_pid)</code> remains. The Transaction-mode idle queue, Session binding, and pinned queue all store complete connections. Session checkout uses move-out/move-back semantics and never clones a connection.</p>
+<div class="note">
+<strong>Lifecycle guarantees</strong>: a draining pool rejects new checkouts, wakes waiters, and discards connections returned or created after draining begins. Successful cleanup clears the cached <code>application_name</code>; a failed label update prevents the user query from running. Dropping a connection or pool closes every owned socket.
+</div>
 </div>
 
 <!-- ============================================================ -->

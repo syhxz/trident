@@ -21,10 +21,11 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::balancer::LoadBalancer;
 use crate::config::{ConsistencyLevel, LsnTrackingConfig, LsnTrackingMode, NodeType, PoolMode};
 use crate::parser::classifier::{
-    contains_multiple_statements, multi_statement_all_readable, requires_writer, Classifier, KeywordClassifier,
+    contains_multiple_statements, multi_statement_all_readable, requires_writer, Classifier,
+    KeywordClassifier,
 };
 use crate::parser::hint::HintParser;
-use crate::pool::conn::PooledConnection;
+use crate::pool::conn::BackendConnection;
 use crate::pool::manager::PoolManager;
 use crate::pool::pinning::detects_pinning_trigger;
 use crate::pool::pool::ConnectionPool;
@@ -32,23 +33,20 @@ use crate::protocol::message::{BackendMessage, FrontendMessage, PgError, Transac
 use crate::protocol::reader::{frontend_tag, parse_frontend_body, read_tagged_frame};
 use crate::protocol::startup::{read_startup_packet, AuthOutcome, StartupHandler, StartupPacket};
 use crate::protocol::writer::encode_backend_message;
-use crate::protocol::writer::encode_query;
 use crate::protocol::ProtocolError;
 use crate::proxy::error::{proxy_error_to_pg_error, ProxyError};
 use crate::proxy::forwarder::{
-    apply_ready_for_query, fetch_current_wal_lsn, forward_simple_query, relay_copy_in_stream,
-    forward_simple_query_with_options, is_write_command_tag, ExtendedQueryRouteTracker,
-    QueryForwardOptions,
+    apply_ready_for_query, fetch_current_wal_lsn, forward_simple_query,
+    forward_simple_query_with_options, is_write_command_tag, relay_copy_in_stream,
+    ExtendedQueryRouteTracker, QueryForwardOptions,
 };
-use crate::proxy::registry::{send_cancel_request_with_timeout, BackendStream, CancelRegistry, ConnectionRegistry, NodeAddress};
+use crate::proxy::registry::{send_cancel_request_with_timeout, CancelRegistry, ConnectionRegistry, NodeAddress};
 use crate::router::consistency::ConsistencyChecker;
 use crate::router::cost::CostEstimator;
 use crate::router::router::{RouteDecision, Router, RoutingContext};
 use crate::session::lsn::LsnTracker;
 use crate::session::session::{SessionState, TxState};
-use crate::session::transaction::{
-    parse_begin_options, transaction_end_tag, TxSplitState,
-};
+use crate::session::transaction::{parse_begin_options, transaction_end_tag, TxSplitState};
 
 /// Per-session data the handler owns for the lifetime of one client
 /// connection: routing/consistency state plus a unique session id used as
@@ -57,9 +55,8 @@ pub struct ClientSession {
     pub state: SessionState,
     held_backend: Option<HeldBackend>,
     /// Cached idle backend from the previous autocommit query. When the
-    /// next autocommit query routes to the same node, this connection is
-    /// reused directly — skipping pool.acquire + registry.take +
-    /// registry.insert + pool.release (4 mutex operations). Released when:
+    /// next autocommit query routes to the same node, this complete
+    /// connection is reused directly, skipping pool release/acquire. Released when:
     /// - Next query routes to a different node
     /// - Session enters an explicit transaction (BEGIN)
     /// - Session closes
@@ -96,18 +93,17 @@ pub struct ClientSession {
     /// pools exist for the same (node, user, database).
     resolved_pools: HashMap<String, Arc<dyn ConnectionPool>>,
     /// Enriched application_name containing client IP for backend audit
-    /// trail. SET on the backend after each fresh connection checkout so
-    /// pg_stat_activity always shows the real client origin regardless of
-    /// connection pooling. Reset by DISCARD ALL on release.
+    /// trail. Applied only when a checked-out physical connection's cache
+    /// differs; a failed SET aborts the operation rather than executing an
+    /// inaccurately attributed user query.
     application_name: String,
 }
 
-/// A backend connection checked out exclusively by this client. It is
-/// retained across statements while PostgreSQL reports an open/failed
+/// A complete backend connection checked out exclusively by this client.
+/// It is retained across statements while PostgreSQL reports an open/failed
 /// transaction, or after a session-state operation triggers pinning.
 struct HeldBackend {
-    conn: PooledConnection,
-    socket: BackendStream,
+    conn: BackendConnection,
 }
 
 /// One extended-query protocol message buffered between Sync boundaries,
@@ -221,10 +217,23 @@ impl ClientSession {
         }
     }
 
-    /// Takes the cached idle backend if it matches the given node_id.
-    /// Returns `None` if no cache exists or node_id doesn't match.
-    fn take_cached_if_matches(&mut self, node_id: &str) -> Option<HeldBackend> {
-        if self.cached_idle_backend.as_ref().is_some_and(|h| h.conn.node_id == node_id) {
+    /// Takes the cached idle backend if it matches the given node_id and
+    /// its generation is still current. Returns `None` if no cache exists,
+    /// node_id doesn't match, or the connection is from a stale generation
+    /// (node was removed and re-added).
+    fn take_cached_if_matches(
+        &mut self,
+        node_id: &str,
+        current_generation: Option<u64>,
+    ) -> Option<HeldBackend> {
+        if self
+            .cached_idle_backend
+            .as_ref()
+            .is_some_and(|h| {
+                h.conn.node_id == node_id
+                    && current_generation.map_or(true, |gen| h.conn.generation >= gen)
+            })
+        {
             self.cached_idle_backend.take()
         } else {
             None
@@ -242,12 +251,6 @@ where
     pub router: &'a RTR,
     pub pool_manager: &'a PM,
     pub lsn_tracker: &'a LSN,
-    /// Maps `(node_id, backend_pid)` to the live backend `TcpStream`,
-    /// letting the handler look up the physical socket for a
-    /// `PooledConnection` returned by the pool (which only carries
-    /// metadata -- see `pool::conn` module docs) so it can actually
-    /// forward SQL and stream results back to the client.
-    pub connection_registry: &'a ConnectionRegistry,
     /// Tracks proxy-issued cancel keys and each session's currently active
     /// backend connection, so CANCEL requests can be validated and routed
     /// correctly in the single-instance case (Requirements 7.1-7.3).
@@ -274,6 +277,11 @@ where
     /// Zero = disabled. Protects against clients that stall during the
     /// Startup/Auth exchange to exhaust max_clients slots.
     pub startup_timeout: std::time::Duration,
+    /// Optional node-generation tracker. When present, cached idle backends
+    /// are validated against the current node generation before reuse.
+    /// Stale connections (from a removed-then-re-added node) are discarded
+    /// instead of sending requests to a defunct backend socket.
+    pub connection_registry: Option<&'a ConnectionRegistry>,
 }
 
 /// Abstraction over `Router::route` used by the handler, so the handler
@@ -291,7 +299,8 @@ pub trait RouteFn: Send + Sync {
         ctx: &mut RoutingContext<'_>,
         readers: &[crate::health::BackendNodeSnapshot],
         analytics_nodes: &[crate::health::BackendNodeSnapshot],
-    ) -> impl std::future::Future<Output = Result<RouteDecision, crate::router::router::RouterError>> + Send;
+    ) -> impl std::future::Future<Output = Result<RouteDecision, crate::router::router::RouterError>>
+           + Send;
 }
 
 impl<C, H, CC, CE, LB> RouteFn for Router<C, H, CC, CE, LB>
@@ -331,7 +340,6 @@ where
         router: &'a RTR,
         pool_manager: &'a PM,
         lsn_tracker: &'a LSN,
-        connection_registry: &'a ConnectionRegistry,
         cancel_registry: &'a CancelRegistry,
         node_addresses: &'a HashMap<String, NodeAddress>,
     ) -> Self {
@@ -339,7 +347,6 @@ where
             router,
             pool_manager,
             lsn_tracker,
-            connection_registry,
             cancel_registry,
             node_addresses,
             query_log: QueryLogSettings::default(),
@@ -348,6 +355,7 @@ where
             cancel_connect_timeout: std::time::Duration::ZERO,
             client_idle_timeout: std::time::Duration::ZERO,
             startup_timeout: std::time::Duration::ZERO,
+            connection_registry: None,
         }
     }
 
@@ -358,7 +366,6 @@ where
         router: &'a RTR,
         pool_manager: &'a PM,
         lsn_tracker: &'a LSN,
-        connection_registry: &'a ConnectionRegistry,
         cancel_registry: &'a CancelRegistry,
         node_addresses: &'a HashMap<String, NodeAddress>,
         query_log: QueryLogSettings,
@@ -367,7 +374,6 @@ where
             router,
             pool_manager,
             lsn_tracker,
-            connection_registry,
             cancel_registry,
             node_addresses,
             query_log,
@@ -376,6 +382,7 @@ where
             cancel_connect_timeout: std::time::Duration::ZERO,
             client_idle_timeout: std::time::Duration::ZERO,
             startup_timeout: std::time::Duration::ZERO,
+            connection_registry: None,
         }
     }
 
@@ -383,6 +390,13 @@ where
     /// process configuration.
     pub fn with_lsn_tracking(mut self, lsn_tracking: LsnTrackingConfig) -> Self {
         self.lsn_tracking = lsn_tracking;
+        self
+    }
+
+    /// Attaches the node-generation tracker so cached connections are
+    /// validated against the current generation before reuse.
+    pub fn with_connection_registry(mut self, registry: &'a ConnectionRegistry) -> Self {
+        self.connection_registry = Some(registry);
         self
     }
 
@@ -438,7 +452,9 @@ where
         // Cache the resolved pool so cleanup can find the exact pool
         // without ambiguous prefix matching.
         if let Some(ref p) = pool {
-            session.resolved_pools.insert(node_id.to_string(), Arc::clone(p));
+            session
+                .resolved_pools
+                .insert(node_id.to_string(), Arc::clone(p));
         }
         pool
     }
@@ -472,16 +488,26 @@ where
         }
     }
 
-    /// Returns the cached idle backend to the pool and registry. Called
-    /// when the next query routes to a different node, or when an explicit
-    /// transaction begins, or at session close.
+    /// Returns the cached idle backend to the pool. Called when the next
+    /// query routes to a different node, when an explicit transaction begins,
+    /// or when the session closes.
     async fn release_cached_backend(&self, session: &mut ClientSession) {
         if let Some(held) = session.cached_idle_backend.take() {
-            self.connection_registry
-                .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
+            // If the connection is from a stale generation (node was
+            // removed and re-added), simply drop it — the old pool that
+            // tracked this slot has already been drained.
+            let stale = self
+                .connection_registry
+                .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
+            if stale {
+                drop(held);
+                return;
+            }
             if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                 let _ = pool.release(&session.state.id, held.conn).await;
             }
+            // If pool not found (node removed entirely), connection is
+            // simply dropped — socket closes, no slot to return.
         }
     }
 
@@ -567,9 +593,14 @@ where
                 // the same pg_authid catalog and can validate passwords
                 // identically (authentication only reads pg_authid, no
                 // writes required). Fail-closed when no node is available.
-                let verify_node = all_nodes.iter()
+                let verify_node = all_nodes
+                    .iter()
                     .find(|n| n.node_type == NodeType::Writer && n.healthy)
-                    .or_else(|| all_nodes.iter().find(|n| n.node_type == NodeType::Reader && n.healthy));
+                    .or_else(|| {
+                        all_nodes
+                            .iter()
+                            .find(|n| n.node_type == NodeType::Reader && n.healthy)
+                    });
 
                 if let Some(node) = verify_node {
                     let pool = self.pool_manager.pool_for_user(
@@ -605,7 +636,8 @@ where
                                         creds.database.as_deref(),
                                         &creds.extra_params,
                                     );
-                                    metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
+                                    metrics::counter!("trident_passthrough_auth_failures_total")
+                                        .increment(1);
                                     tracing::warn!(
                                         username = %creds.username,
                                         node_id = %node.node_id,
@@ -621,15 +653,17 @@ where
                                         ),
                                     );
                                     send_pg_error_response(&mut client_stream, pg_err).await?;
-                                    client_stream.flush().await.map_err(|e| {
-                                        ProxyError::Protocol(ProtocolError::Io(e))
-                                    })?;
+                                    client_stream
+                                        .flush()
+                                        .await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                     return Ok(None);
                                 }
                             }
                         }
                         None => {
-                            metrics::counter!("trident_passthrough_auth_failures_total").increment(1);
+                            metrics::counter!("trident_passthrough_auth_failures_total")
+                                .increment(1);
                             tracing::warn!(
                                 username = %creds.username,
                                 node_id = %node.node_id,
@@ -641,9 +675,10 @@ where
                                 "authentication failed: no backend available for credential verification",
                             );
                             send_pg_error_response(&mut client_stream, pg_err).await?;
-                            client_stream.flush().await.map_err(|e| {
-                                ProxyError::Protocol(ProtocolError::Io(e))
-                            })?;
+                            client_stream
+                                .flush()
+                                .await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             return Ok(None);
                         }
                     }
@@ -662,17 +697,19 @@ where
                         "authentication unavailable: no healthy backend for credential verification, retry shortly",
                     );
                     send_pg_error_response(&mut client_stream, pg_err).await?;
-                    client_stream.flush().await.map_err(|e| {
-                        ProxyError::Protocol(ProtocolError::Io(e))
-                    })?;
+                    client_stream
+                        .flush()
+                        .await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     return Ok(None);
                 }
             }
 
             send_startup_success(&mut client_stream, &auth_outcome).await?;
-            client_stream.flush().await.map_err(|e| {
-                ProxyError::Protocol(ProtocolError::Io(e))
-            })?;
+            client_stream
+                .flush()
+                .await
+                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
 
             Ok(Some(auth_outcome))
         };
@@ -710,7 +747,8 @@ where
                 .and_then(|(_, addr)| addr.rsplit_once(':'))
                 .map(|(ip, _port)| ip)
                 .unwrap_or("unknown");
-            let original_app = session.client_credentials
+            let original_app = session
+                .client_credentials
                 .as_ref()
                 .and_then(|c| c.extra_params.get("application_name"))
                 .cloned()
@@ -727,8 +765,11 @@ where
         // BackendKeyData above) against this session, so a later
         // CancelRequest bearing it can be attributed back correctly
         // (Requirements 7.1-7.3).
-        self.cancel_registry
-            .register_session(auth_outcome.backend_pid, auth_outcome.secret_key, &session_id);
+        self.cancel_registry.register_session(
+            auth_outcome.backend_pid,
+            auth_outcome.secret_key,
+            &session_id,
+        );
 
         // --- Message loop -------------------------------------------------
         let result = self.message_loop(&mut client_stream, &mut session).await;
@@ -738,40 +779,36 @@ where
         // in Session mode (the single bound connection) or Transaction mode
         // (any pinned connections). Best-effort: pool lookups may legitimately
         // find nothing if the session never acquired a connection.
-        // A checked-out transaction/pinned socket is owned directly by
-        // the session rather than the registry. Discard it first so both
-        // the physical socket and the pool capacity slot are released.
+        // A checked-out transaction/pinned connection is owned directly by
+        // the session. Discard it so both the socket and pool slot are released.
         if let Some(held) = session.held_backend.take() {
             if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
                 if let Err(error) = pool.discard(held.conn) {
                     tracing::warn!(error = %error, "failed to discard held backend connection");
                 }
             }
-            drop(held.socket);
         }
 
-        // Release cached idle backend cleanly (it's in a good state).
+        // Release a cached clean idle backend.
         if let Some(held) = session.cached_idle_backend.take() {
-            self.connection_registry
-                .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
-            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
-                let _ = pool.release(&session.state.id, held.conn).await;
+            let stale = self
+                .connection_registry
+                .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
+            if !stale {
+                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
+                    let _ = pool.release(&session.state.id, held.conn).await;
+                }
             }
         }
 
-        // Release metadata still owned by Session-mode bindings or by the
-        // pool's pinned map, and explicitly remove every corresponding
-        // registered socket. `release_session` returns the identities so
-        // this cleanup cannot leak file descriptors.
+        // Release complete connections still owned by Session-mode bindings
+        // or by the pool's pinned map.
         self.cancel_registry.clear_active(&session_id);
         self.cancel_registry
             .unregister_session(auth_outcome.backend_pid, auth_outcome.secret_key);
         for node_id in known_node_ids(self.pool_manager) {
             if let Some(pool) = self.resolve_pool_existing(&node_id, &session) {
-                for connection in pool.release_session(&session_id) {
-                    self.connection_registry
-                        .remove(&connection.node_id, connection.backend_pid);
-                }
+                drop(pool.release_session(&session_id));
             }
         }
         self.lsn_tracker.remove_session(&session_id);
@@ -789,8 +826,9 @@ where
     /// node is logged but never surfaced to the (already-closing) client
     /// connection.
     async fn handle_cancel_request(&self, backend_pid: i32, secret_key: i32) {
-        let Some((node_id, real_backend_pid, real_secret_key)) =
-            self.cancel_registry.resolve_cancel_target(backend_pid, secret_key)
+        let Some((node_id, real_backend_pid, real_secret_key)) = self
+            .cancel_registry
+            .resolve_cancel_target(backend_pid, secret_key)
         else {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "ignored").increment(1);
             tracing::debug!(
@@ -802,16 +840,26 @@ where
         };
 
         let Some(addr) = self.node_addresses.get(&node_id) else {
-            metrics::counter!("trident_cancel_requests_total", "outcome" => "no_node_address").increment(1);
+            metrics::counter!("trident_cancel_requests_total", "outcome" => "no_node_address")
+                .increment(1);
             tracing::warn!(node_id = %node_id, "cannot forward CancelRequest: no known address for node");
             return;
         };
 
-        if let Err(e) = send_cancel_request_with_timeout(addr, real_backend_pid, real_secret_key, self.cancel_connect_timeout).await {
-            metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed").increment(1);
+        if let Err(e) = send_cancel_request_with_timeout(
+            addr,
+            real_backend_pid,
+            real_secret_key,
+            self.cancel_connect_timeout,
+        )
+        .await
+        {
+            metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed")
+                .increment(1);
             tracing::warn!(node_id = %node_id, error = %e, "failed to forward CancelRequest to backend");
         } else {
-            metrics::counter!("trident_cancel_requests_total", "outcome" => "forwarded").increment(1);
+            metrics::counter!("trident_cancel_requests_total", "outcome" => "forwarded")
+                .increment(1);
         }
     }
 
@@ -840,11 +888,18 @@ where
             let (tag, body) = match if self.client_idle_timeout.is_zero() {
                 read_tagged_frame(client_stream).await
             } else {
-                match tokio::time::timeout(self.client_idle_timeout, read_tagged_frame(client_stream)).await {
+                match tokio::time::timeout(
+                    self.client_idle_timeout,
+                    read_tagged_frame(client_stream),
+                )
+                .await
+                {
                     Ok(result) => result,
-                    Err(_) => return Err(ProxyError::Protocol(ProtocolError::Malformed(
-                        "client idle timeout exceeded".into(),
-                    ))),
+                    Err(_) => {
+                        return Err(ProxyError::Protocol(ProtocolError::Malformed(
+                            "client idle timeout exceeded".into(),
+                        )))
+                    }
                 }
             } {
                 Ok(frame) => frame,
@@ -864,9 +919,10 @@ where
                     frontend_tag::TERMINATE => return Ok(()),
                     frontend_tag::SYNC => {
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
-                        client_stream.flush().await.map_err(|e| {
-                            ProxyError::Protocol(ProtocolError::Io(e))
-                        })?;
+                        client_stream
+                            .flush()
+                            .await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         extended_error_pending = false;
                         extended_batch.clear();
                         extended_batch_bytes = 0;
@@ -896,9 +952,10 @@ where
                     // Flush the buffered writer so the complete response
                     // (RowDescription + DataRow(s) + CommandComplete +
                     // ReadyForQuery) is sent as one TCP segment.
-                    client_stream.flush().await.map_err(|e| {
-                        ProxyError::Protocol(ProtocolError::Io(e))
-                    })?;
+                    client_stream
+                        .flush()
+                        .await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                 }
                 frontend_tag::SYNC => {
                     if extended_batch.is_empty() {
@@ -919,9 +976,10 @@ where
                             }
                         }
                     }
-                    client_stream.flush().await.map_err(|e| {
-                        ProxyError::Protocol(ProtocolError::Io(e))
-                    })?;
+                    client_stream
+                        .flush()
+                        .await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                 }
                 frontend_tag::FLUSH => {
                     if extended_batch.is_empty() {
@@ -929,9 +987,10 @@ where
                         // had was already delivered at the last Sync
                         // boundary; just make sure the write buffer is
                         // drained.
-                        client_stream.flush().await.map_err(|e| {
-                            ProxyError::Protocol(ProtocolError::Io(e))
-                        })?;
+                        client_stream
+                            .flush()
+                            .await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     } else {
                         // Trident forwards extended-query batches whole at
                         // Sync boundaries and cannot deliver intermediate
@@ -950,9 +1009,10 @@ where
                              end the batch with Sync instead",
                         );
                         send_pg_error_response(client_stream, error).await?;
-                        client_stream.flush().await.map_err(|e| {
-                            ProxyError::Protocol(ProtocolError::Io(e))
-                        })?;
+                        client_stream
+                            .flush()
+                            .await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         extended_error_pending = true;
                         extended_batch.clear();
                         extended_batch_bytes = 0;
@@ -974,9 +1034,7 @@ where
                             "extended query batch exceeds message limit without Sync".into(),
                         )));
                     }
-                    if extended_batch_bytes.saturating_add(body.len())
-                        > MAX_EXTENDED_BATCH_BYTES
-                    {
+                    if extended_batch_bytes.saturating_add(body.len()) > MAX_EXTENDED_BATCH_BYTES {
                         return Err(ProxyError::Protocol(ProtocolError::Malformed(
                             "extended query batch exceeds byte limit without Sync".into(),
                         )));
@@ -1107,8 +1165,12 @@ where
         let tracked_node = if route_sql.is_none() {
             // Check if this batch references the unnamed statement cross-Sync
             let references_unnamed_cross_sync = batch.iter().any(|frame| match frame.tag {
-                frontend_tag::BIND => matches!(frame.bind_statement(), Some(stmt) if stmt.is_empty()),
-                frontend_tag::DESCRIBE => matches!(frame.kind_and_name(), Some((b'S', name)) if name.is_empty()),
+                frontend_tag::BIND => {
+                    matches!(frame.bind_statement(), Some(stmt) if stmt.is_empty())
+                }
+                frontend_tag::DESCRIBE => {
+                    matches!(frame.kind_and_name(), Some((b'S', name)) if name.is_empty())
+                }
                 _ => false,
             });
 
@@ -1127,9 +1189,9 @@ where
             // Named statement lookup
             batch.iter().find_map(|frame| match frame.tag {
                 frontend_tag::BIND => match frame.bind_statement() {
-                    Some(statement) if !statement.is_empty() => {
-                        session.extended_route_tracker.route_for_statement(statement)
-                    }
+                    Some(statement) if !statement.is_empty() => session
+                        .extended_route_tracker
+                        .route_for_statement(statement),
                     _ => None,
                 },
                 frontend_tag::DESCRIBE => match frame.kind_and_name() {
@@ -1151,9 +1213,7 @@ where
             let all_nodes = self.pool_manager.snapshot();
             if let Some(node_id) = session.aurora_node_id.as_ref() {
                 let still_available = all_nodes.iter().any(|node| {
-                    node.node_id == *node_id
-                        && node.node_type == NodeType::Reader
-                        && node.healthy
+                    node.node_id == *node_id && node.node_type == NodeType::Reader && node.healthy
                 });
                 if !still_available {
                     return Err(ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(
@@ -1241,37 +1301,30 @@ where
                 target_node_id.clone(),
             ))
         })?;
-        let (mut conn, mut backend_socket) = if let Some(cached) = session.take_cached_if_matches(&target_node_id) {
-            // Fast path: reuse cached idle connection.
-            (cached.conn, cached.socket)
+        let current_gen = self.connection_registry.map(|r| r.node_generation(&target_node_id));
+        let mut conn = if let Some(cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
+            // Fast path: reuse the complete cached connection.
+            cached.conn
         } else {
-            // Release any cached connection to a different node.
+            // Release any cached connection to a different node (or stale generation).
             self.release_cached_backend(session).await;
-
-            let conn = pool.acquire(&session.state.id).await?;
-            let socket = self
-                .connection_registry
-                .take(&conn.node_id, conn.backend_pid)
-                .ok_or_else(|| {
-                    let _ = pool.discard(conn.clone());
-                    ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(
-                        "backend socket missing from registry".into(),
-                    ))
-                })?;
-            (conn, socket)
+            pool.acquire(&session.state.id).await?
         };
 
-        // SET application_name is pipelined with the extended batch below —
-        // the Simple Query frame is prepended to the outbound bytes and its
-        // response cycle is drained before relaying user responses.
-        let appname_sql_ext = if !session.application_name.is_empty() {
-            Some(format!(
-                "SET application_name = '{}'",
-                session.application_name.replace('\'', "''")
-            ))
-        } else {
-            None
-        };
+        // Apply the audit label only when this physical connection's cache
+        // differs. This standalone internal cycle runs only on cache misses;
+        // unlike pipelining it guarantees the user batch is never executed
+        // when the label could not be applied accurately.
+        if let Err(error) = ensure_application_name(
+            &mut conn,
+            &session.application_name,
+            TransactionStatus::Idle,
+        )
+        .await
+        {
+            pool.discard(conn)?;
+            return Err(ProxyError::Protocol(error));
+        }
 
         // A named prepared statement lives on this physical connection, not
         // on the node. In Transaction pool mode the connection would
@@ -1311,12 +1364,10 @@ where
         {
             let init_sql = aurora_consistency_sql(session.state.consistency);
             if let Err(error) =
-                execute_internal_query(&mut backend_socket, &init_sql, TransactionStatus::Idle)
-                    .await
+                execute_internal_query(&mut conn.stream, &init_sql, TransactionStatus::Idle).await
             {
                 session.aurora_initialized_backend_pid = None;
                 pool.discard(conn)?;
-                drop(backend_socket);
                 return Err(ProxyError::Protocol(error));
             }
             session.aurora_initialized_backend_pid = Some(conn.backend_pid);
@@ -1324,16 +1375,7 @@ where
 
         // Send all buffered raw frames + Sync to the backend in one write.
         // No re-encoding: the bytes the client sent are forwarded verbatim.
-        // If SET application_name is needed, prepend it as a Simple Query
-        // frame so it's sent in the same write (zero extra RTT).
-        let outbound = match appname_sql_ext {
-            Some(ref appname) => {
-                let mut buf = encode_query(appname);
-                buf.extend_from_slice(&assemble_extended_outbound(batch));
-                buf
-            }
-            None => assemble_extended_outbound(batch),
-        };
+        let outbound = assemble_extended_outbound(batch);
 
         self.cancel_registry.mark_active(
             &session.state.id,
@@ -1342,42 +1384,15 @@ where
             conn.secret_key,
         );
 
-        if let Err(e) = backend_socket.write_all(&outbound).await {
+        if let Err(e) = conn.stream.write_all(&outbound).await {
             self.cancel_registry.clear_active(&session.state.id);
             pool.discard(conn)?;
-            drop(backend_socket);
             return Err(ProxyError::Protocol(e.into()));
         }
-        if let Err(e) = backend_socket.flush().await {
+        if let Err(e) = conn.stream.flush().await {
             self.cancel_registry.clear_active(&session.state.id);
             pool.discard(conn)?;
-            drop(backend_socket);
             return Err(ProxyError::Protocol(e.into()));
-        }
-
-        // Drain the pipelined SET application_name response cycle
-        // (CommandComplete + ReadyForQuery) before relaying extended protocol
-        // responses. Non-fatal: if it errors, log and continue.
-        if appname_sql_ext.is_some() {
-            loop {
-                let (tag, _body) = match read_tagged_frame(&mut backend_socket).await {
-                    Ok(frame) => frame,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "failed to drain pipelined SET application_name response");
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
-                        drop(backend_socket);
-                        return Err(ProxyError::Protocol(e));
-                    }
-                };
-                match tag {
-                    b'Z' => break, // ReadyForQuery — SET cycle complete
-                    b'E' => {
-                        tracing::debug!("pipelined SET application_name returned ErrorResponse in extended path");
-                    }
-                    _ => {} // CommandComplete("SET"), ParameterStatus, etc.
-                }
-            }
         }
 
         // Relay backend responses until ReadyForQuery.
@@ -1392,12 +1407,11 @@ where
             _ => None,
         };
         let tx_status = loop {
-            let (tag, body) = match read_tagged_frame(&mut backend_socket).await {
+            let (tag, body) = match read_tagged_frame(&mut conn.stream).await {
                 Ok(frame) => frame,
                 Err(e) => {
                     self.cancel_registry.clear_active(&session.state.id);
                     pool.discard(conn)?;
-                    drop(backend_socket);
                     return Err(ProxyError::Protocol(e));
                 }
             };
@@ -1411,7 +1425,6 @@ where
                     if body.len() != 1 {
                         self.cancel_registry.clear_active(&session.state.id);
                         pool.discard(conn)?;
-                        drop(backend_socket);
                         return Err(ProxyError::Protocol(ProtocolError::Malformed(
                             "ReadyForQuery body length is not 1".into(),
                         )));
@@ -1421,10 +1434,10 @@ where
                         None => {
                             self.cancel_registry.clear_active(&session.state.id);
                             pool.discard(conn)?;
-                            drop(backend_socket);
-                            return Err(ProxyError::Protocol(ProtocolError::Malformed(
-                                format!("ReadyForQuery invalid status byte: 0x{:02x}", body[0]),
-                            )));
+                            return Err(ProxyError::Protocol(ProtocolError::Malformed(format!(
+                                "ReadyForQuery invalid status byte: 0x{:02x}",
+                                body[0]
+                            ))));
                         }
                     };
                     break status;
@@ -1438,30 +1451,43 @@ where
                     if cmd_tag == "COMMIT" {
                         commit_tag_seen = true;
                     }
-                    write_raw_frame_to(client_stream, tag, &body).await?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        return Err(e);
+                    }
                 }
                 b'E' => {
                     // ErrorResponse.
                     had_error = true;
-                    write_raw_frame_to(client_stream, tag, &body).await?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        return Err(e);
+                    }
                 }
                 b'G' => {
                     // COPY ... FROM STDIN via the extended protocol: relay
                     // CopyInResponse, then switch to relaying the client's
                     // copy stream to the backend until CopyDone/CopyFail.
-                    write_raw_frame_to(client_stream, tag, &body).await?;
-                    client_stream
-                        .flush()
-                        .await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    let copy_result =
-                        relay_copy_in_stream(&mut backend_socket, client_stream).await;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        return Err(e);
+                    }
+                    if let Err(e) = client_stream.flush().await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        return Err(ProxyError::Protocol(ProtocolError::Io(e)));
+                    }
+                    let copy_result = relay_copy_in_stream(&mut conn.stream, client_stream).await;
                     // The Sync pipelined behind Execute was consumed and
                     // ignored by the backend while in copy-in mode (per
                     // protocol spec); send a fresh one or ReadyForQuery
                     // never arrives.
                     let sync_result = match copy_result {
-                        Ok(()) => backend_socket
+                        Ok(()) => conn
+                            .stream
                             .write_all(&[b'S', 0, 0, 0, 4])
                             .await
                             .map_err(ProtocolError::Io),
@@ -1472,7 +1498,6 @@ where
                         // state; this connection must not be reused.
                         self.cancel_registry.clear_active(&session.state.id);
                         pool.discard(conn)?;
-                        drop(backend_socket);
                         return Err(ProxyError::Protocol(e));
                     }
                 }
@@ -1484,15 +1509,21 @@ where
                     let (name, value) = extract_two_cstrings_from_body(&body);
                     if Some(name.as_str()) == extension_guc_name {
                         reported_lsn = crate::health::parse_lsn(&value);
-                    } else {
-                        write_raw_frame_to(client_stream, tag, &body).await?;
+                    } else if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        return Err(e);
                     }
                 }
                 _ => {
                     // Everything else (ParseComplete, BindComplete, DataRow,
                     // RowDescription, NoData, ParameterDescription,
                     // CloseComplete, NoticeResponse, etc.): relay raw.
-                    write_raw_frame_to(client_stream, tag, &body).await?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        pool.discard(conn)?;
+                        return Err(e);
+                    }
                 }
             }
         };
@@ -1529,8 +1560,7 @@ where
         // pending_write fallback pipeline query on the next read.
         if let Some(lsn) = reported_lsn {
             if committed_write {
-                self.lsn_tracker
-                    .record_write(&session.state.id, lsn);
+                self.lsn_tracker.record_write(&session.state.id, lsn);
                 session.pending_write = false;
                 session.extension_detected = true;
             }
@@ -1541,18 +1571,19 @@ where
         if tx_status == TransactionStatus::Idle {
             session.tx_has_writes = false;
         }
+        if batch_pinning_trigger.is_some() && !had_error {
+            conn.current_application_name = None;
+        }
 
         // Return or hold the backend connection.
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn, socket: backend_socket });
+            session.held_backend = Some(HeldBackend { conn });
         } else if conn.dirty {
-            // Dirty connections cannot be cached — must go through cleaner.
-            self.connection_registry
-                .insert(&conn.node_id, conn.backend_pid, backend_socket);
+            // Dirty connections cannot be cached — release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache for reuse by the next query in this session.
-            session.cached_idle_backend = Some(HeldBackend { conn, socket: backend_socket });
+            session.cached_idle_backend = Some(HeldBackend { conn });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -1571,6 +1602,20 @@ where
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let expected_status = transaction_status_for_state(session.state.tx_state);
+        let appname_result = {
+            let held = session.held_backend.as_mut().expect("checked by caller");
+            ensure_application_name(&mut held.conn, &session.application_name, expected_status)
+                .await
+        };
+        if let Err(error) = appname_result {
+            let held = session.held_backend.take().expect("checked by caller");
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                let _ = pool.discard(held.conn);
+            }
+            return Err(ProxyError::Protocol(error));
+        }
+
         let held = session.held_backend.as_mut().expect("checked by caller");
 
         // Send all buffered raw frames + Sync to the backend in one write.
@@ -1584,22 +1629,20 @@ where
             held.conn.secret_key,
         );
 
-        if let Err(e) = held.socket.write_all(&outbound).await {
+        if let Err(e) = held.conn.stream.write_all(&outbound).await {
             self.cancel_registry.clear_active(&session.state.id);
             let held = session.held_backend.take().unwrap();
-            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                 let _ = pool.discard(held.conn);
             }
-            drop(held.socket);
             return Err(ProxyError::Protocol(e.into()));
         }
-        if let Err(e) = held.socket.flush().await {
+        if let Err(e) = held.conn.stream.flush().await {
             self.cancel_registry.clear_active(&session.state.id);
             let held = session.held_backend.take().unwrap();
-            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                 let _ = pool.discard(held.conn);
             }
-            drop(held.socket);
             return Err(ProxyError::Protocol(e.into()));
         }
 
@@ -1615,15 +1658,14 @@ where
             _ => None,
         };
         let tx_status = loop {
-            let (tag, body) = match read_tagged_frame(&mut held.socket).await {
+            let (tag, body) = match read_tagged_frame(&mut held.conn.stream).await {
                 Ok(frame) => frame,
                 Err(e) => {
                     self.cancel_registry.clear_active(&session.state.id);
                     let held = session.held_backend.take().unwrap();
-                    if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                    if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                         let _ = pool.discard(held.conn);
                     }
-                    drop(held.socket);
                     return Err(ProxyError::Protocol(e));
                 }
             };
@@ -1634,10 +1676,10 @@ where
                     if body.len() != 1 {
                         self.cancel_registry.clear_active(&session.state.id);
                         let held = session.held_backend.take().unwrap();
-                        if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session)
+                        {
                             let _ = pool.discard(held.conn);
                         }
-                        drop(held.socket);
                         return Err(ProxyError::Protocol(ProtocolError::Malformed(
                             "ReadyForQuery body length is not 1".into(),
                         )));
@@ -1647,13 +1689,15 @@ where
                         None => {
                             self.cancel_registry.clear_active(&session.state.id);
                             let held = session.held_backend.take().unwrap();
-                            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                            if let Some(pool) =
+                                self.resolve_pool_existing(&held.conn.node_id, session)
+                            {
                                 let _ = pool.discard(held.conn);
                             }
-                            drop(held.socket);
-                            return Err(ProxyError::Protocol(ProtocolError::Malformed(
-                                format!("ReadyForQuery invalid status byte: 0x{:02x}", body[0]),
-                            )));
+                            return Err(ProxyError::Protocol(ProtocolError::Malformed(format!(
+                                "ReadyForQuery invalid status byte: 0x{:02x}",
+                                body[0]
+                            ))));
                         }
                     };
                     break status;
@@ -1666,25 +1710,51 @@ where
                     if cmd_tag == "COMMIT" {
                         commit_tag_seen = true;
                     }
-                    write_raw_frame_to(client_stream, tag, &body).await?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        return Err(e);
+                    }
                 }
                 b'E' => {
                     had_error = true;
-                    write_raw_frame_to(client_stream, tag, &body).await?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        return Err(e);
+                    }
                 }
                 b'G' => {
                     // COPY ... FROM STDIN on the held backend: same handling
                     // as the non-held path (see handle_extended_query_batch).
-                    write_raw_frame_to(client_stream, tag, &body).await?;
-                    client_stream
-                        .flush()
-                        .await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        return Err(e);
+                    }
+                    if let Err(e) = client_stream.flush().await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        return Err(ProxyError::Protocol(ProtocolError::Io(e)));
+                    }
                     let copy_result =
-                        relay_copy_in_stream(&mut held.socket, client_stream).await;
+                        relay_copy_in_stream(&mut held.conn.stream, client_stream).await;
                     let sync_result = match copy_result {
                         Ok(()) => held
-                            .socket
+                            .conn
+                            .stream
                             .write_all(&[b'S', 0, 0, 0, 4])
                             .await
                             .map_err(ProtocolError::Io),
@@ -1693,10 +1763,10 @@ where
                     if let Err(e) = sync_result {
                         self.cancel_registry.clear_active(&session.state.id);
                         let held = session.held_backend.take().unwrap();
-                        if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session)
+                        {
                             let _ = pool.discard(held.conn);
                         }
-                        drop(held.socket);
                         return Err(ProxyError::Protocol(e));
                     }
                 }
@@ -1706,12 +1776,24 @@ where
                     let (name, value) = extract_two_cstrings_from_body(&body);
                     if Some(name.as_str()) == extension_guc_name {
                         reported_lsn = crate::health::parse_lsn(&value);
-                    } else {
-                        write_raw_frame_to(client_stream, tag, &body).await?;
+                    } else if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        return Err(e);
                     }
                 }
                 _ => {
-                    write_raw_frame_to(client_stream, tag, &body).await?;
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.cancel_registry.clear_active(&session.state.id);
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                            let _ = pool.discard(held.conn);
+                        }
+                        return Err(e);
+                    }
                 }
             }
         };
@@ -1740,10 +1822,11 @@ where
                 let held = session.held_backend.as_mut().expect("checked by caller");
                 if batch_pinning_trigger.is_some() {
                     held.conn.dirty = true;
+                    held.conn.current_application_name = None;
                 }
                 if !held.conn.pinned {
                     let node_id = held.conn.node_id.clone();
-                    if let Some(pool) = self.resolve_pool(&node_id, session) {
+                    if let Some(pool) = self.resolve_pool_existing(&node_id, session) {
                         let held = session.held_backend.as_mut().expect("checked");
                         pool.pin(&session.state.id, &mut held.conn);
                     }
@@ -1770,8 +1853,7 @@ where
         // Extension LSN capture (same as non-held path).
         if let Some(lsn) = reported_lsn {
             if committed_write {
-                self.lsn_tracker
-                    .record_write(&session.state.id, lsn);
+                self.lsn_tracker.record_write(&session.state.id, lsn);
                 session.pending_write = false;
                 session.extension_detected = true;
             }
@@ -1792,14 +1874,14 @@ where
                 // parsed on this connection which is now returning to the
                 // pool. A cross-Sync Bind("") must be rejected since a
                 // different connection may be acquired next time.
-                let pool = self.resolve_pool(&held.conn.node_id, session).ok_or_else(|| {
-                    ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
-                        "pool for '{}' no longer exists",
-                        held.conn.node_id
-                    )))
-                })?;
-                self.connection_registry
-                    .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
+                let pool = self
+                    .resolve_pool_existing(&held.conn.node_id, session)
+                    .ok_or_else(|| {
+                        ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
+                            "pool for '{}' no longer exists",
+                            held.conn.node_id
+                        )))
+                    })?;
                 pool.release(&session.state.id, held.conn).await?;
             }
         }
@@ -1808,7 +1890,7 @@ where
     }
 
     /// Times and logs one simple-query statement (Requirement: wire up
-    /// `config.logging.query_log`/`slow_query`, see `QueryLogSettings`
+    /// `config.logging.query_trace`/`slow_query`, see `QueryLogSettings`
     /// docs), then delegates the actual routing/forwarding work to
     /// `handle_simple_query_inner`. Kept as a thin wrapper around the
     /// inner method (rather than threading timing through every early
@@ -1850,7 +1932,8 @@ where
             Some(NodeType::Analytics) => "analytics",
             None => "unknown",
         };
-        metrics::histogram!("trident_query_duration_ms", "target" => target_label).record(elapsed_ms_f64);
+        metrics::histogram!("trident_query_duration_ms", "target" => target_label)
+            .record(elapsed_ms_f64);
 
         let elapsed_ms = elapsed_ms_f64.round() as u64;
         if elapsed_ms >= self.query_log.slow_query_threshold_ms {
@@ -1888,6 +1971,20 @@ where
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let expected_status = transaction_status_for_state(session.state.tx_state);
+        let appname_result = {
+            let held = session.held_backend.as_mut().expect("checked by caller");
+            ensure_application_name(&mut held.conn, &session.application_name, expected_status)
+                .await
+        };
+        if let Err(error) = appname_result {
+            let held = session.held_backend.take().expect("checked by caller");
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                let _ = pool.discard(held.conn);
+            }
+            return Err(ProxyError::Protocol(error));
+        }
+
         let held = session.held_backend.as_mut().expect("checked by caller");
         let write_intent = query_has_write_intent(sql);
 
@@ -1907,8 +2004,7 @@ where
             LsnTrackingMode::Auto => !session.extension_detected,
             LsnTrackingMode::Extension | LsnTrackingMode::AuroraWriteForwarding => false,
         };
-        let commit_attempt = session.tx_has_writes
-            && transaction_end_tag(sql) == Some("COMMIT");
+        let commit_attempt = session.tx_has_writes && transaction_end_tag(sql) == Some("COMMIT");
         let pipeline_lsn = pipeline_mode
             && !self.lsn_tracking.pipeline.lazy_fallback
             && pipeline_safe_sql(sql)
@@ -1921,7 +2017,7 @@ where
             held.conn.secret_key,
         );
         let relay_result = forward_simple_query_with_options(
-            &mut held.socket,
+            &mut held.conn.stream,
             client_stream,
             sql,
             QueryForwardOptions {
@@ -1942,10 +2038,9 @@ where
             Err(failure) => {
                 session.state.tx_state = TxState::Failed;
                 let held = session.held_backend.take().unwrap();
-                if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                     let _ = pool.discard(held.conn);
                 }
-                drop(held.socket);
                 if failure.error_response_relayed {
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
@@ -1954,10 +2049,14 @@ where
             }
         };
 
-        if self.lsn_tracking.mode == LsnTrackingMode::Auto
-            && relay_outcome.reported_lsn.is_some()
-        {
+        if self.lsn_tracking.mode == LsnTrackingMode::Auto && relay_outcome.reported_lsn.is_some() {
             session.extension_detected = true;
+        }
+
+        if detects_pinning_trigger(sql).is_some() && !relay_outcome.had_error_response {
+            if let Some(held) = session.held_backend.as_mut() {
+                held.conn.current_application_name = None;
+            }
         }
 
         if write_intent && !relay_outcome.had_error_response {
@@ -2004,14 +2103,14 @@ where
                 // Keep in held_backend — nothing to do.
             } else {
                 let held = session.held_backend.take().unwrap();
-                let pool = self.resolve_pool(&held.conn.node_id, session).ok_or_else(|| {
-                    ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
-                        "pool for '{}' no longer exists",
-                        held.conn.node_id
-                    )))
-                })?;
-                self.connection_registry
-                    .insert(&held.conn.node_id, held.conn.backend_pid, held.socket);
+                let pool = self
+                    .resolve_pool_existing(&held.conn.node_id, session)
+                    .ok_or_else(|| {
+                        ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
+                            "pool for '{}' no longer exists",
+                            held.conn.node_id
+                        )))
+                    })?;
                 pool.release(&session.state.id, held.conn).await?;
             }
         }
@@ -2021,10 +2120,9 @@ where
         // and must not be reused.
         if !relay_outcome.connection_reusable {
             if let Some(held) = session.held_backend.take() {
-                if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                     let _ = pool.discard(held.conn);
                 }
-                drop(held.socket);
             }
         }
 
@@ -2039,7 +2137,7 @@ where
 
         self.cancel_registry.clear_active(&session.state.id);
         if let Some(held) = session.held_backend.take() {
-            if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                 if let Err(error) = pool.discard(held.conn) {
                     tracing::warn!(error = %error, "failed to discard aborted transaction connection");
                 }
@@ -2049,7 +2147,6 @@ where
                     "cannot update pool accounting for aborted transaction: pool no longer exists"
                 );
             }
-            drop(held.socket);
         }
         session.state.tx_state = TxState::Failed;
     }
@@ -2093,9 +2190,9 @@ where
                 node.node_id == *node_id && node.node_type == NodeType::Reader && node.healthy
             });
             if !still_available {
-                return Err(ProxyError::Pool(
-                    crate::pool::pool::PoolError::Exhausted(node_id.clone()),
-                ));
+                return Err(ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(
+                    node_id.clone(),
+                )));
             }
             node_id.clone()
         } else {
@@ -2123,12 +2220,11 @@ where
         let pool = self.resolve_pool(&node_id, session).ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(node_id.clone()))
         })?;
-        let (conn, mut socket) = if let Some(held) = session.held_backend.take() {
+        let (mut conn, backend_status) = if let Some(held) = session.held_backend.take() {
             if held.conn.node_id != node_id {
-                if let Some(held_pool) = self.resolve_pool(&held.conn.node_id, session) {
+                if let Some(held_pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                     held_pool.discard(held.conn)?;
                 }
-                drop(held.socket);
                 session.aurora_initialized_backend_pid = None;
                 return Err(ProxyError::Pool(
                     crate::pool::pool::PoolError::CleanupFailed(format!(
@@ -2136,35 +2232,32 @@ where
                     )),
                 ));
             }
-            (held.conn, held.socket)
+            (
+                held.conn,
+                transaction_status_for_state(session.state.tx_state),
+            )
         } else {
-            let conn = pool.acquire(&session.state.id).await?;
-            let socket = match self
-                .connection_registry
-                .take(&conn.node_id, conn.backend_pid)
-            {
-                Some(socket) => socket,
-                None => {
-                    session.aurora_initialized_backend_pid = None;
-                    pool.discard(conn)?;
-                    return Err(ProxyError::Pool(
-                        crate::pool::pool::PoolError::CleanupFailed(
-                            "Aurora backend connection socket missing from registry".into(),
-                        ),
-                    ));
-                }
-            };
-            (conn, socket)
+            (
+                pool.acquire(&session.state.id).await?,
+                TransactionStatus::Idle,
+            )
         };
+
+        if let Err(error) =
+            ensure_application_name(&mut conn, &session.application_name, backend_status).await
+        {
+            session.aurora_initialized_backend_pid = None;
+            pool.discard(conn)?;
+            return Err(ProxyError::Protocol(error));
+        }
 
         if session.aurora_initialized_backend_pid != Some(conn.backend_pid) {
             let init_sql = aurora_consistency_sql(session.state.consistency);
             if let Err(error) =
-                execute_internal_query(&mut socket, &init_sql, TransactionStatus::Idle).await
+                execute_internal_query(&mut conn.stream, &init_sql, TransactionStatus::Idle).await
             {
                 session.aurora_initialized_backend_pid = None;
                 pool.discard(conn)?;
-                drop(socket);
                 return Err(ProxyError::Protocol(error));
             }
             session.aurora_initialized_backend_pid = Some(conn.backend_pid);
@@ -2186,7 +2279,7 @@ where
             conn.backend_pid,
             conn.secret_key,
         );
-        let relay = forward_simple_query(&mut socket, client_stream, forwarded_sql).await;
+        let relay = forward_simple_query(&mut conn.stream, client_stream, forwarded_sql).await;
         self.cancel_registry.clear_active(&session.state.id);
         let outcome = match relay {
             Ok(outcome) => outcome,
@@ -2196,7 +2289,6 @@ where
                     session.state.tx_state = TxState::Failed;
                 }
                 pool.discard(conn)?;
-                drop(socket);
                 if failure.error_response_relayed {
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
@@ -2208,13 +2300,21 @@ where
         if translated_sql.is_some() && outcome.had_error_response {
             session.state.consistency = previous_consistency;
         }
+        if translated_sql.is_none()
+            && detects_pinning_trigger(sql).is_some()
+            && !outcome.had_error_response
+        {
+            conn.dirty = true;
+            conn.current_application_name = None;
+            if !conn.pinned {
+                pool.pin(&session.state.id, &mut conn);
+            }
+        }
         session.state.tx_state = apply_ready_for_query(outcome.tx_status);
 
-        if session.state.tx_state != TxState::Idle {
-            session.held_backend = Some(HeldBackend { conn, socket });
+        if session.state.tx_state != TxState::Idle || conn.pinned {
+            session.held_backend = Some(HeldBackend { conn });
         } else {
-            self.connection_registry
-                .insert(&conn.node_id, conn.backend_pid, socket);
             pool.release(&session.state.id, conn).await?;
         }
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -2241,19 +2341,40 @@ where
             Some(writer_id) => writer_id,
             None => return false,
         };
-        let timeout_duration = std::time::Duration::from_millis(
-            self.lsn_tracking.pipeline.internal_query_timeout_ms,
-        );
+        let timeout_duration =
+            std::time::Duration::from_millis(self.lsn_tracking.pipeline.internal_query_timeout_ms);
 
         if session
             .held_backend
             .as_ref()
             .is_some_and(|held| held.conn.node_id == writer_id)
         {
+            let appname_result = {
+                let held = session.held_backend.as_mut().expect("checked above");
+                ensure_application_name(
+                    &mut held.conn,
+                    &session.application_name,
+                    transaction_status_for_state(session.state.tx_state),
+                )
+                .await
+            };
+            if let Err(error) = appname_result {
+                tracing::warn!(error = %error, "cannot set application_name for held lazy LSN query");
+                if let Some(held) = session.held_backend.take() {
+                    if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                        let _ = pool.discard(held.conn);
+                    }
+                }
+                return false;
+            }
+
             let result = {
                 let held = session.held_backend.as_mut().expect("checked above");
-                tokio::time::timeout(timeout_duration, fetch_current_wal_lsn(&mut held.socket))
-                    .await
+                tokio::time::timeout(
+                    timeout_duration,
+                    fetch_current_wal_lsn(&mut held.conn.stream),
+                )
+                .await
             };
             match result {
                 Ok(Ok(Some(lsn))) => {
@@ -2271,10 +2392,9 @@ where
             }
 
             if let Some(held) = session.held_backend.take() {
-                if let Some(pool) = self.resolve_pool(&held.conn.node_id, session) {
+                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
                     let _ = pool.discard(held.conn);
                 }
-                drop(held.socket);
             }
             return false;
         }
@@ -2282,29 +2402,29 @@ where
         let Some(pool) = self.resolve_pool(&writer_id, session) else {
             return false;
         };
-        let conn = match pool.acquire(&session.state.id).await {
+        let mut conn = match pool.acquire(&session.state.id).await {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(error = %error, "cannot acquire Writer for lazy LSN query");
                 return false;
             }
         };
-        let mut socket = match self
-            .connection_registry
-            .take(&conn.node_id, conn.backend_pid)
+        if let Err(error) = ensure_application_name(
+            &mut conn,
+            &session.application_name,
+            TransactionStatus::Idle,
+        )
+        .await
         {
-            Some(socket) => socket,
-            None => {
-                let _ = pool.discard(conn);
-                return false;
-            }
-        };
+            tracing::warn!(error = %error, "cannot set application_name for lazy LSN query");
+            let _ = pool.discard(conn);
+            return false;
+        }
 
-        let result = tokio::time::timeout(timeout_duration, fetch_current_wal_lsn(&mut socket)).await;
+        let result =
+            tokio::time::timeout(timeout_duration, fetch_current_wal_lsn(&mut conn.stream)).await;
         match result {
             Ok(Ok(lsn)) => {
-                self.connection_registry
-                    .insert(&conn.node_id, conn.backend_pid, socket);
                 if let Err(error) = pool.release(&session.state.id, conn).await {
                     tracing::warn!(error = %error, "failed to release Writer after lazy LSN query");
                     return false;
@@ -2320,13 +2440,11 @@ where
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "lazy Writer LSN query failed; forcing Writer routing");
                 let _ = pool.discard(conn);
-                drop(socket);
                 false
             }
             Err(_) => {
                 tracing::warn!("lazy Writer LSN query timed out; forcing Writer routing");
                 let _ = pool.discard(conn);
-                drop(socket);
                 false
             }
         }
@@ -2346,14 +2464,15 @@ where
                 "active split transaction has no held backend".into(),
             ))
         })?;
-        let conn = held.conn;
-        let mut socket = held.socket;
-        let pool = self.resolve_pool(&conn.node_id, session).ok_or_else(|| {
-            ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
-                "pool for split transaction node '{}' no longer exists",
-                conn.node_id
-            )))
-        })?;
+        let mut conn = held.conn;
+        let pool = self
+            .resolve_pool_existing(&conn.node_id, session)
+            .ok_or_else(|| {
+                ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
+                    "pool for split transaction node '{}' no longer exists",
+                    conn.node_id
+                )))
+            })?;
 
         let commit_attempt = session.tx_has_writes && transaction_end_tag(sql) == Some("COMMIT");
         let pipeline_mode = match self.lsn_tracking.mode {
@@ -2375,7 +2494,7 @@ where
             conn.secret_key,
         );
         let relay = forward_simple_query_with_options(
-            &mut socket,
+            &mut conn.stream,
             client_stream,
             sql,
             QueryForwardOptions {
@@ -2394,7 +2513,6 @@ where
             Ok(outcome) => outcome,
             Err(failure) => {
                 pool.discard(conn)?;
-                drop(socket);
                 session.state.tx_state = TxState::Failed;
                 if failure.error_response_relayed {
                     // The client already has the backend's ErrorResponse;
@@ -2430,15 +2548,12 @@ where
         session.state.tx_state = apply_ready_for_query(outcome.tx_status);
         if !outcome.connection_reusable {
             pool.discard(conn)?;
-            drop(socket);
             send_ready_for_query(client_stream, session.state.tx_state).await?;
             return Ok(());
         }
         if conn.pinned {
-            session.held_backend = Some(HeldBackend { conn, socket });
+            session.held_backend = Some(HeldBackend { conn });
         } else {
-            self.connection_registry
-                .insert(&conn.node_id, conn.backend_pid, socket);
             pool.release(&session.state.id, conn).await?;
         }
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -2643,9 +2758,7 @@ where
                         tx_state: session.state.tx_state,
                         tx_split: &mut reroute_split,
                         consistency: session.state.consistency,
-                        session_write_lsn: self
-                            .lsn_tracker
-                            .session_write_lsn(&session.state.id),
+                        session_write_lsn: self.lsn_tracker.session_write_lsn(&session.state.id),
                         global_write_lsn: self.lsn_tracker.global_write_lsn(),
                     };
                     self.router.route(sql, &mut ctx, &readers, &analytics).await
@@ -2667,7 +2780,9 @@ where
                 decision = RouteDecision {
                     target: NodeType::Writer,
                     node_id: None,
-                    reason: std::borrow::Cow::Borrowed("pending write watermark unavailable; conservative Writer fallback"),
+                    reason: std::borrow::Cow::Borrowed(
+                        "pending write watermark unavailable; conservative Writer fallback",
+                    ),
                     forced_by_hint: false,
                     fallback_to_writer: true,
                     requires_split_upgrade: requires_upgrade,
@@ -2719,8 +2834,11 @@ where
             session.state.tx_split = tx_split_before_routing;
             // No healthy candidate available for the chosen target.
             let pseudo_node_id = format!("{:?}", decision.target);
-            metrics::counter!("trident_pool_exhausted_total", "node_id" => pseudo_node_id.clone()).increment(1);
-            return Err(ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(pseudo_node_id)));
+            metrics::counter!("trident_pool_exhausted_total", "node_id" => pseudo_node_id.clone())
+                .increment(1);
+            return Err(ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(
+                pseudo_node_id,
+            )));
         }
 
         let mut split_reader_rolled_back = false;
@@ -2737,12 +2855,10 @@ where
                 }
             };
             let mut reader_conn = held.conn;
-            let mut reader_socket = held.socket;
-            let reader_pool = match self.resolve_pool(&reader_conn.node_id, session) {
+            let reader_pool = match self.resolve_pool_existing(&reader_conn.node_id, session) {
                 Some(pool) => pool,
                 None => {
                     session.state.tx_state = TxState::Failed;
-                    drop(reader_socket);
                     return Err(ProxyError::Pool(
                         crate::pool::pool::PoolError::CleanupFailed(format!(
                             "pool for split Reader '{}' no longer exists",
@@ -2752,42 +2868,24 @@ where
                 }
             };
 
-            if let Err(error) = execute_internal_query(
-                &mut reader_socket,
-                "ROLLBACK",
-                TransactionStatus::Idle,
-            )
-            .await
+            if let Err(error) =
+                execute_internal_query(&mut reader_conn.stream, "ROLLBACK", TransactionStatus::Idle)
+                    .await
             {
                 session.state.tx_state = TxState::Failed;
                 reader_pool.discard(reader_conn)?;
-                drop(reader_socket);
                 return Err(ProxyError::Protocol(error));
             }
             split_reader_rolled_back = true;
 
             // In Transaction mode the ROLLBACK leaves the connection in a
-            // clean Idle state, so we can return it to the pool for reuse
-            // instead of destroying the TCP connection. In Session mode,
-            // `release` is a no-op which would leave a second node binding
-            // behind after the upgrade, so we must discard.
+            // clean Idle state, so return the complete connection for reuse.
+            // In Session mode this Reader binding must be discarded because
+            // the transaction is moving to a different backend.
             match reader_pool.mode() {
                 PoolMode::Transaction => {
-                    // ROLLBACK already reset transaction state; clear dirty
-                    // so release does not issue an unnecessary DISCARD ALL.
                     reader_conn.dirty = false;
-                    // Put the socket back in the registry before release —
-                    // the pool's idle-queue only holds metadata; the socket
-                    // must be findable via the registry for the next acquire.
-                    self.connection_registry.insert(
-                        &reader_conn.node_id,
-                        reader_conn.backend_pid,
-                        reader_socket,
-                    );
-                    if let Err(error) = reader_pool
-                        .release(&session.state.id, reader_conn)
-                        .await
-                    {
+                    if let Err(error) = reader_pool.release(&session.state.id, reader_conn).await {
                         session.state.tx_state = TxState::Failed;
                         return Err(ProxyError::Pool(error));
                     }
@@ -2795,31 +2893,20 @@ where
                 PoolMode::Session => {
                     if let Err(error) = reader_pool.discard(reader_conn) {
                         session.state.tx_state = TxState::Failed;
-                        drop(reader_socket);
                         return Err(ProxyError::Pool(error));
                     }
-                    drop(reader_socket);
                 }
             }
         }
 
-        let freshly_checked_out;
-        let (mut conn, mut backend_socket) = if let Some(held) = session.held_backend.take() {
+        let current_gen = self.connection_registry.map(|r| r.node_generation(&target_node_id));
+        let mut conn = if let Some(held) = session.held_backend.take() {
             // PostgreSQL transaction and session state is connection-local.
-            // Once held, route decisions may not move the session to a
-            // different physical backend until the transaction ends (or
-            // the session itself closes).
-            freshly_checked_out = false;
-            (held.conn, held.socket)
-        } else if let Some(cached) = session.take_cached_if_matches(&target_node_id) {
-            // Fast path: reuse the cached idle connection from the
-            // previous autocommit query to the same node. Skips
-            // pool.acquire + registry.take (2 mutex locks avoided).
-            freshly_checked_out = false;
-            (cached.conn, cached.socket)
+            held.conn
+        } else if let Some(cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
+            // Fast path: reuse the complete cached idle connection.
+            cached.conn
         } else {
-            // Release any cached connection to a different node before
-            // acquiring from the target pool.
             self.release_cached_backend(session).await;
 
             let target_pool = match self.resolve_pool(&target_node_id, session) {
@@ -2832,13 +2919,13 @@ where
                     } else {
                         session.state.tx_split = tx_split_before_routing.clone();
                     }
-                    return Err(ProxyError::Pool(
-                        crate::pool::pool::PoolError::Exhausted(target_node_id.clone()),
-                    ));
+                    return Err(ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(
+                        target_node_id.clone(),
+                    )));
                 }
             };
 
-            let conn: PooledConnection = match target_pool.acquire(&session.state.id).await {
+            match target_pool.acquire(&session.state.id).await {
                 Ok(conn) => conn,
                 Err(e) => {
                     if matches!(e, crate::pool::pool::PoolError::Exhausted(_)) {
@@ -2852,41 +2939,32 @@ where
                     }
                     return Err(ProxyError::Pool(e));
                 }
-            };
-
-            let socket = match self.connection_registry.take(&conn.node_id, conn.backend_pid) {
-                Some(socket) => socket,
-                None => {
-                    // Metadata without a socket is unusable and must not be
-                    // released into the idle queue, where it would poison
-                    // every subsequent borrower while retaining its slot.
-                    target_pool.discard(conn)?;
-                    if split_reader_rolled_back {
-                        session.state.tx_state = TxState::Failed;
-                    } else {
-                        session.state.tx_split = tx_split_before_routing.clone();
-                    }
-                    return Err(ProxyError::Pool(
-                        crate::pool::pool::PoolError::CleanupFailed(
-                            "backend connection socket missing from registry".into(),
-                        ),
-                    ));
-                }
-            };
-
-            // SET application_name is pipelined with the user query below
-            // (via QueryForwardOptions::appname_prefix) — no separate roundtrip.
-            freshly_checked_out = true;
-
-            (conn, socket)
+            }
         };
 
-        let pool = self.resolve_pool(&conn.node_id, session).ok_or_else(|| {
-            ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
-                "pool for held backend node '{}' no longer exists",
-                conn.node_id
-            )))
-        })?;
+        let pool = self
+            .resolve_pool_existing(&conn.node_id, session)
+            .ok_or_else(|| {
+                ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(format!(
+                    "pool for held backend node '{}' no longer exists",
+                    conn.node_id
+                )))
+            })?;
+
+        // QueryForwardOptions does not expose whether an appname prefix
+        // succeeded independently of the user query. Use a standalone
+        // internal cycle so the per-connection cache is updated only after
+        // SET is confirmed successful.
+        if let Err(error) = ensure_application_name(
+            &mut conn,
+            &session.application_name,
+            TransactionStatus::Idle,
+        )
+        .await
+        {
+            pool.discard(conn)?;
+            return Err(ProxyError::Protocol(error));
+        }
 
         if pinning_trigger.is_some() && !conn.pinned {
             pool.pin(&session.state.id, &mut conn);
@@ -2907,7 +2985,6 @@ where
                 None => {
                     session.state.tx_state = TxState::Failed;
                     pool.discard(conn)?;
-                    drop(backend_socket);
                     return Err(ProxyError::Protocol(ProtocolError::Malformed(
                         "split transaction is missing its delayed BEGIN command".into(),
                     )));
@@ -2942,16 +3019,6 @@ where
             && pipeline_safe_sql(sql)
             && ((prior_tx_state == TxState::Idle && write_intent) || commit_attempt);
 
-        // Build pipelined SET application_name for freshly checked-out connections.
-        let appname_sql = if freshly_checked_out && !session.application_name.is_empty() {
-            Some(format!(
-                "SET application_name = '{}'",
-                session.application_name.replace('\'', "''")
-            ))
-        } else {
-            None
-        };
-
         // Requirements 7.1-7.3: mark this session as having a query in
         // flight against this exact real backend connection *before*
         // sending it, and always clear that mark once the round trip
@@ -2964,7 +3031,7 @@ where
             conn.secret_key,
         );
         let relay_result = forward_simple_query_with_options(
-            &mut backend_socket,
+            &mut conn.stream,
             client_stream,
             sql,
             QueryForwardOptions {
@@ -2974,7 +3041,7 @@ where
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
                 begin_prefix: delayed_begin,
-                appname_prefix: appname_sql.as_deref(),
+                appname_prefix: None,
             },
         )
         .await;
@@ -2986,14 +3053,12 @@ where
                 // The backend socket may be in an unknown state after a
                 // protocol-level failure (as opposed to a normal
                 // ErrorResponse followed by ReadyForQuery). Do not return it
-                // to the registry/pool. If an ErrorResponse was already
-                // relayed, only synthesize the missing ReadyForQuery; the
+                // to the pool. If an ErrorResponse was already relayed, only synthesize the missing ReadyForQuery; the
                 // outer loop must not send a duplicate error.
                 if session.state.tx_state != TxState::Idle {
                     session.state.tx_state = TxState::Failed;
                 }
                 pool.discard(conn)?;
-                drop(backend_socket);
                 if failure.error_response_relayed {
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
@@ -3002,9 +3067,7 @@ where
             }
         };
 
-        if self.lsn_tracking.mode == LsnTrackingMode::Auto
-            && relay_outcome.reported_lsn.is_some()
-        {
+        if self.lsn_tracking.mode == LsnTrackingMode::Auto && relay_outcome.reported_lsn.is_some() {
             session.extension_detected = true;
         }
 
@@ -3025,7 +3088,8 @@ where
         {
             session.tx_has_writes = true;
         }
-        if transaction_end_tag(sql).is_some() && relay_outcome.tx_status == TransactionStatus::Idle {
+        if transaction_end_tag(sql).is_some() && relay_outcome.tx_status == TransactionStatus::Idle
+        {
             session.tx_has_writes = false;
         }
 
@@ -3047,37 +3111,25 @@ where
         // backend stream, and resolve the pending watermark lazily later.
         if !relay_outcome.connection_reusable {
             pool.discard(conn)?;
-            drop(backend_socket);
             send_ready_for_query(client_stream, session.state.tx_state).await?;
             return Ok(());
         }
 
         if pinning_trigger.is_some() {
             conn.dirty = true;
+            if !relay_outcome.had_error_response {
+                conn.current_application_name = None;
+            }
         }
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            // Keep both metadata and socket out of the shared registry so
-            // no other session can observe transaction/session-local state.
-            session.held_backend = Some(HeldBackend {
-                conn,
-                socket: backend_socket,
-            });
+            session.held_backend = Some(HeldBackend { conn });
         } else if conn.dirty {
-            // Dirty connections cannot be cached — must go through the
-            // cleaner (DISCARD ALL) via pool.release.
-            self.connection_registry
-                .insert(&conn.node_id, conn.backend_pid, backend_socket);
+            // Dirty connections cannot be cached; release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
-            // Cache this clean idle connection for potential reuse by the
-            // next query in this session. Avoids pool.release +
-            // registry.insert + registry.take + pool.acquire on the next
-            // query if it routes to the same node.
-            session.cached_idle_backend = Some(HeldBackend {
-                conn,
-                socket: backend_socket,
-            });
+            // Cache the complete clean idle connection for same-node reuse.
+            session.cached_idle_backend = Some(HeldBackend { conn });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await?;
@@ -3171,10 +3223,14 @@ fn record_statement_routes(session: &mut ClientSession, batch: &[ExtendedFrame],
 /// batch contains a Bind referencing the unnamed statement (meaning the
 /// Parse+Bind+Execute cycle is complete within this batch or the Bind has
 /// consumed it). This enables cross-Sync unnamed statement routing.
-fn update_unnamed_parse_tracking(session: &mut ClientSession, batch: &[ExtendedFrame], node_id: &str) {
+fn update_unnamed_parse_tracking(
+    session: &mut ClientSession,
+    batch: &[ExtendedFrame],
+    node_id: &str,
+) {
     let has_unnamed_parse = batch.iter().any(|frame| {
-        frame.tag == frontend_tag::PARSE
-            && frame.body.first().is_some_and(|&b| b == 0) // empty name = unnamed
+        frame.tag == frontend_tag::PARSE && frame.body.first().is_some_and(|&b| b == 0)
+        // empty name = unnamed
     });
     let has_unnamed_bind = batch.iter().any(|frame| {
         frame.tag == frontend_tag::BIND && {
@@ -3291,6 +3347,43 @@ fn known_node_ids(pool_manager: &impl PoolManager) -> Vec<String> {
         .collect()
 }
 
+fn transaction_status_for_state(state: TxState) -> TransactionStatus {
+    match state {
+        TxState::Idle => TransactionStatus::Idle,
+        TxState::InTransaction => TransactionStatus::InTransaction,
+        TxState::Failed => TransactionStatus::Failed,
+    }
+}
+
+async fn ensure_application_name(
+    conn: &mut BackendConnection,
+    desired: &str,
+    expected_status: TransactionStatus,
+) -> Result<(), ProtocolError> {
+    if desired.is_empty() || conn.current_application_name.as_deref() == Some(desired) {
+        return Ok(());
+    }
+
+    let sql = format!("SET application_name = '{}'", desired.replace('\'', "''"));
+    let mut sink = tokio::io::join(tokio::io::empty(), tokio::io::sink());
+    let outcome = forward_simple_query(&mut conn.stream, &mut sink, &sql)
+        .await
+        .map_err(|failure| failure.source)?;
+    if outcome.had_error_response {
+        return Err(ProtocolError::Malformed(
+            "SET application_name returned an ErrorResponse".into(),
+        ));
+    }
+    if outcome.tx_status != expected_status {
+        return Err(ProtocolError::Malformed(format!(
+            "SET application_name ended with transaction status {:?}, expected {:?}",
+            outcome.tx_status, expected_status
+        )));
+    }
+    conn.current_application_name = Some(desired.to_string());
+    Ok(())
+}
+
 async fn execute_internal_query(
     backend: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     sql: &str,
@@ -3332,7 +3425,10 @@ async fn send_startup_success<S: AsyncWrite + Unpin + Send>(
     outcome: &AuthOutcome,
 ) -> Result<(), ProxyError> {
     let auth_ok = encode_backend_message(&BackendMessage::AuthenticationOk);
-    stream.write_all(&auth_ok).await.map_err(ProtocolError::Io)?;
+    stream
+        .write_all(&auth_ok)
+        .await
+        .map_err(ProtocolError::Io)?;
 
     // Send the baseline server parameters expected by libpq and most
     // PostgreSQL drivers. These are proxy capabilities, not values copied
@@ -3359,7 +3455,10 @@ async fn send_startup_success<S: AsyncWrite + Unpin + Send>(
         pid: outcome.backend_pid,
         secret_key: outcome.secret_key,
     });
-    stream.write_all(&key_data).await.map_err(ProtocolError::Io)?;
+    stream
+        .write_all(&key_data)
+        .await
+        .map_err(ProtocolError::Io)?;
 
     send_ready_for_query(stream, TxState::Idle).await
 }
@@ -3420,7 +3519,7 @@ mod tests {
     use crate::parser::classifier::KeywordClassifier as Classifier_;
     use crate::parser::hint::RegexHintParser as HintParser_;
     use crate::parser::pattern::RegexPatternMatcher;
-    use crate::pool::conn::{MaybeTlsStream, PooledConnection};
+    use crate::pool::conn::{BackendConnection, MaybeTlsStream, PooledConnection};
     use crate::pool::pool::{ConnCleaner, ConnFactory, NodePool, PoolError};
     use crate::protocol::message::FieldDescription;
     use crate::protocol::startup::TrustStartupHandler;
@@ -3471,6 +3570,98 @@ mod tests {
             aurora_consistency_sql(ConsistencyLevel::Global),
             "SET apg_write_forward.consistency_mode = 'GLOBAL'"
         );
+    }
+
+    #[tokio::test]
+    async fn application_name_cache_updates_only_after_successful_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(address);
+        let (accepted, connected) = tokio::join!(listener.accept(), connect);
+        let (mut backend, _) = accepted.unwrap();
+        let handler_stream = connected.unwrap();
+
+        let backend_task = tokio::spawn(async move {
+            let message = crate::protocol::reader::read_frontend_message(&mut backend)
+                .await
+                .unwrap();
+            let FrontendMessage::Query(sql) = message else {
+                panic!("expected SET application_name query");
+            };
+            backend
+                .write_all(&encode_backend_message(&BackendMessage::CommandComplete {
+                    tag: "SET".to_string(),
+                }))
+                .await
+                .unwrap();
+            backend
+                .write_all(&encode_backend_message(&BackendMessage::ReadyForQuery(
+                    TransactionStatus::Idle,
+                )))
+                .await
+                .unwrap();
+            sql
+        });
+
+        let mut conn = BackendConnection::new(
+            PooledConnection::new("primary", 1, 1000),
+            MaybeTlsStream::Plain(handler_stream),
+            0,
+        );
+        ensure_application_name(&mut conn, "trident:test", TransactionStatus::Idle)
+            .await
+            .unwrap();
+        ensure_application_name(&mut conn, "trident:test", TransactionStatus::Idle)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend_task.await.unwrap(),
+            "SET application_name = 'trident:test'"
+        );
+        assert_eq!(
+            conn.current_application_name.as_deref(),
+            Some("trident:test")
+        );
+    }
+
+    #[tokio::test]
+    async fn application_name_error_response_does_not_update_cache() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(address);
+        let (accepted, connected) = tokio::join!(listener.accept(), connect);
+        let (mut backend, _) = accepted.unwrap();
+        let handler_stream = connected.unwrap();
+
+        tokio::spawn(async move {
+            let _ = crate::protocol::reader::read_frontend_message(&mut backend)
+                .await
+                .unwrap();
+            backend
+                .write_all(&encode_backend_message(&BackendMessage::ErrorResponse(
+                    PgError::simple("ERROR", "42501", "SET denied"),
+                )))
+                .await
+                .unwrap();
+            backend
+                .write_all(&encode_backend_message(&BackendMessage::ReadyForQuery(
+                    TransactionStatus::Idle,
+                )))
+                .await
+                .unwrap();
+        });
+
+        let mut conn = BackendConnection::new(
+            PooledConnection::new("primary", 1, 1000),
+            MaybeTlsStream::Plain(handler_stream),
+            0,
+        );
+        let result =
+            ensure_application_name(&mut conn, "trident:test", TransactionStatus::Idle).await;
+
+        assert!(matches!(result, Err(ProtocolError::Malformed(_))));
+        assert!(conn.current_application_name.is_none());
     }
 
     async fn read_until_ready<S>(stream: &mut S) -> Vec<BackendMessage>
@@ -3541,9 +3732,10 @@ mod tests {
                         });
                         socket.write_all(&complete).await.unwrap();
                     } else if upper.starts_with("SELECT PG_CURRENT_WAL_LSN") {
-                        let data_row = encode_backend_message(&BackendMessage::DataRow(vec![Some(
-                            b"16/B374D848".to_vec(),
-                        )]));
+                        let data_row =
+                            encode_backend_message(&BackendMessage::DataRow(vec![Some(
+                                b"16/B374D848".to_vec(),
+                            )]));
                         socket.write_all(&data_row).await.unwrap();
                         let complete = encode_backend_message(&BackendMessage::CommandComplete {
                             tag: "SELECT 1".to_string(),
@@ -3576,20 +3768,23 @@ mod tests {
                         });
                         socket.write_all(&complete).await.unwrap();
                     } else {
-                        let row_desc = encode_backend_message(&BackendMessage::RowDescription(vec![
-                            FieldDescription {
-                                name: "col1".to_string(),
-                                table_oid: 0,
-                                column_attr_num: 1,
-                                type_oid: 23,
-                                type_size: 4,
-                                type_modifier: -1,
-                                format_code: 0,
-                            },
-                        ]));
+                        let row_desc =
+                            encode_backend_message(&BackendMessage::RowDescription(vec![
+                                FieldDescription {
+                                    name: "col1".to_string(),
+                                    table_oid: 0,
+                                    column_attr_num: 1,
+                                    type_oid: 23,
+                                    type_size: 4,
+                                    type_modifier: -1,
+                                    format_code: 0,
+                                },
+                            ]));
                         socket.write_all(&row_desc).await.unwrap();
                         let data_row =
-                            encode_backend_message(&BackendMessage::DataRow(vec![Some(b"1".to_vec())]));
+                            encode_backend_message(&BackendMessage::DataRow(vec![Some(
+                                b"1".to_vec(),
+                            )]));
                         socket.write_all(&data_row).await.unwrap();
                         let complete = encode_backend_message(&BackendMessage::CommandComplete {
                             tag: "SELECT 1".to_string(),
@@ -3628,19 +3823,14 @@ mod tests {
         }
     }
 
-    /// A `ConnFactory` that, for each `acquire`-triggered `create` call,
-    /// establishes a real loopback TCP pair: one end is registered in the
-    /// shared `ConnectionRegistry` (so `ConnectionHandler` can look it up
-    /// as if it were a real backend connection), and the other end is
-    /// driven by `run_fake_backend` on a background task, standing in for
-    /// an actual PostgreSQL backend.
+    /// A `ConnFactory` that returns a complete connection backed by a local
+    /// TCP pair. The peer runs `run_fake_backend` in a background task.
     struct FakeBackendFactory {
         next_pid: AtomicI32,
-        registry: Arc<ConnectionRegistry>,
     }
 
     impl ConnFactory for FakeBackendFactory {
-        async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+        async fn create(&self, node_id: &str) -> Result<BackendConnection, PoolError> {
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
 
             let listener = TcpListener::bind("127.0.0.1:0")
@@ -3653,35 +3843,32 @@ mod tests {
             let (accept_result, connect_result) = tokio::join!(listener.accept(), connect_fut);
             let (backend_end, _peer_addr) =
                 accept_result.map_err(|e| PoolError::ConnectFailed(e.to_string()))?;
-            let handler_end = connect_result.map_err(|e| PoolError::ConnectFailed(e.to_string()))?;
+            let handler_end =
+                connect_result.map_err(|e| PoolError::ConnectFailed(e.to_string()))?;
 
             tokio::spawn(run_fake_backend(backend_end));
-            self.registry.insert_raw(node_id, pid, MaybeTlsStream::Plain(handler_end));
-
-            Ok(PooledConnection::new(node_id, pid, pid * 1000))
+            Ok(BackendConnection::new(
+                PooledConnection::new(node_id, pid, pid * 1000),
+                MaybeTlsStream::Plain(handler_end),
+                0,
+            ))
         }
     }
 
-    struct FakeBackendCleaner {
-        registry: Arc<ConnectionRegistry>,
-    }
+    struct FakeBackendCleaner;
+
     impl ConnCleaner for FakeBackendCleaner {
-        async fn clean(&self, _conn: &PooledConnection) -> Result<(), PoolError> {
+        async fn clean(&self, _conn: &mut BackendConnection) -> Result<(), PoolError> {
             Ok(())
-        }
-
-        fn discard(&self, conn: &PooledConnection) {
-            self.registry.remove(&conn.node_id, conn.backend_pid);
         }
     }
 
     struct ExtensionBackendFactory {
-        registry: Arc<ConnectionRegistry>,
         queries: Arc<Mutex<Vec<String>>>,
     }
 
     impl ConnFactory for ExtensionBackendFactory {
-        async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+        async fn create(&self, node_id: &str) -> Result<BackendConnection, PoolError> {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .map_err(|error| PoolError::ConnectFailed(error.to_string()))?;
@@ -3698,47 +3885,40 @@ mod tests {
 
             tokio::spawn(async move {
                 loop {
-                    let message = match crate::protocol::reader::read_frontend_message(&mut backend)
-                        .await
-                    {
-                        Ok(message) => message,
-                        Err(_) => return,
-                    };
+                    let message =
+                        match crate::protocol::reader::read_frontend_message(&mut backend).await {
+                            Ok(message) => message,
+                            Err(_) => return,
+                        };
                     let FrontendMessage::Query(sql) = message else {
                         continue;
                     };
                     queries.lock().unwrap().push(sql.clone());
                     if sql.starts_with("SELECT pg_current_wal_lsn") {
                         backend
-                            .write_all(&encode_backend_message(&BackendMessage::DataRow(vec![Some(
-                                b"16/B374D848".to_vec(),
-                            )])))
+                            .write_all(&encode_backend_message(&BackendMessage::DataRow(vec![
+                                Some(b"16/B374D848".to_vec()),
+                            ])))
                             .await
                             .unwrap();
                         backend
-                            .write_all(&encode_backend_message(
-                                &BackendMessage::CommandComplete {
-                                    tag: "SELECT 1".to_string(),
-                                },
-                            ))
+                            .write_all(&encode_backend_message(&BackendMessage::CommandComplete {
+                                tag: "SELECT 1".to_string(),
+                            }))
                             .await
                             .unwrap();
                     } else {
                         backend
-                            .write_all(&encode_backend_message(
-                                &BackendMessage::CommandComplete {
-                                    tag: "INSERT 0 1".to_string(),
-                                },
-                            ))
+                            .write_all(&encode_backend_message(&BackendMessage::CommandComplete {
+                                tag: "INSERT 0 1".to_string(),
+                            }))
                             .await
                             .unwrap();
                         backend
-                            .write_all(&encode_backend_message(
-                                &BackendMessage::ParameterStatus {
-                                    name: "pg_lsn_track.last_commit_lsn".to_string(),
-                                    value: "16/B374D848".to_string(),
-                                },
-                            ))
+                            .write_all(&encode_backend_message(&BackendMessage::ParameterStatus {
+                                name: "pg_lsn_track.last_commit_lsn".to_string(),
+                                value: "16/B374D848".to_string(),
+                            }))
                             .await
                             .unwrap();
                     }
@@ -3751,8 +3931,11 @@ mod tests {
                 }
             });
 
-            self.registry.insert_raw(node_id, 300, MaybeTlsStream::Plain(handler_socket));
-            Ok(PooledConnection::new(node_id, 300, 300_000))
+            Ok(BackendConnection::new(
+                PooledConnection::new(node_id, 300, 300_000),
+                MaybeTlsStream::Plain(handler_socket),
+                0,
+            ))
         }
     }
 
@@ -3789,14 +3972,11 @@ mod tests {
     /// Uses the non-conventional writer name `primary` deliberately: this
     /// is a regression fixture for production configurations where a
     /// Writer node is not literally named `writer`.
-    fn make_pool_manager(registry: Arc<ConnectionRegistry>) -> crate::pool::manager::InMemoryPoolManager {
-        make_pool_manager_with_mode(registry, PoolMode::Transaction)
+    fn make_pool_manager() -> crate::pool::manager::InMemoryPoolManager {
+        make_pool_manager_with_mode(PoolMode::Transaction)
     }
 
-    fn make_pool_manager_with_mode(
-        registry: Arc<ConnectionRegistry>,
-        mode: PoolMode,
-    ) -> crate::pool::manager::InMemoryPoolManager {
+    fn make_pool_manager_with_mode(mode: PoolMode) -> crate::pool::manager::InMemoryPoolManager {
         let mut pools: HashMap<String, Box<dyn crate::pool::pool::ConnectionPool>> = HashMap::new();
         pools.insert(
             "primary".to_string(),
@@ -3806,9 +3986,8 @@ mod tests {
                 10,
                 FakeBackendFactory {
                     next_pid: AtomicI32::new(1),
-                    registry: registry.clone(),
                 },
-                FakeBackendCleaner { registry },
+                FakeBackendCleaner,
             )),
         );
         crate::pool::manager::InMemoryPoolManager::new(pools, || {
@@ -3824,14 +4003,11 @@ mod tests {
         })
     }
 
-    fn make_split_pool_manager(
-        registry: Arc<ConnectionRegistry>,
-    ) -> crate::pool::manager::InMemoryPoolManager {
-        make_split_pool_manager_with_writer_capacity(registry, 10)
+    fn make_split_pool_manager() -> crate::pool::manager::InMemoryPoolManager {
+        make_split_pool_manager_with_writer_capacity(10)
     }
 
     fn make_split_pool_manager_with_writer_capacity(
-        registry: Arc<ConnectionRegistry>,
         writer_capacity: u32,
     ) -> crate::pool::manager::InMemoryPoolManager {
         let mut pools: HashMap<String, Box<dyn crate::pool::pool::ConnectionPool>> = HashMap::new();
@@ -3849,11 +4025,8 @@ mod tests {
                     max_connections,
                     FakeBackendFactory {
                         next_pid: AtomicI32::new(1),
-                        registry: registry.clone(),
                     },
-                    FakeBackendCleaner {
-                        registry: registry.clone(),
-                    },
+                    FakeBackendCleaner,
                 )),
             );
         }
@@ -3882,7 +4055,6 @@ mod tests {
     }
 
     fn make_reader_pool_manager(
-        registry: Arc<ConnectionRegistry>,
         mode: PoolMode,
         reader_replay_lsn: u64,
         include_writer: bool,
@@ -3897,11 +4069,8 @@ mod tests {
                     10,
                     FakeBackendFactory {
                         next_pid: AtomicI32::new(100),
-                        registry: registry.clone(),
                     },
-                    FakeBackendCleaner {
-                        registry: registry.clone(),
-                    },
+                    FakeBackendCleaner,
                 )),
             );
         }
@@ -3913,9 +4082,8 @@ mod tests {
                 10,
                 FakeBackendFactory {
                     next_pid: AtomicI32::new(200),
-                    registry: registry.clone(),
                 },
-                FakeBackendCleaner { registry },
+                FakeBackendCleaner,
             )),
         );
 
@@ -3951,7 +4119,6 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(4096);
         let router = make_router();
-        let registry = Arc::new(ConnectionRegistry::new());
         let queries = Arc::new(Mutex::new(Vec::new()));
         let mut pools: HashMap<String, Box<dyn crate::pool::pool::ConnectionPool>> = HashMap::new();
         pools.insert(
@@ -3961,12 +4128,9 @@ mod tests {
                 PoolMode::Transaction,
                 2,
                 ExtensionBackendFactory {
-                    registry: registry.clone(),
                     queries: queries.clone(),
                 },
-                FakeBackendCleaner {
-                    registry: registry.clone(),
-                },
+                FakeBackendCleaner,
             )),
         );
         let pool_manager = crate::pool::manager::InMemoryPoolManager::new(pools, || {
@@ -3987,7 +4151,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4012,10 +4175,7 @@ mod tests {
         assert!(lsn_tracker.session_write_lsn("auto-extension") > 0);
         assert_eq!(
             queries.lock().unwrap().as_slice(),
-            [
-                "INSERT INTO t VALUES (1)",
-                "INSERT INTO t VALUES (2)",
-            ],
+            ["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)",],
             "lazy_fallback skips pipeline; extension detected via GUC only"
         );
     }
@@ -4026,13 +4186,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(4096);
         let router = make_router();
-        let registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_reader_pool_manager(
-            registry.clone(),
-            PoolMode::Transaction,
-            u64::MAX,
-            true,
-        );
+        let pool_manager = make_reader_pool_manager(PoolMode::Transaction, u64::MAX, true);
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4040,7 +4194,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4076,13 +4229,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(8192);
         let router = make_router();
-        let registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_reader_pool_manager(
-            registry.clone(),
-            PoolMode::Session,
-            u64::MAX,
-            false,
-        );
+        let pool_manager = make_reader_pool_manager(PoolMode::Session, u64::MAX, false);
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4094,7 +4241,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &registry,
             &cancel_registry,
             &node_addresses,
         )
@@ -4138,8 +4284,7 @@ mod tests {
 
         let (mut client_side, server_side) = duplex(4096);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4147,7 +4292,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4185,9 +4329,8 @@ mod tests {
             startup.extend(body);
             client_side.write_all(&startup).await.unwrap();
             read_until_ready(&mut client_side).await;
-            let terminate = crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Terminate,
-            );
+            let terminate =
+                crate::protocol::writer::encode_frontend_message(&FrontendMessage::Terminate);
             client_side.write_all(&terminate).await.unwrap();
         };
 
@@ -4202,11 +4345,7 @@ mod tests {
         let (mut client_side, server_side) = duplex(4096);
 
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager_with_mode(
-            connection_registry.clone(),
-            PoolMode::Session,
-        );
+        let pool_manager = make_pool_manager_with_mode(PoolMode::Session);
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4214,7 +4353,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4229,7 +4367,12 @@ mod tests {
                 secret_key: 9999,
             };
             handler
-                .handle(server_side, &mut startup_handler, "session-1".to_string(), ConsistencyLevel::Session)
+                .handle(
+                    server_side,
+                    &mut startup_handler,
+                    "session-1".to_string(),
+                    ConsistencyLevel::Session,
+                )
                 .await
         };
 
@@ -4253,7 +4396,10 @@ mod tests {
             // Startup responses are ordered as AuthenticationOk, baseline
             // ParameterStatus messages, BackendKeyData, ReadyForQuery.
             let startup_messages = read_until_ready(&mut client_side).await;
-            assert_eq!(startup_messages.first(), Some(&BackendMessage::AuthenticationOk));
+            assert_eq!(
+                startup_messages.first(),
+                Some(&BackendMessage::AuthenticationOk)
+            );
             assert_eq!(
                 startup_messages.last(),
                 Some(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
@@ -4282,9 +4428,9 @@ mod tests {
             );
 
             // --- client side: send a write query ---
-            let query_bytes = crate::protocol::writer::encode_frontend_message(&FrontendMessage::Query(
-                "INSERT INTO t VALUES (1)".to_string(),
-            ));
+            let query_bytes = crate::protocol::writer::encode_frontend_message(
+                &FrontendMessage::Query("INSERT INTO t VALUES (1)".to_string()),
+            );
             client_side.write_all(&query_bytes).await.unwrap();
 
             // The fake backend relays a CommandComplete for the INSERT
@@ -4302,7 +4448,10 @@ mod tests {
             let ready2 = crate::protocol::reader::read_backend_message(&mut client_side)
                 .await
                 .unwrap();
-            assert_eq!(ready2, BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+            assert_eq!(
+                ready2,
+                BackendMessage::ReadyForQuery(TransactionStatus::Idle)
+            );
             // With lazy_fallback (default), pipeline is skipped: LSN is
             // deferred until a subsequent read targets a reader. The write
             // is marked via pending_write instead of immediate recording.
@@ -4323,13 +4472,12 @@ mod tests {
         // recorded while the session was live.
         assert_eq!(lsn_tracker.session_write_lsn("session-1"), 0);
         assert_eq!(
-            pool_manager.pool_for("primary").unwrap().active_connections(),
+            pool_manager
+                .pool_for("primary")
+                .unwrap()
+                .active_connections(),
             0,
             "session cleanup must free its pool slot"
-        );
-        assert!(
-            connection_registry.take("primary", 1).is_none(),
-            "session cleanup must drop the registered backend socket"
         );
     }
 
@@ -4339,8 +4487,7 @@ mod tests {
 
         let (mut client_side, server_side) = duplex(8192);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4348,7 +4495,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4419,7 +4565,9 @@ mod tests {
 
             // Should NOT get an ErrorResponse (extended protocol is now supported)
             assert!(
-                !messages.iter().any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
+                !messages
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
                 "extended query should succeed; got: {messages:?}"
             );
             assert_eq!(
@@ -4442,8 +4590,7 @@ mod tests {
 
         let (mut client_side, server_side) = duplex(8192);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4451,7 +4598,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4503,12 +4649,11 @@ mod tests {
 
             // Messages after the error are ignored until Sync, which must
             // produce ReadyForQuery -- the standard recovery sequence.
-            let mut tail = crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Execute {
+            let mut tail =
+                crate::protocol::writer::encode_frontend_message(&FrontendMessage::Execute {
                     portal: "".to_string(),
                     max_rows: 0,
-                },
-            );
+                });
             tail.extend(crate::protocol::writer::encode_frontend_message(
                 &FrontendMessage::Sync,
             ));
@@ -4517,7 +4662,10 @@ mod tests {
             let ready = crate::protocol::reader::read_backend_message(&mut client_side)
                 .await
                 .unwrap();
-            assert_eq!(ready, BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+            assert_eq!(
+                ready,
+                BackendMessage::ReadyForQuery(TransactionStatus::Idle)
+            );
 
             // The connection must remain fully usable: a normal extended
             // batch afterwards succeeds end to end.
@@ -4561,7 +4709,9 @@ mod tests {
                 }
             }
             assert!(
-                !messages.iter().any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
+                !messages
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
                 "post-recovery batch should succeed; got: {messages:?}"
             );
 
@@ -4580,8 +4730,7 @@ mod tests {
 
         let (mut client_side, server_side) = duplex(8192);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4589,7 +4738,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4608,82 +4756,83 @@ mod tests {
                 )
                 .await
         };
-        let client = async {
-            // Startup
-            let mut body = 196_608i32.to_be_bytes().to_vec();
-            body.push(0);
-            let mut startup = ((body.len() + 4) as i32).to_be_bytes().to_vec();
-            startup.extend(body);
-            client_side.write_all(&startup).await.unwrap();
-            read_until_ready(&mut client_side).await;
+        let client =
+            async {
+                // Startup
+                let mut body = 196_608i32.to_be_bytes().to_vec();
+                body.push(0);
+                let mut startup = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+                startup.extend(body);
+                client_side.write_all(&startup).await.unwrap();
+                read_until_ready(&mut client_side).await;
 
-            // First Sync: Parse named "stmt1" + Sync
-            let mut batch1 = Vec::new();
-            batch1.extend(crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Parse {
-                    name: "stmt1".to_string(),
-                    sql: "SELECT 1".to_string(),
-                    param_types: vec![],
-                },
-            ));
-            batch1.extend(crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Sync,
-            ));
-            client_side.write_all(&batch1).await.unwrap();
-            // Read responses until ReadyForQuery
-            loop {
-                let msg = crate::protocol::reader::read_backend_message(&mut client_side)
-                    .await
-                    .unwrap();
-                if matches!(msg, BackendMessage::ReadyForQuery(_)) {
-                    break;
+                // First Sync: Parse named "stmt1" + Sync
+                let mut batch1 = Vec::new();
+                batch1.extend(crate::protocol::writer::encode_frontend_message(
+                    &FrontendMessage::Parse {
+                        name: "stmt1".to_string(),
+                        sql: "SELECT 1".to_string(),
+                        param_types: vec![],
+                    },
+                ));
+                batch1.extend(crate::protocol::writer::encode_frontend_message(
+                    &FrontendMessage::Sync,
+                ));
+                client_side.write_all(&batch1).await.unwrap();
+                // Read responses until ReadyForQuery
+                loop {
+                    let msg = crate::protocol::reader::read_backend_message(&mut client_side)
+                        .await
+                        .unwrap();
+                    if matches!(msg, BackendMessage::ReadyForQuery(_)) {
+                        break;
+                    }
                 }
-            }
 
-            // Second Sync: Bind+Execute referencing "stmt1" (no Parse)
-            let mut batch2 = Vec::new();
-            batch2.extend(crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Bind {
-                    portal: "".to_string(),
-                    statement: "stmt1".to_string(),
-                    param_formats: vec![],
-                    params: vec![],
-                    result_formats: vec![],
-                },
-            ));
-            batch2.extend(crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Execute {
-                    portal: "".to_string(),
-                    max_rows: 0,
-                },
-            ));
-            batch2.extend(crate::protocol::writer::encode_frontend_message(
-                &FrontendMessage::Sync,
-            ));
-            client_side.write_all(&batch2).await.unwrap();
+                // Second Sync: Bind+Execute referencing "stmt1" (no Parse)
+                let mut batch2 = Vec::new();
+                batch2.extend(crate::protocol::writer::encode_frontend_message(
+                    &FrontendMessage::Bind {
+                        portal: "".to_string(),
+                        statement: "stmt1".to_string(),
+                        param_formats: vec![],
+                        params: vec![],
+                        result_formats: vec![],
+                    },
+                ));
+                batch2.extend(crate::protocol::writer::encode_frontend_message(
+                    &FrontendMessage::Execute {
+                        portal: "".to_string(),
+                        max_rows: 0,
+                    },
+                ));
+                batch2.extend(crate::protocol::writer::encode_frontend_message(
+                    &FrontendMessage::Sync,
+                ));
+                client_side.write_all(&batch2).await.unwrap();
 
-            let mut messages = Vec::new();
-            loop {
-                let msg = crate::protocol::reader::read_backend_message(&mut client_side)
-                    .await
-                    .unwrap();
-                let is_ready = matches!(msg, BackendMessage::ReadyForQuery(_));
-                messages.push(msg);
-                if is_ready {
-                    break;
+                let mut messages = Vec::new();
+                loop {
+                    let msg = crate::protocol::reader::read_backend_message(&mut client_side)
+                        .await
+                        .unwrap();
+                    let is_ready = matches!(msg, BackendMessage::ReadyForQuery(_));
+                    messages.push(msg);
+                    if is_ready {
+                        break;
+                    }
                 }
-            }
 
-            // Should succeed (routed to same backend as the original Parse)
-            assert!(
+                // Should succeed (routed to same backend as the original Parse)
+                assert!(
                 !messages.iter().any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
                 "named statement re-execution should route to the same backend; got: {messages:?}"
             );
 
-            let terminate =
-                crate::protocol::writer::encode_frontend_message(&FrontendMessage::Terminate);
-            client_side.write_all(&terminate).await.unwrap();
-        };
+                let terminate =
+                    crate::protocol::writer::encode_frontend_message(&FrontendMessage::Terminate);
+                client_side.write_all(&terminate).await.unwrap();
+            };
 
         let (server_result, ()) = tokio::join!(server, client);
         server_result.unwrap();
@@ -4695,8 +4844,7 @@ mod tests {
 
         let (mut client_side, server_side) = duplex(8192);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4704,7 +4852,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4774,7 +4921,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(saw_command_complete, "INSERT should produce CommandComplete");
+            assert!(
+                saw_command_complete,
+                "INSERT should produce CommandComplete"
+            );
 
             let terminate =
                 crate::protocol::writer::encode_frontend_message(&FrontendMessage::Terminate);
@@ -4797,8 +4947,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(1024);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -4806,7 +4955,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -4836,9 +4984,15 @@ mod tests {
                 tag: "SET".to_string()
             }
         );
-        assert_eq!(ready, BackendMessage::ReadyForQuery(TransactionStatus::Idle));
         assert_eq!(
-            pool_manager.pool_for("primary").unwrap().active_connections(),
+            ready,
+            BackendMessage::ReadyForQuery(TransactionStatus::Idle)
+        );
+        assert_eq!(
+            pool_manager
+                .pool_for("primary")
+                .unwrap()
+                .active_connections(),
             0,
             "proxy-local SET must not acquire a backend connection"
         );
@@ -4846,53 +5000,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_registry_socket_discards_metadata_socket_and_pool_slot() {
-        use tokio::io::duplex;
+    async fn pool_checkout_round_trip_preserves_complete_connection_ownership() {
+        let pool_manager = make_pool_manager();
+        let pool = pool_manager.pool_for("primary").unwrap();
 
-        let router = make_router();
-        let factory_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(factory_registry.clone());
-        // Deliberately give the handler a different registry so acquisition
-        // returns metadata whose socket cannot be found.
-        let handler_registry = ConnectionRegistry::new();
-        let lsn_tracker = InMemoryLsnTracker::new();
-        let cancel_registry = CancelRegistry::new();
-        let node_addresses = HashMap::new();
-        let handler = ConnectionHandler::new(
-            &router,
-            &pool_manager,
-            &lsn_tracker,
-            &handler_registry,
-            &cancel_registry,
-            &node_addresses,
-        );
-        let mut session = ClientSession::new("missing-socket", ConsistencyLevel::Session);
-        let (_client_side, mut handler_side) = duplex(1024);
+        let mut first = pool.acquire("ownership-session").await.unwrap();
+        let first_pid = first.backend_pid;
+        execute_internal_query(&mut first.stream, "SELECT 1", TransactionStatus::Idle)
+            .await
+            .unwrap();
+        pool.release("ownership-session", first).await.unwrap();
 
-        let result = handler
-            .handle_simple_query(&mut handler_side, &mut session, "SELECT 1")
-            .await;
-        assert!(matches!(result, Err(ProxyError::Pool(_))));
-        assert_eq!(
-            pool_manager.pool_for("primary").unwrap().active_connections(),
-            0
-        );
-        assert!(
-            factory_registry.take("primary", 1).is_none(),
-            "discard callback must remove the orphaned physical socket"
-        );
+        let second = pool.acquire("ownership-session").await.unwrap();
+        assert_eq!(second.backend_pid, first_pid);
+        assert_eq!(second.node_id, "primary");
+        pool.discard(second).unwrap();
+        assert_eq!(pool.active_connections(), 0);
     }
 
     #[tokio::test]
     async fn lsn_protocol_failure_preserves_write_and_discards_backend() {
         use tokio::io::duplex;
 
-        struct MalformedLsnFactory {
-            registry: Arc<ConnectionRegistry>,
-        }
+        struct MalformedLsnFactory;
 
         impl ConnFactory for MalformedLsnFactory {
-            async fn create(&self, node_id: &str) -> Result<PooledConnection, PoolError> {
+            async fn create(&self, node_id: &str) -> Result<BackendConnection, PoolError> {
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .map_err(|error| PoolError::ConnectFailed(error.to_string()))?;
@@ -4912,11 +5045,9 @@ mod tests {
                         .unwrap();
                     assert!(matches!(first, FrontendMessage::Query(_)));
                     backend
-                        .write_all(&encode_backend_message(
-                            &BackendMessage::CommandComplete {
-                                tag: "INSERT 0 1".to_string(),
-                            },
-                        ))
+                        .write_all(&encode_backend_message(&BackendMessage::CommandComplete {
+                            tag: "INSERT 0 1".to_string(),
+                        }))
                         .await
                         .unwrap();
                     backend
@@ -4934,27 +5065,24 @@ mod tests {
                     backend.write_all(&[b'D', 0, 0, 0, 3]).await.unwrap();
                 });
 
-                self.registry.insert_raw(node_id, 1, MaybeTlsStream::Plain(handler_socket));
-                Ok(PooledConnection::new(node_id, 1, 1000))
+                Ok(BackendConnection::new(
+                    PooledConnection::new(node_id, 1, 1000),
+                    MaybeTlsStream::Plain(handler_socket),
+                    0,
+                ))
             }
         }
 
         let router = make_router();
-        let registry = Arc::new(ConnectionRegistry::new());
-        let mut pools: HashMap<String, Box<dyn crate::pool::pool::ConnectionPool>> =
-            HashMap::new();
+        let mut pools: HashMap<String, Box<dyn crate::pool::pool::ConnectionPool>> = HashMap::new();
         pools.insert(
             "primary".to_string(),
             Box::new(NodePool::new(
                 "primary",
                 PoolMode::Transaction,
                 1,
-                MalformedLsnFactory {
-                    registry: registry.clone(),
-                },
-                FakeBackendCleaner {
-                    registry: registry.clone(),
-                },
+                MalformedLsnFactory,
+                FakeBackendCleaner,
             )),
         );
         let pool_manager = crate::pool::manager::InMemoryPoolManager::new(pools, || {
@@ -4985,7 +5113,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &registry,
             &cancel_registry,
             &node_addresses,
             QueryLogSettings::default(),
@@ -5010,20 +5137,24 @@ mod tests {
         };
         let (result, ()) = tokio::join!(query, client);
 
-        assert!(result.is_ok(), "the already-committed user write must succeed");
+        assert!(
+            result.is_ok(),
+            "the already-committed user write must succeed"
+        );
         assert!(
             session.pending_write,
             "a failed internal LSN cycle must defer watermark acquisition"
         );
         assert_eq!(
-            pool_manager.pool_for("primary").unwrap().active_connections(),
+            pool_manager
+                .pool_for("primary")
+                .unwrap()
+                .active_connections(),
             0,
             "protocol-damaged backend must release its pool slot"
         );
-        assert!(
-            registry.take("primary", 1).is_none(),
-            "protocol-damaged backend socket must not return to the registry"
-        );
+        assert!(session.held_backend.is_none());
+        assert!(session.cached_idle_backend.is_none());
     }
 
     #[tokio::test]
@@ -5032,8 +5163,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(8192);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_split_pool_manager(connection_registry.clone());
+        let pool_manager = make_split_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -5041,7 +5171,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5062,7 +5191,11 @@ mod tests {
         let (begin_result, ()) = tokio::join!(begin, drain_begin);
         begin_result.unwrap();
         assert_eq!(session.state.tx_state, TxState::InTransaction);
-        assert!(session.state.tx_split.as_ref().is_some_and(|state| !state.active));
+        assert!(session
+            .state
+            .tx_split
+            .as_ref()
+            .is_some_and(|state| !state.active));
         assert!(session.held_backend.is_none(), "BEGIN must be delayed");
         assert_eq!(
             pool_manager
@@ -5083,14 +5216,14 @@ mod tests {
         };
         let (select_result, ()) = tokio::join!(select, drain_select);
         select_result.unwrap();
-        assert_eq!(session.held_backend.as_ref().unwrap().conn.node_id, "reader-1");
+        assert_eq!(
+            session.held_backend.as_ref().unwrap().conn.node_id,
+            "reader-1"
+        );
         assert!(session.state.tx_split.as_ref().unwrap().on_reader);
 
-        let update = handler.handle_simple_query(
-            &mut handler_side,
-            &mut session,
-            "UPDATE t SET value = 2",
-        );
+        let update =
+            handler.handle_simple_query(&mut handler_side, &mut session, "UPDATE t SET value = 2");
         let drain_update = async {
             for _ in 0..2 {
                 crate::protocol::reader::read_backend_message(&mut client_side)
@@ -5100,7 +5233,10 @@ mod tests {
         };
         let (update_result, ()) = tokio::join!(update, drain_update);
         update_result.unwrap();
-        assert_eq!(session.held_backend.as_ref().unwrap().conn.node_id, "primary");
+        assert_eq!(
+            session.held_backend.as_ref().unwrap().conn.node_id,
+            "primary"
+        );
         assert!(!session.state.tx_split.as_ref().unwrap().on_reader);
 
         let commit = handler.handle_simple_query(&mut handler_side, &mut session, "COMMIT");
@@ -5127,13 +5263,9 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(8192);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
         // The Writer remains healthy/routable but has no capacity, forcing
         // the failure after the Reader transaction has been rolled back.
-        let pool_manager = make_split_pool_manager_with_writer_capacity(
-            connection_registry.clone(),
-            0,
-        );
+        let pool_manager = make_split_pool_manager_with_writer_capacity(0);
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -5141,7 +5273,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5168,14 +5299,13 @@ mod tests {
         };
         let (select_result, ()) = tokio::join!(select, drain_select);
         select_result.unwrap();
-        assert_eq!(session.held_backend.as_ref().unwrap().conn.node_id, "reader-1");
+        assert_eq!(
+            session.held_backend.as_ref().unwrap().conn.node_id,
+            "reader-1"
+        );
 
         let update_result = handler
-            .handle_simple_query(
-                &mut handler_side,
-                &mut session,
-                "UPDATE t SET value = 2",
-            )
+            .handle_simple_query(&mut handler_side, &mut session, "UPDATE t SET value = 2")
             .await;
         assert!(matches!(
             update_result,
@@ -5204,8 +5334,7 @@ mod tests {
                 .unwrap();
             (error, ready)
         };
-        let (rejected_result, (error, failed_ready)) =
-            tokio::join!(rejected, read_rejection);
+        let (rejected_result, (error, failed_ready)) = tokio::join!(rejected, read_rejection);
         rejected_result.unwrap();
         assert!(matches!(
             error,
@@ -5217,7 +5346,10 @@ mod tests {
             BackendMessage::ReadyForQuery(TransactionStatus::Failed)
         );
         assert_eq!(
-            pool_manager.pool_for("primary").unwrap().active_connections(),
+            pool_manager
+                .pool_for("primary")
+                .unwrap()
+                .active_connections(),
             0,
             "a statement in the virtual failed block must not acquire a Writer"
         );
@@ -5243,7 +5375,10 @@ mod tests {
                 tag: "ROLLBACK".to_string()
             }
         );
-        assert_eq!(ready, BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+        assert_eq!(
+            ready,
+            BackendMessage::ReadyForQuery(TransactionStatus::Idle)
+        );
         assert_eq!(session.state.tx_state, TxState::Idle);
         assert!(session.state.tx_split.is_none());
     }
@@ -5254,8 +5389,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(2048);
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_split_pool_manager(connection_registry.clone());
+        let pool_manager = make_split_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -5263,7 +5397,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5301,8 +5434,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(4096);
         let router = make_router_with_split(false);
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -5310,7 +5442,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5383,8 +5514,7 @@ mod tests {
 
         let (mut client_side, mut handler_side) = duplex(8192);
         let router = make_router_with_split(false);
-        let registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -5392,7 +5522,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5431,7 +5560,10 @@ mod tests {
                 tag: "ROLLBACK".to_string()
             }
         );
-        assert_eq!(ready, BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+        assert_eq!(
+            ready,
+            BackendMessage::ReadyForQuery(TransactionStatus::Idle)
+        );
         assert_eq!(lsn_tracker.session_write_lsn("failed-commit"), 0);
         assert!(!session.pending_write);
         assert_eq!(session.state.tx_state, TxState::Idle);
@@ -5453,8 +5585,7 @@ mod tests {
         let (mut client_side, server_side) = duplex(4096);
 
         let router = make_router();
-        let connection_registry = Arc::new(ConnectionRegistry::new());
-        let pool_manager = make_pool_manager(connection_registry.clone());
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
@@ -5462,7 +5593,6 @@ mod tests {
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
             crate::proxy::handler::QueryLogSettings::new(true, 0),
@@ -5474,7 +5604,12 @@ mod tests {
                 secret_key: 2,
             };
             handler
-                .handle(server_side, &mut startup_handler, "session-ql".to_string(), ConsistencyLevel::Session)
+                .handle(
+                    server_side,
+                    &mut startup_handler,
+                    "session-ql".to_string(),
+                    ConsistencyLevel::Session,
+                )
                 .await
         };
 
@@ -5487,9 +5622,9 @@ mod tests {
 
             read_until_ready(&mut client_side).await;
 
-            let query_bytes = crate::protocol::writer::encode_frontend_message(&FrontendMessage::Query(
-                "SELECT 1".to_string(),
-            ));
+            let query_bytes = crate::protocol::writer::encode_frontend_message(
+                &FrontendMessage::Query("SELECT 1".to_string()),
+            );
             client_side.write_all(&query_bytes).await.unwrap();
 
             // Fake backend responds with RowDescription + DataRow +
@@ -5520,7 +5655,10 @@ mod tests {
         let router = make_router();
         struct EmptyPoolManager;
         impl PoolManager for EmptyPoolManager {
-            fn pool_for(&self, _node_id: &str) -> Option<std::sync::Arc<dyn crate::pool::pool::ConnectionPool>> {
+            fn pool_for(
+                &self,
+                _node_id: &str,
+            ) -> Option<std::sync::Arc<dyn crate::pool::pool::ConnectionPool>> {
                 None
             }
             fn snapshot(&self) -> Vec<BackendNodeSnapshot> {
@@ -5529,14 +5667,12 @@ mod tests {
         }
         let pool_manager = EmptyPoolManager;
         let lsn_tracker = InMemoryLsnTracker::new();
-        let connection_registry = ConnectionRegistry::new();
         let cancel_registry = CancelRegistry::new();
         let node_addresses = HashMap::new();
         let handler = ConnectionHandler::new(
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5549,7 +5685,12 @@ mod tests {
                 secret_key: 2,
             };
             handler
-                .handle(server_side, &mut startup_handler, "session-2".to_string(), ConsistencyLevel::Eventual)
+                .handle(
+                    server_side,
+                    &mut startup_handler,
+                    "session-2".to_string(),
+                    ConsistencyLevel::Eventual,
+                )
                 .await
         };
 
@@ -5563,9 +5704,9 @@ mod tests {
             // Drain the complete startup response through ReadyForQuery.
             read_until_ready(&mut client_side).await;
 
-            let query_bytes = crate::protocol::writer::encode_frontend_message(&FrontendMessage::Query(
-                "INSERT INTO t VALUES (1)".to_string(),
-            ));
+            let query_bytes = crate::protocol::writer::encode_frontend_message(
+                &FrontendMessage::Query("INSERT INTO t VALUES (1)".to_string()),
+            );
             client_side.write_all(&query_bytes).await.unwrap();
 
             let response = crate::protocol::reader::read_backend_message(&mut client_side)
@@ -5607,14 +5748,12 @@ mod tests {
         TestRouter,
         crate::pool::manager::InMemoryPoolManager,
         InMemoryLsnTracker,
-        ConnectionRegistry,
         CancelRegistry,
         HashMap<String, NodeAddress>,
         TcpListener,
     ) {
         let router = make_router();
-        let connection_registry = ConnectionRegistry::new();
-        let pool_manager = make_pool_manager(Arc::new(ConnectionRegistry::new()));
+        let pool_manager = make_pool_manager();
         let lsn_tracker = InMemoryLsnTracker::new();
         let cancel_registry = CancelRegistry::new();
 
@@ -5633,7 +5772,6 @@ mod tests {
             router,
             pool_manager,
             lsn_tracker,
-            connection_registry,
             cancel_registry,
             node_addresses,
             listener,
@@ -5642,13 +5780,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_request_forwarded_with_real_backend_pid_and_secret_when_session_active() {
-        let (router, pool_manager, lsn_tracker, connection_registry, cancel_registry, node_addresses, listener) =
+        let (router, pool_manager, lsn_tracker, cancel_registry, node_addresses, listener) =
             make_handler_with_cancel_listener().await;
         let handler = ConnectionHandler::new(
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5676,22 +5813,22 @@ mod tests {
             .expect("listener should have received a connection")
             .unwrap();
 
-        let expected = crate::protocol::writer::encode_frontend_message(&FrontendMessage::CancelRequest {
-            backend_pid: 555,
-            secret_key: 666,
-        });
+        let expected =
+            crate::protocol::writer::encode_frontend_message(&FrontendMessage::CancelRequest {
+                backend_pid: 555,
+                secret_key: 666,
+            });
         assert_eq!(received.to_vec(), expected);
     }
 
     #[tokio::test]
     async fn cancel_request_ignored_when_key_unknown() {
-        let (router, pool_manager, lsn_tracker, connection_registry, cancel_registry, node_addresses, listener) =
+        let (router, pool_manager, lsn_tracker, cancel_registry, node_addresses, listener) =
             make_handler_with_cancel_listener().await;
         let handler = ConnectionHandler::new(
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5701,7 +5838,8 @@ mod tests {
 
         handler.handle_cancel_request(999, 888).await;
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), listen_task).await;
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listen_task).await;
         assert!(
             outcome.is_err(),
             "an unknown cancel key must never open a connection to the backend"
@@ -5710,13 +5848,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_request_ignored_when_session_has_no_active_query() {
-        let (router, pool_manager, lsn_tracker, connection_registry, cancel_registry, node_addresses, listener) =
+        let (router, pool_manager, lsn_tracker, cancel_registry, node_addresses, listener) =
             make_handler_with_cancel_listener().await;
         let handler = ConnectionHandler::new(
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5730,7 +5867,8 @@ mod tests {
 
         handler.handle_cancel_request(100, 200).await;
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), listen_task).await;
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(200), listen_task).await;
         assert!(
             outcome.is_err(),
             "a session with no active query must never trigger a forwarded CancelRequest"
@@ -5738,16 +5876,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_dispatches_a_cancel_startup_packet_without_touching_the_regular_session_lifecycle() {
+    async fn handle_dispatches_a_cancel_startup_packet_without_touching_the_regular_session_lifecycle(
+    ) {
         use tokio::io::duplex;
 
-        let (router, pool_manager, lsn_tracker, connection_registry, cancel_registry, node_addresses, listener) =
+        let (router, pool_manager, lsn_tracker, cancel_registry, node_addresses, listener) =
             make_handler_with_cancel_listener().await;
         let handler = ConnectionHandler::new(
             &router,
             &pool_manager,
             &lsn_tracker,
-            &connection_registry,
             &cancel_registry,
             &node_addresses,
         );
@@ -5765,10 +5903,11 @@ mod tests {
 
         let (mut client_side, server_side) = duplex(4096);
 
-        let cancel_bytes = crate::protocol::writer::encode_frontend_message(&FrontendMessage::CancelRequest {
-            backend_pid: 100,
-            secret_key: 200,
-        });
+        let cancel_bytes =
+            crate::protocol::writer::encode_frontend_message(&FrontendMessage::CancelRequest {
+                backend_pid: 100,
+                secret_key: 200,
+            });
         client_side.write_all(&cancel_bytes).await.unwrap();
 
         let mut startup_handler = TrustStartupHandler {
@@ -5776,7 +5915,12 @@ mod tests {
             secret_key: 2,
         };
         let result = handler
-            .handle(server_side, &mut startup_handler, "unused-session-id".to_string(), ConsistencyLevel::Session)
+            .handle(
+                server_side,
+                &mut startup_handler,
+                "unused-session-id".to_string(),
+                ConsistencyLevel::Session,
+            )
             .await;
         assert!(result.is_ok());
 
@@ -5784,10 +5928,11 @@ mod tests {
             .await
             .expect("listener should have received a connection")
             .unwrap();
-        let expected = crate::protocol::writer::encode_frontend_message(&FrontendMessage::CancelRequest {
-            backend_pid: 555,
-            secret_key: 666,
-        });
+        let expected =
+            crate::protocol::writer::encode_frontend_message(&FrontendMessage::CancelRequest {
+                backend_pid: 555,
+                secret_key: 666,
+            });
         assert_eq!(received.to_vec(), expected);
 
         // A CancelRequest never receives any response bytes on its own
