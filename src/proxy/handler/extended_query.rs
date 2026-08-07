@@ -250,7 +250,13 @@ where
         } else if let Some(node_id) = tracked_node {
             // Named statement was previously parsed on this node: reuse that
             // route without touching the pool snapshot at all.
-            (node_id, None)
+            // If a split transaction is pending, capture the deferred BEGIN.
+            let begin = if session.state.tx_split.as_ref().is_some_and(|s| !s.active) {
+                session.state.tx_split.as_ref().map(|s| s.begin_sql().to_string())
+            } else {
+                None
+            };
+            (node_id, begin)
         } else {
             // Route based on the SQL from Parse. The pool snapshot (which
             // clones every node's state) is only taken on this branch and
