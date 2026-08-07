@@ -9,7 +9,9 @@
 //! replacement. `CancelRegistry` independently tracks PostgreSQL cancel keys.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -23,9 +25,25 @@ use crate::protocol::writer::{encode_frontend_message, encode_query};
 /// Low-frequency node generation tracker. Connections capture the generation
 /// of the factory that created them; draining the old pool drops stale
 /// connections instead of returning them to a replacement pool.
-#[derive(Default)]
+///
+/// Reads (`node_generation`) are lock-free via `ArcSwap`; writes
+/// (`remove_by_node`, `allow_node`) are serialized by a `Mutex` that
+/// publishes a new snapshot after mutation.
 pub struct ConnectionRegistry {
-    node_generations: Mutex<HashMap<String, u64>>,
+    /// Serializes mutations. The `Mutex` is only held during the infrequent
+    /// write operations (node add/remove), never on the query hot path.
+    write_lock: Mutex<HashMap<String, u64>>,
+    /// Lock-free read snapshot. Updated atomically after each mutation.
+    snapshot: ArcSwap<HashMap<String, u64>>,
+}
+
+impl Default for ConnectionRegistry {
+    fn default() -> Self {
+        Self {
+            write_lock: Mutex::new(HashMap::new()),
+            snapshot: ArcSwap::from_pointee(HashMap::new()),
+        }
+    }
 }
 
 impl ConnectionRegistry {
@@ -33,9 +51,10 @@ impl ConnectionRegistry {
         Self::default()
     }
 
+    /// Returns the current generation for a node. Lock-free hot-path read.
     pub fn node_generation(&self, node_id: &str) -> u64 {
-        self.node_generations
-            .lock()
+        self.snapshot
+            .load()
             .get(node_id)
             .copied()
             .unwrap_or(0)
@@ -43,16 +62,19 @@ impl ConnectionRegistry {
 
     /// Invalidates factories and connections from the current incarnation.
     pub fn remove_by_node(&self, node_id: &str) {
-        let mut generations = self.node_generations.lock();
+        let mut generations = self.write_lock.lock();
         *generations.entry(node_id.to_string()).or_insert(0) += 1;
+        self.snapshot.store(Arc::new(generations.clone()));
     }
 
     /// Starts a new node incarnation and returns its generation token.
     pub fn allow_node(&self, node_id: &str) -> u64 {
-        let mut generations = self.node_generations.lock();
+        let mut generations = self.write_lock.lock();
         let generation = generations.entry(node_id.to_string()).or_insert(0);
         *generation += 1;
-        *generation
+        let result = *generation;
+        self.snapshot.store(Arc::new(generations.clone()));
+        result
     }
 }
 

@@ -716,13 +716,14 @@ fn is_valid_host_port(addr: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::sync::Mutex;
 
     /// Guard that serializes tests which mutate process-wide environment variables.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Also used by `pgpass::tests` via `crate::config::tests::ENV_LOCK`.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ---------------------------------------------------------------------
     // Test helper: builds a valid baseline configuration that individual

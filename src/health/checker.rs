@@ -811,6 +811,10 @@ impl<P: HealthProbe> HealthChecker<P> {
         if nodes.contains_key(&node_id) {
             return false;
         }
+        // Hold both locks to ensure nodes and probes are updated atomically.
+        // This prevents an intermediate state where a node exists without
+        // its probe (or vice versa) visible to the health-check loop.
+        let mut probes = self.probes.write();
         nodes.insert(
             node_id.clone(),
             TrackedNode {
@@ -822,11 +826,9 @@ impl<P: HealthProbe> HealthChecker<P> {
                 last_replication_lag_ms: None,
             },
         );
-        drop(nodes);
-
-        let mut probes = self.probes.write();
         probes.insert(node_id.clone(), Arc::new(probe));
         drop(probes);
+        drop(nodes);
 
         self.refresh_cached_snapshot();
         tracing::info!(node_id = %node_id, "dynamically added node to health checker");
@@ -860,12 +862,12 @@ impl<P: HealthProbe> HealthChecker<P> {
             }
         }
 
-        nodes.remove(node_id);
-        drop(nodes);
-
+        // Hold both locks to ensure nodes and probes are removed atomically.
         let mut probes = self.probes.write();
+        nodes.remove(node_id);
         probes.remove(node_id);
         drop(probes);
+        drop(nodes);
 
         self.refresh_cached_snapshot();
         tracing::info!(node_id, "dynamically removed node from health checker");

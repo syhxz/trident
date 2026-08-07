@@ -356,24 +356,34 @@ impl InMemoryPoolManager {
     pub fn remove_pool(&self, node_id: &str) -> bool {
         // Drain the base pool before removal so in-flight acquires are
         // rejected while existing checked-out connections finish naturally.
+        // Capture the Arc pointer so the RCU closure only removes this
+        // exact incarnation (prevents ABA if a new pool with the same
+        // node_id was added concurrently).
         let old_pool = {
             let current = self.pools.load();
             current.get(node_id).cloned()
         };
+        let old_ptr = old_pool.as_ref().map(|p| Arc::as_ptr(p) as *const () as usize);
         if let Some(pool) = &old_pool {
             pool.drain();
         }
 
         let mut removed = false;
         self.pools.rcu(|current| {
-            if !current.contains_key(node_id) {
-                removed = false;
-                Arc::clone(current)
-            } else {
-                removed = true;
-                let mut new_pools = (**current).clone();
-                new_pools.remove(node_id);
-                Arc::new(new_pools)
+            match (current.get(node_id), old_ptr) {
+                (Some(existing), Some(expected_ptr))
+                    if Arc::as_ptr(existing) as *const () as usize == expected_ptr =>
+                {
+                    removed = true;
+                    let mut new_pools = (**current).clone();
+                    new_pools.remove(node_id);
+                    Arc::new(new_pools)
+                }
+                _ => {
+                    // Node doesn't exist or is a different incarnation — no-op.
+                    removed = false;
+                    Arc::clone(current)
+                }
             }
         });
         // Also drain and remove any per-user pools for this node
@@ -417,8 +427,13 @@ impl PoolManager for InMemoryPoolManager {
 
         // Check that the node exists (either in the base pools or known to
         // the factory). This prevents phantom pool creation for dynamically
-        // removed nodes.
-        self.pools.load().get(node_id)?;
+        // removed nodes. We also capture the base pool pointer identity to
+        // detect ABA scenarios (node removed and re-added with same name).
+        let base_pool_ptr = {
+            let pools = self.pools.load();
+            let base = pools.get(node_id)?;
+            Arc::as_ptr(base) as *const () as usize
+        };
 
         // Key includes database so the same user connecting to different
         // databases gets separate pools (each pool's connections target one
@@ -555,10 +570,14 @@ impl PoolManager for InMemoryPoolManager {
             return Some(Arc::clone(&pool_arc));
         }
 
-        // Re-check that the node still exists — it may have been removed
-        // concurrently between the initial check and pool creation. Without
-        // this, a zombie user pool could be inserted for a deleted node.
-        if self.pools.load().get(node_id).is_none() {
+        // Re-check that the node still exists and is the same incarnation
+        // (same Arc pointer) — it may have been removed and re-added
+        // concurrently (ABA) between the initial check and pool creation.
+        // Without this, a user pool created against the old node's address
+        // could be inserted into the new node's namespace.
+        let still_same = self.pools.load().get(node_id)
+            .is_some_and(|p| Arc::as_ptr(p) as *const () as usize == base_pool_ptr);
+        if !still_same {
             pool_arc.drain();
             self.pending_pool_creates
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);

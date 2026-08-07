@@ -224,6 +224,11 @@ fn substitute_from_map(input: &str, vars: &HashMap<String, String>) -> Option<St
 mod tests {
     use super::*;
 
+    /// Shared env-var serialization lock (same instance used by config::tests).
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::config::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // -----------------------------------------------------------------
     // substitute_env_placeholders
     // -----------------------------------------------------------------
@@ -338,6 +343,7 @@ mod tests {
 
     #[test]
     fn resolves_password_from_pgpassfile_env_override() {
+        let _guard = env_lock();
         let dir = std::env::temp_dir();
         let path = dir.join(format!("trident-test-pgpass-{}.conf", std::process::id()));
         std::fs::write(&path, "10.0.1.10:5432:mydb:proxy_user:from-pgpass\n").unwrap();
@@ -352,6 +358,7 @@ mod tests {
 
     #[test]
     fn missing_pgpassfile_returns_none_not_error() {
+        let _guard = env_lock();
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "trident-test-pgpass-missing-{}.conf",
@@ -368,6 +375,7 @@ mod tests {
 
     #[test]
     fn no_matching_entry_returns_none() {
+        let _guard = env_lock();
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "trident-test-pgpass-nomatch-{}.conf",

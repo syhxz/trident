@@ -231,7 +231,7 @@ impl ClientSession {
             .as_ref()
             .is_some_and(|h| {
                 h.conn.node_id == node_id
-                    && current_generation.map_or(true, |gen| h.conn.generation >= gen)
+                    && current_generation.is_none_or(|gen| h.conn.generation >= gen)
             })
         {
             self.cached_idle_backend.take()
@@ -494,13 +494,16 @@ where
     async fn release_cached_backend(&self, session: &mut ClientSession) {
         if let Some(held) = session.cached_idle_backend.take() {
             // If the connection is from a stale generation (node was
-            // removed and re-added), simply drop it — the old pool that
-            // tracked this slot has already been drained.
+            // removed and re-added), discard it through its source pool
+            // so that active_connections / known_connections accounting
+            // is correctly decremented.
             let stale = self
                 .connection_registry
                 .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
             if stale {
-                drop(held);
+                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                    let _ = pool.discard(held.conn);
+                }
                 return;
             }
             if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
@@ -794,7 +797,12 @@ where
             let stale = self
                 .connection_registry
                 .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
-            if !stale {
+            if stale {
+                // Stale: discard through source pool to fix accounting.
+                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
+                    let _ = pool.discard(held.conn);
+                }
+            } else {
                 if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
                     let _ = pool.release(&session.state.id, held.conn).await;
                 }

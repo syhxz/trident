@@ -340,6 +340,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                     )));
                 }
                 self.register_connection(&conn);
+                metrics::counter!("trident_pool_connections_established_total", "node_id" => self.node_id.clone()).increment(1);
                 Ok(conn)
             }
             Ok(Err(error)) => {
@@ -579,8 +580,25 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 });
             }
 
+            // Register the waiter BEFORE re-checking idle/capacity to close
+            // the lost-wakeup window: if a release happens between our check
+            // and the await, the notification is captured by this future.
+            let notified = self.release_notify.notified();
+            tokio::pin!(notified);
+
+            // Re-check after registering — a slot may have become available.
+            if let Some(conn) = self.take_reusable_idle() {
+                self.record_checkout(&conn);
+                return Ok(conn);
+            }
+            if self.try_reserve_slot() {
+                let conn = self.create_reserved_connection().await?;
+                self.record_checkout(&conn);
+                return Ok(conn);
+            }
+
             // Wait for a release notification or timeout
-            match tokio::time::timeout(remaining, self.release_notify.notified()).await {
+            match tokio::time::timeout(remaining, notified).await {
                 Ok(()) => {
                     if self.draining.load(Ordering::SeqCst) {
                         return Err(PoolError::Exhausted(format!(
@@ -610,8 +628,10 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         }
     }
 
-    /// Records the checkout time for leak detection.
+    /// Records the checkout time for leak detection and increments the
+    /// pool checkout counter (used to derive connection reuse ratio).
     fn record_checkout(&self, conn: &BackendConnection) {
+        metrics::counter!("trident_pool_checkouts_total", "node_id" => self.node_id.clone()).increment(1);
         if !self.settings.leak_detection_threshold.is_zero() {
             self.checkout_times.lock().insert(conn.backend_pid, Instant::now());
         }

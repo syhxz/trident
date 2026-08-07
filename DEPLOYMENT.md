@@ -121,6 +121,8 @@ admin:
 | `trident_health_checks_total{node_id,result}` | counter | Health check results per node |
 | `trident_pool_active_connections{node_id}` | gauge | Active backend connections per node |
 | `trident_pool_max_size{node_id}` | gauge | Pool capacity per node |
+| `trident_pool_checkouts_total{node_id}` | counter | Total connection checkouts from the pool |
+| `trident_pool_connections_established_total{node_id}` | counter | New backend connections created |
 | `trident_pool_exhausted_total{node_id}` | counter | Pool exhaustion events (client gets SQLSTATE 53300) |
 | `trident_node_replication_lag_ms{node_id}` | gauge | Replication lag per Reader/Analytics node |
 | `trident_query_duration_ms{target}` | histogram | Per-statement latency (Simple Query only) |
