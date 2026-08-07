@@ -514,6 +514,21 @@ where
         }
     }
 
+    /// Discards a broken/unknown-state connection and clears the cancel
+    /// registry entry for this session. This is the single canonical exit
+    /// path for error-handling code that needs to abandon a checked-out
+    /// connection. Centralising this prevents forgetting either the pool
+    /// slot release or the cancel registry cleanup.
+    fn discard_backend(
+        &self,
+        pool: &Arc<dyn ConnectionPool>,
+        conn: BackendConnection,
+        session_id: &str,
+    ) -> Result<(), ProxyError> {
+        self.cancel_registry.clear_active(session_id);
+        pool.discard(conn).map_err(ProxyError::Pool)
+    }
+
     /// Handles a single client connection end-to-end. `startup_handler`
     /// performs the Startup/authentication handshake with the client;
     /// `session_id` uniquely identifies this connection for pool/LSN
@@ -1393,13 +1408,11 @@ where
         );
 
         if let Err(e) = conn.stream.write_all(&outbound).await {
-            self.cancel_registry.clear_active(&session.state.id);
-            pool.discard(conn)?;
+            self.discard_backend(&pool, conn, &session.state.id)?;
             return Err(ProxyError::Protocol(e.into()));
         }
         if let Err(e) = conn.stream.flush().await {
-            self.cancel_registry.clear_active(&session.state.id);
-            pool.discard(conn)?;
+            self.discard_backend(&pool, conn, &session.state.id)?;
             return Err(ProxyError::Protocol(e.into()));
         }
 
@@ -1418,8 +1431,7 @@ where
             let (tag, body) = match read_tagged_frame(&mut conn.stream).await {
                 Ok(frame) => frame,
                 Err(e) => {
-                    self.cancel_registry.clear_active(&session.state.id);
-                    pool.discard(conn)?;
+                    self.discard_backend(&pool, conn, &session.state.id)?;
                     return Err(ProxyError::Protocol(e));
                 }
             };
@@ -1431,8 +1443,7 @@ where
                     // containing I/T/E). Invalid bytes previously degraded to Idle,
                     // which could return a connection in unknown state to the pool.
                     if body.len() != 1 {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(ProxyError::Protocol(ProtocolError::Malformed(
                             "ReadyForQuery body length is not 1".into(),
                         )));
@@ -1440,8 +1451,7 @@ where
                     let status = match TransactionStatus::from_byte(body[0]) {
                         Some(s) => s,
                         None => {
-                            self.cancel_registry.clear_active(&session.state.id);
-                            pool.discard(conn)?;
+                            self.discard_backend(&pool, conn, &session.state.id)?;
                             return Err(ProxyError::Protocol(ProtocolError::Malformed(format!(
                                 "ReadyForQuery invalid status byte: 0x{:02x}",
                                 body[0]
@@ -1460,8 +1470,7 @@ where
                         commit_tag_seen = true;
                     }
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
                     }
                 }
@@ -1469,8 +1478,7 @@ where
                     // ErrorResponse.
                     had_error = true;
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
                     }
                 }
@@ -1479,13 +1487,11 @@ where
                     // CopyInResponse, then switch to relaying the client's
                     // copy stream to the backend until CopyDone/CopyFail.
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
                     }
                     if let Err(e) = client_stream.flush().await {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(ProxyError::Protocol(ProtocolError::Io(e)));
                     }
                     let copy_result = relay_copy_in_stream(&mut conn.stream, client_stream).await;
@@ -1504,8 +1510,7 @@ where
                     if let Err(e) = sync_result {
                         // Mid-copy failure leaves the backend in copy-in
                         // state; this connection must not be reused.
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(ProxyError::Protocol(e));
                     }
                 }
@@ -1518,8 +1523,7 @@ where
                     if Some(name.as_str()) == extension_guc_name {
                         reported_lsn = crate::health::parse_lsn(&value);
                     } else if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
                     }
                 }
@@ -1528,8 +1532,7 @@ where
                     // RowDescription, NoData, ParameterDescription,
                     // CloseComplete, NoticeResponse, etc.): relay raw.
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
-                        self.cancel_registry.clear_active(&session.state.id);
-                        pool.discard(conn)?;
+                        self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
                     }
                 }
