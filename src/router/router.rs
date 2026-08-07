@@ -299,6 +299,7 @@ where
         ctx: &mut RoutingContext<'_>,
         readers: &[BackendNodeSnapshot],
         analytics_nodes: &[BackendNodeSnapshot],
+        writers: &[BackendNodeSnapshot],
     ) -> Result<RouteDecision, RouterError> {
         // Loaded once per `route` call so every step below observes a
         // single consistent snapshot of settings, even if `update_settings`
@@ -452,7 +453,35 @@ where
             return Err(RouterError::NoReadableNode);
         }
 
-        // Step 7: Load-balanced selection among eligible readers.
+        // Step 7: Load-balanced selection among eligible readers (and
+        // writer when writer_readable is enabled).
+        if settings.writer_readable {
+            // Include writer(s) in the candidate pool for load balancing.
+            let mut all_candidates: Vec<NodeCandidate> = eligible
+                .iter()
+                .filter_map(|id| readers.iter().find(|n| &n.node_id == id))
+                .map(|n| NodeCandidate {
+                    node_id: n.node_id.clone(),
+                    weight: n.weight,
+                    active_connections: n.active_connections,
+                })
+                .collect();
+            for w in writers {
+                all_candidates.push(NodeCandidate {
+                    node_id: w.node_id.clone(),
+                    weight: w.weight,
+                    active_connections: w.active_connections,
+                });
+            }
+            if let Some(node_id) = self.load_balancer.select(&all_candidates) {
+                // Check if the selected node is a writer
+                if writers.iter().any(|w| w.node_id == node_id) {
+                    return Ok(RouteDecision::writer("autocommit read, writer selected by load balancer"));
+                }
+                return Ok(RouteDecision::selected(NodeType::Reader, Some(node_id), "autocommit read, consistency satisfied"));
+            }
+        }
+
         let node_id = self.select_from_candidates(&eligible, readers);
         Ok(RouteDecision::selected(NodeType::Reader, node_id, "autocommit read, consistency satisfied"))
     }
@@ -549,7 +578,7 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)]; // far behind, would fail Global check
         let decision = router
-            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx, &readers, &[])
+            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx, &readers, &[], &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
@@ -570,7 +599,7 @@ mod tests {
             session_write_lsn: 0,
             global_write_lsn: 0,
         };
-        let decision = router.route("SELECT 1", &mut ctx, &[], &[]).await.unwrap();
+        let decision = router.route("SELECT 1", &mut ctx, &[], &[], &[]).await.unwrap();
         assert_eq!(decision.target, NodeType::Writer);
     }
 
@@ -595,7 +624,7 @@ mod tests {
         };
         // No readers satisfy the (very strict) consistency requirement, but
         // the decision must never set fallback_to_writer=true.
-        let decision = router.route("SELECT 1", &mut ctx, &[], &[]).await.unwrap();
+        let decision = router.route("SELECT 1", &mut ctx, &[], &[], &[]).await.unwrap();
         assert!(!decision.fallback_to_writer);
     }
 
@@ -617,7 +646,7 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)];
         let decision = router
-            .route("SELECT * FROM sensitive_table", &mut ctx, &readers, &[])
+            .route("SELECT * FROM sensitive_table", &mut ctx, &readers, &[], &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Writer);
@@ -643,7 +672,7 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)];
         let decision = router
-            .route("SELECT * FROM unrelated_table", &mut ctx, &readers, &[])
+            .route("SELECT * FROM unrelated_table", &mut ctx, &readers, &[], &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
@@ -671,7 +700,7 @@ mod tests {
                 "/*+ ROUTE_TO_READER */ SELECT * FROM sensitive_table",
                 &mut ctx,
                 &readers,
-                &[],
+                &[], &[],
             )
             .await
             .unwrap();
@@ -693,7 +722,7 @@ mod tests {
             global_write_lsn: 100,
         };
         let readers = vec![reader("lagging-reader", 1)];
-        let result = router.route("SELECT 1", &mut ctx, &readers, &[]).await;
+        let result = router.route("SELECT 1", &mut ctx, &readers, &[], &[]).await;
         assert!(matches!(result, Err(RouterError::NoReadableNode)));
     }
 
@@ -710,7 +739,7 @@ mod tests {
         };
         let readers = vec![reader("lagging-reader", 1)];
         let decision = router
-            .route("SELECT 1", &mut ctx, &readers, &[])
+            .route("SELECT 1", &mut ctx, &readers, &[], &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Writer);
@@ -729,7 +758,7 @@ mod tests {
             global_write_lsn: 0,
         };
         let decision = router
-            .route("INSERT INTO t VALUES (1)", &mut ctx, &[], &[])
+            .route("INSERT INTO t VALUES (1)", &mut ctx, &[], &[], &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Writer);
@@ -753,6 +782,7 @@ mod tests {
                 &mut ctx,
                 &readers,
                 &[],
+                &[],
             )
             .await
             .unwrap();
@@ -775,7 +805,7 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)];
         let decision = router
-            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx, &readers, &[])
+            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx, &readers, &[], &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
@@ -797,7 +827,7 @@ mod tests {
             global_write_lsn: 0,
         };
         let decision2 = router
-            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx2, &readers, &[])
+            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx2, &readers, &[], &[])
             .await
             .unwrap();
         assert!(!decision2.forced_by_hint);
@@ -832,7 +862,7 @@ mod tests {
             global_write_lsn: 1000,
         };
         let readers = vec![reader("r1", 0)];
-        let decision = router.route("SELECT 1", &mut ctx, &readers, &[]).await.unwrap();
+        let decision = router.route("SELECT 1", &mut ctx, &readers, &[], &[]).await.unwrap();
         assert_eq!(decision.target, NodeType::Writer);
         assert!(decision.fallback_to_writer);
     }
@@ -849,7 +879,7 @@ mod tests {
             global_write_lsn: 100,
         };
         let readers = vec![reader("r1", 200)];
-        let decision = router.route("SELECT 1", &mut ctx, &readers, &[]).await.unwrap();
+        let decision = router.route("SELECT 1", &mut ctx, &readers, &[], &[]).await.unwrap();
         assert_eq!(decision.target, NodeType::Reader);
         assert_eq!(decision.node_id, Some("r1".to_string()));
     }
@@ -875,7 +905,7 @@ mod tests {
             replication_lag_ms: None,
         }];
         let decision = router
-            .route("SELECT * FROM huge_table", &mut ctx, &[], &analytics)
+            .route("SELECT * FROM huge_table", &mut ctx, &[], &analytics, &[])
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Analytics);
@@ -904,7 +934,7 @@ mod tests {
             replication_lag_ms: None,
         }];
         let decision = router
-            .route("SELECT * FROM huge_table", &mut ctx, &[], &analytics)
+            .route("SELECT * FROM huge_table", &mut ctx, &[], &analytics, &[])
             .await
             .unwrap();
         assert_ne!(decision.target, NodeType::Analytics);
@@ -934,7 +964,7 @@ mod tests {
             };
             // Reader lags behind both thresholds -> no eligible reader.
             let readers = vec![reader("r1", 0)];
-            let decision = rt.block_on(router.route("SELECT 1", &mut ctx, &readers, &[])).unwrap();
+            let decision = rt.block_on(router.route("SELECT 1", &mut ctx, &readers, &[], &[])).unwrap();
             prop_assert_eq!(decision.target, NodeType::Writer);
             prop_assert!(decision.fallback_to_writer);
         }

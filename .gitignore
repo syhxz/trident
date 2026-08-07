@@ -27,3 +27,5 @@ DESIGN.md
 
 # Logs
 *.log
+backup_20260806/
+pgbench_log.*

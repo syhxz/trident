@@ -308,6 +308,7 @@ pub trait RouteFn: Send + Sync {
         ctx: &mut RoutingContext<'_>,
         readers: &[crate::health::BackendNodeSnapshot],
         analytics_nodes: &[crate::health::BackendNodeSnapshot],
+        writers: &[crate::health::BackendNodeSnapshot],
     ) -> impl std::future::Future<Output = Result<RouteDecision, crate::router::router::RouterError>>
            + Send;
 }
@@ -334,8 +335,9 @@ where
         ctx: &mut RoutingContext<'_>,
         readers: &[crate::health::BackendNodeSnapshot],
         analytics_nodes: &[crate::health::BackendNodeSnapshot],
+        writers: &[crate::health::BackendNodeSnapshot],
     ) -> Result<RouteDecision, crate::router::router::RouterError> {
-        Router::route(self, sql, ctx, readers, analytics_nodes).await
+        Router::route(self, sql, ctx, readers, analytics_nodes, writers).await
     }
 }
 
@@ -1722,7 +1724,7 @@ mod tests {
                 healthy: true,
                 replay_lsn: reader_replay_lsn,
                 active_connections: 0,
-                weight: 1,
+                weight: 10,
                 replication_lag_ms: None,
             });
             nodes

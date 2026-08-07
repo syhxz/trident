@@ -845,6 +845,11 @@ where
             .filter(|n| n.node_type == NodeType::Analytics && n.healthy)
             .cloned()
             .collect();
+        let writers: Vec<_> = all_nodes
+            .iter()
+            .filter(|n| n.node_type == NodeType::Writer && n.healthy)
+            .cloned()
+            .collect();
 
         let session_write_lsn = self.lsn_tracker.session_write_lsn(&session.state.id);
         let global_write_lsn = self.lsn_tracker.global_write_lsn();
@@ -864,7 +869,7 @@ where
                 session_write_lsn,
                 global_write_lsn,
             };
-            self.router.route(sql, &mut ctx, &readers, &analytics).await
+            self.router.route(sql, &mut ctx, &readers, &analytics, &writers).await
         };
         // Always put the state back, including when routing fails. The prior
         // implementation used `?` before this assignment and could silently
@@ -886,7 +891,7 @@ where
                         session_write_lsn: self.lsn_tracker.session_write_lsn(&session.state.id),
                         global_write_lsn: self.lsn_tracker.global_write_lsn(),
                     };
-                    self.router.route(sql, &mut ctx, &readers, &analytics).await
+                    self.router.route(sql, &mut ctx, &readers, &analytics, &writers).await
                 };
                 session.state.tx_split = reroute_split;
                 decision = reroute_result?;

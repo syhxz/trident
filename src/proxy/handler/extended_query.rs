@@ -237,6 +237,11 @@ where
                 .filter(|n| n.node_type == NodeType::Analytics && n.healthy)
                 .cloned()
                 .collect();
+            let writers: Vec<_> = all_nodes
+                .iter()
+                .filter(|n| n.node_type == NodeType::Writer && n.healthy)
+                .cloned()
+                .collect();
             let sql_for_routing = route_sql.unwrap_or("SELECT 1");
 
             let session_write_lsn = self.lsn_tracker.session_write_lsn(&session.state.id);
@@ -251,7 +256,7 @@ where
                     global_write_lsn,
                 };
                 self.router
-                    .route(sql_for_routing, &mut ctx, &readers, &analytics)
+                    .route(sql_for_routing, &mut ctx, &readers, &analytics, &writers)
                     .await
             };
             session.state.tx_split = tx_split;
