@@ -161,6 +161,10 @@ pub struct QueryForwardOptions<'a> {
     pub pipeline_lsn: bool,
     pub extension_guc: Option<&'a str>,
     pub internal_query_timeout: Duration,
+    /// Per-frame idle timeout applied to COPY IN relay. If zero, no timeout
+    /// is applied (backward-compatible). Prevents a stalled client from
+    /// holding a backend slot indefinitely during COPY.
+    pub copy_idle_timeout: Duration,
     /// Transaction-opening statement (a validated BEGIN variant) pipelined
     /// in the same outbound write as the main query, saving one full
     /// backend round trip when a delayed split-transaction BEGIN must be
@@ -184,6 +188,7 @@ impl Default for QueryForwardOptions<'_> {
             pipeline_lsn: false,
             extension_guc: None,
             internal_query_timeout: Duration::from_millis(100),
+            copy_idle_timeout: Duration::ZERO,
             begin_prefix: None,
             appname_prefix: None,
         }
@@ -474,7 +479,7 @@ where
                     source: ProtocolError::Io(source),
                     error_response_relayed,
                 })?;
-                relay_copy_in_stream(backend, client)
+                relay_copy_in_stream_with_timeout(backend, client, options.copy_idle_timeout)
                     .await
                     .map_err(|source| QueryRelayError {
                         source,
@@ -525,9 +530,14 @@ where
 /// defines the error semantics (Flush/Sync are ignored during copy-in;
 /// other types make the backend fail the COPY), so the proxy does not
 /// second-guess it.
-pub(crate) async fn relay_copy_in_stream<B, C>(
+///
+/// If `idle_timeout` is zero, no per-frame timeout is applied. Otherwise,
+/// a stalled client that sends no data within the timeout causes the COPY
+/// to fail with an I/O timeout error, freeing the backend slot.
+pub(crate) async fn relay_copy_in_stream_with_timeout<B, C>(
     backend: &mut B,
     client: &mut C,
+    idle_timeout: Duration,
 ) -> Result<(), ProtocolError>
 where
     B: AsyncWrite + Unpin + Send,
@@ -536,7 +546,19 @@ where
     const TAG_COPY_DONE: u8 = b'c';
     const TAG_COPY_FAIL: u8 = b'f';
     loop {
-        let (tag, body) = read_tagged_frame(client).await?;
+        let (tag, body) = if idle_timeout.is_zero() {
+            read_tagged_frame(client).await?
+        } else {
+            match tokio::time::timeout(idle_timeout, read_tagged_frame(client)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(ProtocolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "client idle timeout during COPY IN",
+                    )));
+                }
+            }
+        };
         write_raw_frame(backend, tag, &body).await?;
         if tag == TAG_COPY_DONE || tag == TAG_COPY_FAIL {
             backend.flush().await.map_err(ProtocolError::Io)?;

@@ -3,6 +3,8 @@
 //! Contains `handle_extended_query_batch` and `forward_extended_on_held_backend`,
 //! which process Parse/Bind/Execute/Sync message batches.
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{ConsistencyLevel, LsnTrackingMode, NodeType};
@@ -12,7 +14,7 @@ use crate::protocol::message::{PgError, TransactionStatus};
 use crate::protocol::reader::{frontend_tag, read_tagged_frame};
 use crate::protocol::ProtocolError;
 use crate::proxy::error::ProxyError;
-use crate::proxy::forwarder::{apply_ready_for_query, is_write_command_tag, relay_copy_in_stream};
+use crate::proxy::forwarder::{apply_ready_for_query, is_write_command_tag, relay_copy_in_stream_with_timeout};
 use crate::router::router::RoutingContext;
 use crate::session::session::TxState;
 
@@ -126,6 +128,34 @@ where
             }
         }
 
+        // Intercept `SET trident.consistency = '...'` in extended protocol.
+        // Like the simple query path, this is a proxy-local setting that
+        // should not reach the backend. If the only Parse SQL in the batch
+        // is a consistency SET, handle it locally and return synthetic
+        // ParseComplete + BindComplete + CommandComplete + ReadyForQuery.
+        if let Some(sql) = route_sql {
+            if session.state.tx_state != TxState::Failed
+                && session.state.apply_consistency_set_command(sql)
+            {
+                use crate::protocol::writer::encode_backend_message;
+                use crate::protocol::message::BackendMessage;
+                // Send ParseComplete ('1'), BindComplete ('2'), CommandComplete, RFQ
+                let parse_complete = [b'1', 0, 0, 0, 4];
+                let bind_complete = [b'2', 0, 0, 0, 4];
+                let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                    tag: "SET".to_string(),
+                });
+                client_stream.write_all(&parse_complete).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                client_stream.write_all(&bind_complete).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                client_stream.write_all(&cmd_complete).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                send_ready_for_query(client_stream, session.state.tx_state).await?;
+                return Ok(());
+            }
+        }
+
         // If no Parse in batch, look up the statement name referenced by
         // Bind/Describe(Statement) to find its previously recorded route
         // target. Execute references a *portal* (a separate namespace
@@ -184,7 +214,7 @@ where
             None
         };
 
-        let target_node_id = if self.lsn_tracking.mode == LsnTrackingMode::AuroraWriteForwarding {
+        let (target_node_id, deferred_begin_sql) = if self.lsn_tracking.mode == LsnTrackingMode::AuroraWriteForwarding {
             // Aurora write forwarding pins every session to one Reader and
             // bypasses the Router entirely; extended batches must honor the
             // same binding or session consistency breaks.
@@ -198,7 +228,7 @@ where
                         node_id.clone(),
                     )));
                 }
-                node_id.clone()
+                (node_id.clone(), None)
             } else {
                 let selected = all_nodes
                     .iter()
@@ -215,12 +245,12 @@ where
                         ))
                     })?;
                 session.aurora_node_id = Some(selected.clone());
-                selected
+                (selected, None)
             }
         } else if let Some(node_id) = tracked_node {
             // Named statement was previously parsed on this node: reuse that
             // route without touching the pool snapshot at all.
-            node_id
+            (node_id, None)
         } else {
             // Route based on the SQL from Parse. The pool snapshot (which
             // clones every node's state) is only taken on this branch and
@@ -247,6 +277,7 @@ where
             let session_write_lsn = self.lsn_tracker.session_write_lsn(&session.state.id);
             let global_write_lsn = self.lsn_tracker.global_write_lsn();
             let mut tx_split = session.state.tx_split.take();
+            let split_was_pending = tx_split.as_ref().is_some_and(|state| !state.active);
             let decision = {
                 let mut ctx = RoutingContext {
                     tx_state: session.state.tx_state,
@@ -260,16 +291,45 @@ where
                     .await
             };
             session.state.tx_split = tx_split;
-            let decision = decision?;
+            let mut decision = decision?;
 
-            match decision.target {
+            // Consistency protection: if a prior write is pending LSN
+            // resolution and this read would go to a Reader, force it to
+            // Writer (same logic as simple_query path). We skip the full
+            // resolve_pending_write_lsn pipeline here because the extended
+            // path does not have access to a spare backend for the internal
+            // LSN query; instead, conservatively route to Writer until the
+            // next simple-query cycle can resolve the watermark.
+            if session.pending_write && decision.target != NodeType::Writer {
+                decision.target = NodeType::Writer;
+                decision.node_id = None;
+                decision.fallback_to_writer = true;
+                decision.reason = std::borrow::Cow::Borrowed(
+                    "pending_write: forcing to Writer until LSN is resolved",
+                );
+            }
+
+            // Capture deferred BEGIN SQL for split transactions that have
+            // not yet opened a real backend transaction.
+            let deferred_begin_sql = if split_was_pending || decision.requires_split_upgrade {
+                session
+                    .state
+                    .tx_split
+                    .as_ref()
+                    .map(|state| state.begin_sql().to_string())
+            } else {
+                None
+            };
+
+            let node_id = match decision.target {
                 NodeType::Writer => all_nodes
                     .iter()
                     .find(|n| n.node_type == NodeType::Writer && n.healthy)
                     .map(|n| n.node_id.clone())
                     .unwrap_or_default(),
                 _ => decision.node_id.unwrap_or_default(),
-            }
+            };
+            (node_id, deferred_begin_sql)
         };
 
         if target_node_id.is_empty() {
@@ -356,6 +416,24 @@ where
             session.aurora_initialized_backend_pid = Some(conn.backend_pid);
         }
 
+        // Send the deferred BEGIN if this is the first statement in a
+        // split transaction. The simple query path pipelines BEGIN before
+        // the user SQL; here we must issue it as a separate internal query
+        // because the extended protocol batch is forwarded verbatim and
+        // cannot be prepended with a simple-query message.
+        if let Some(ref begin_sql) = deferred_begin_sql {
+            if let Err(error) = execute_internal_query(
+                &mut conn.stream,
+                begin_sql,
+                TransactionStatus::InTransaction,
+            )
+            .await
+            {
+                pool.discard(conn)?;
+                return Err(ProxyError::Protocol(error));
+            }
+        }
+
         // Send all buffered raw frames + Sync to the backend in one write.
         // No re-encoding: the bytes the client sent are forwarded verbatim.
         let outbound = assemble_extended_outbound(batch);
@@ -392,7 +470,14 @@ where
                 Ok(frame) => frame,
                 Err(e) => {
                     self.discard_backend(&pool, conn, &session.state.id)?;
-                    return Err(ProxyError::Protocol(e));
+                    // If we already forwarded a backend ErrorResponse to the
+                    // client, wrap the error so the outer loop does not send
+                    // a duplicate ErrorResponse.
+                    let err = ProxyError::Protocol(e);
+                    if had_error {
+                        return Err(ProxyError::BackendErrorAlreadyRelayed(Box::new(err)));
+                    }
+                    return Err(err);
                 }
             };
 
@@ -454,7 +539,11 @@ where
                         self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(ProxyError::Protocol(ProtocolError::Io(e)));
                     }
-                    let copy_result = relay_copy_in_stream(&mut conn.stream, client_stream).await;
+                    let copy_result = relay_copy_in_stream_with_timeout(
+                        &mut conn.stream,
+                        client_stream,
+                        self.client_idle_timeout,
+                    ).await;
                     // The Sync pipelined behind Execute was consumed and
                     // ignored by the backend while in copy-in mode (per
                     // protocol spec); send a fresh one or ReadyForQuery
@@ -548,13 +637,13 @@ where
 
         // Return or hold the backend connection.
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn });
+            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
         } else if conn.dirty {
             // Dirty connections cannot be cached — release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache for reuse by the next query in this session.
-            session.cached_idle_backend = Some(HeldBackend { conn });
+            session.cached_idle_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -625,7 +714,11 @@ where
                 Ok(frame) => frame,
                 Err(e) => {
                     self.discard_held_backend(session);
-                    return Err(ProxyError::Protocol(e));
+                    let err = ProxyError::Protocol(e);
+                    if had_error {
+                        return Err(ProxyError::BackendErrorAlreadyRelayed(Box::new(err)));
+                    }
+                    return Err(err);
                 }
             };
 
@@ -682,7 +775,11 @@ where
                         return Err(ProxyError::Protocol(ProtocolError::Io(e)));
                     }
                     let copy_result =
-                        relay_copy_in_stream(&mut held.conn.stream, client_stream).await;
+                        relay_copy_in_stream_with_timeout(
+                            &mut held.conn.stream,
+                            client_stream,
+                            self.client_idle_timeout,
+                        ).await;
                     let sync_result = match copy_result {
                         Ok(()) => held
                             .conn

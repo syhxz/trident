@@ -353,8 +353,16 @@ where
         // (Requirement 3.7 / Property 14).
         if ctx.tx_state == TxState::InTransaction {
             if let Some(tx_split) = ctx.tx_split.as_mut() {
-                let stmt_kind = if self.classifier.classify(sql).requires_writer()
+                // Classify the statement for transaction splitting. We must
+                // be conservative here: anything not explicitly recognized as
+                // read-only is treated as a write. This matches the autocommit
+                // path where `!sql_kind.readable()` routes to Writer, ensuring
+                // that WITH...INSERT, DO $$...$$, and other unrecognized forms
+                // never accidentally land on a Reader within a split transaction.
+                let sql_kind = self.classifier.classify(sql);
+                let stmt_kind = if sql_kind.requires_writer()
                     || self.classifier.has_write_function_call(sql)
+                    || !sql_kind.readable()
                 {
                     StatementKind::Write
                 } else {

@@ -182,6 +182,34 @@ pub fn resolve_password_from_pgpass(
         return Ok(None);
     };
 
+    // libpq-compatible permission check: on Unix, the .pgpass file must
+    // not be world-or-group readable (mode & 0o077 must be 0), otherwise
+    // it is silently ignored. This prevents accidental exposure of secrets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let mode = meta.mode();
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        mode = format!("{:04o}", mode & 0o7777),
+                        "ignoring .pgpass file: permissions are too open (must be 0600 or stricter)"
+                    );
+                    return Ok(None);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(PgPassError::Io {
+                    path: path.display().to_string(),
+                    source,
+                })
+            }
+        }
+    }
+
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -347,6 +375,13 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("trident-test-pgpass-{}.conf", std::process::id()));
         std::fs::write(&path, "10.0.1.10:5432:mydb:proxy_user:from-pgpass\n").unwrap();
+
+        // Set restrictive permissions as required by the permission check.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         std::env::set_var("PGPASSFILE", &path);
         let result = resolve_password_from_pgpass("10.0.1.10", 5432, "mydb", "proxy_user").unwrap();

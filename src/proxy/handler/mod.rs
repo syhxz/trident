@@ -57,6 +57,36 @@ use crate::router::router::{RouteDecision, Router, RoutingContext};
 use crate::session::lsn::LsnTracker;
 use crate::session::session::{SessionState, TxState};
 
+/// RAII guard that ensures critical session resources are cleaned up
+/// even if the handler task panics. Async-aware cleanup (pool release)
+/// cannot run from Drop; those are handled best-effort by idle
+/// validation. This guard covers CancelRegistry and LSN session metadata.
+struct SessionCleanupGuard<'a, LSN: LsnTracker> {
+    session_id: String,
+    cancel_registry: &'a CancelRegistry,
+    lsn_tracker: &'a LSN,
+    /// BackendKeyData issued to the client during startup.
+    proxy_backend_pid: i32,
+    proxy_secret_key: i32,
+    /// Set to true when normal cleanup has run; prevents double-cleanup.
+    disarmed: bool,
+}
+
+impl<LSN: LsnTracker> Drop for SessionCleanupGuard<'_, LSN> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // Panic cleanup: clear any active-backend marker and the session's
+        // cancel routing entry so stale state doesn't accumulate.
+        self.cancel_registry.clear_active(&self.session_id);
+        self.cancel_registry
+            .unregister_session(self.proxy_backend_pid, self.proxy_secret_key);
+        self.lsn_tracker.remove_session(&self.session_id);
+        tracing::debug!(session = %self.session_id, "panic/abort cleanup guard fired");
+    }
+}
+
 /// Per-session data the handler owns for the lifetime of one client
 /// connection: routing/consistency state plus a unique session id used as
 /// the pool's `session_id` key.
@@ -113,6 +143,11 @@ pub struct ClientSession {
 /// transaction, or after a session-state operation triggers pinning.
 struct HeldBackend {
     conn: BackendConnection,
+    /// The pool this connection was originally acquired from. Used to
+    /// return/discard the connection to the correct pool even after a
+    /// node has been removed and re-added (which creates a new pool
+    /// instance with the same node_id).
+    source_pool: Option<Arc<dyn ConnectionPool>>,
 }
 
 /// One extended-query protocol message buffered between Sync boundaries,
@@ -511,13 +546,20 @@ where
             let stale = self
                 .connection_registry
                 .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
+
+            // Prefer the stored source_pool to avoid returning to a
+            // different (new) pool that shares the same node_id.
+            let pool = held
+                .source_pool
+                .or_else(|| self.resolve_pool_existing(&held.conn.node_id, session));
+
             if stale {
-                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                if let Some(pool) = pool {
                     let _ = pool.discard(held.conn);
                 }
                 return;
             }
-            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+            if let Some(pool) = pool {
                 let _ = pool.release(&session.state.id, held.conn).await;
             }
             // If pool not found (node removed entirely), connection is
@@ -550,7 +592,10 @@ where
     ) {
         self.cancel_registry.clear_active(&session.state.id);
         if let Some(held) = session.held_backend.take() {
-            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+            let pool = held
+                .source_pool
+                .or_else(|| self.resolve_pool_existing(&held.conn.node_id, session));
+            if let Some(pool) = pool {
                 let _ = pool.discard(held.conn);
             }
         }
@@ -786,6 +831,12 @@ where
         // This will be SET on the backend after each fresh connection checkout,
         // ensuring pg_stat_activity always reflects the real client IP
         // regardless of pool sharing in Transaction mode.
+        //
+        // Format: "trident:<client_ip>:<original_app>" — preserves the
+        // client's original application_name while prepending the proxy
+        // identifier and client IP for audit/traceability in
+        // pg_stat_activity. When no application_name was provided, uses
+        // "trident:<client_ip>" as a fallback.
         {
             let client_ip = session_id
                 .rsplit_once('-')
@@ -816,6 +867,17 @@ where
             &session_id,
         );
 
+        // RAII guard: ensures CancelRegistry and LSN metadata are cleaned
+        // up even if the handler panics. Disarmed during normal cleanup.
+        let mut cleanup_guard = SessionCleanupGuard {
+            session_id: session_id.clone(),
+            cancel_registry: self.cancel_registry,
+            lsn_tracker: self.lsn_tracker,
+            proxy_backend_pid: auth_outcome.backend_pid,
+            proxy_secret_key: auth_outcome.secret_key,
+            disarmed: false,
+        };
+
         // --- Message loop -------------------------------------------------
         let result = self.message_loop(&mut client_stream, &mut session).await;
 
@@ -827,7 +889,10 @@ where
         // A checked-out transaction/pinned connection is owned directly by
         // the session. Discard it so both the socket and pool slot are released.
         if let Some(held) = session.held_backend.take() {
-            if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
+            let pool = held
+                .source_pool
+                .or_else(|| self.resolve_pool_existing(&held.conn.node_id, &session));
+            if let Some(pool) = pool {
                 if let Err(error) = pool.discard(held.conn) {
                     tracing::warn!(error = %error, "failed to discard held backend connection");
                 }
@@ -839,13 +904,16 @@ where
             let stale = self
                 .connection_registry
                 .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
+            let pool = held
+                .source_pool
+                .or_else(|| self.resolve_pool_existing(&held.conn.node_id, &session));
             if stale {
                 // Stale: discard through source pool to fix accounting.
-                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
+                if let Some(pool) = pool {
                     let _ = pool.discard(held.conn);
                 }
             } else {
-                if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, &session) {
+                if let Some(pool) = pool {
                     let _ = pool.release(&session.state.id, held.conn).await;
                 }
             }
@@ -853,6 +921,8 @@ where
 
         // Release complete connections still owned by Session-mode bindings
         // or by the pool's pinned map.
+        // Disarm the panic guard — normal cleanup is running.
+        cleanup_guard.disarmed = true;
         self.cancel_registry.clear_active(&session_id);
         self.cancel_registry
             .unregister_session(auth_outcome.backend_pid, auth_outcome.secret_key);
@@ -1019,7 +1089,14 @@ where
                             .handle_extended_query_batch(client_stream, session, &batch)
                             .await
                         {
-                            send_error_response(client_stream, &e).await?;
+                            // If the backend already sent its own
+                            // ErrorResponse (which was relayed to the
+                            // client), do NOT send a second proxy-generated
+                            // error. Only send ReadyForQuery.
+                            let already_relayed = matches!(&e, ProxyError::BackendErrorAlreadyRelayed(_));
+                            if !already_relayed {
+                                send_error_response(client_stream, &e).await?;
+                            }
                             send_ready_for_query(client_stream, session.state.tx_state).await?;
                             if session.state.tx_state != TxState::Idle {
                                 self.fail_open_transaction(session);

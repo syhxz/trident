@@ -4,6 +4,8 @@
 //! `forward_on_held_backend`, `handle_aurora_simple_query`,
 //! `resolve_pending_write_lsn`, and `finish_active_split_transaction`.
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{ConsistencyLevel, LsnTrackingMode, NodeType, PoolMode};
@@ -172,6 +174,7 @@ where
                 internal_query_timeout: std::time::Duration::from_millis(
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
+                copy_idle_timeout: self.client_idle_timeout,
                 begin_prefix: None,
                 appname_prefix: None,
             },
@@ -438,7 +441,7 @@ where
         session.state.tx_state = apply_ready_for_query(outcome.tx_status);
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn });
+            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
         } else {
             pool.release(&session.state.id, conn).await?;
         }
@@ -628,6 +631,7 @@ where
                 internal_query_timeout: std::time::Duration::from_millis(
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
+                copy_idle_timeout: self.client_idle_timeout,
                 begin_prefix: None,
                 appname_prefix: None,
             },
@@ -677,7 +681,7 @@ where
             return Ok(());
         }
         if conn.pinned {
-            session.held_backend = Some(HeldBackend { conn });
+            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
         } else {
             pool.release(&session.state.id, conn).await?;
         }
@@ -1170,6 +1174,7 @@ where
                 internal_query_timeout: std::time::Duration::from_millis(
                     self.lsn_tracking.pipeline.internal_query_timeout_ms,
                 ),
+                copy_idle_timeout: self.client_idle_timeout,
                 begin_prefix: delayed_begin,
                 appname_prefix: None,
             },
@@ -1253,13 +1258,13 @@ where
         }
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn });
+            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
         } else if conn.dirty {
             // Dirty connections cannot be cached; release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache the complete clean idle connection for same-node reuse.
-            session.cached_idle_backend = Some(HeldBackend { conn });
+            session.cached_idle_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await?;

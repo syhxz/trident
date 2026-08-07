@@ -26,6 +26,12 @@ pub enum ProxyError {
 
     #[error("connection handler task panicked: {0}")]
     Panic(String),
+
+    /// A backend ErrorResponse was already forwarded to the client before
+    /// the connection failed. The outer message loop must NOT send another
+    /// ErrorResponse; it should only send ReadyForQuery and update state.
+    #[error("backend error already relayed: {0}")]
+    BackendErrorAlreadyRelayed(Box<ProxyError>),
 }
 
 /// Converts a `ProxyError` into a well-formed `PgError` (SQLSTATE + message)
@@ -85,6 +91,12 @@ pub fn proxy_error_to_pg_error(err: &ProxyError) -> PgError {
             "XX000",
             "internal error: the proxy encountered an unexpected condition while processing this request".to_string(),
         ),
+        ProxyError::BackendErrorAlreadyRelayed(inner) => {
+            // This variant should normally never be converted to a PgError
+            // (the outer loop skips sending an error), but handle it
+            // gracefully by delegating to the wrapped inner error.
+            return proxy_error_to_pg_error(inner);
+        }
     };
 
     PgError::simple("ERROR", sqlstate, &message)

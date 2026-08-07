@@ -650,6 +650,18 @@ impl AppConfig {
             }
         }
 
+        // Reject empty admin auth_token — an empty string would allow
+        // unauthenticated requests to bypass the Bearer token check
+        // (empty == empty). Treat as a misconfiguration. Users who do
+        // not want auth should omit the field entirely (None).
+        if let Some(ref token) = self.admin.auth_token {
+            if token.is_empty() {
+                return Err(ConfigError::Validation(
+                    "admin.auth_token must not be an empty string; omit the field to disable auth".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -664,6 +676,7 @@ impl AppConfig {
         })?;
         let mut config: AppConfig = serde_yaml::from_str(&contents)?;
         config.resolve_passwords()?;
+        config.resolve_admin_token()?;
         config.validate()?;
         Ok(config)
     }
@@ -699,6 +712,21 @@ impl AppConfig {
             node.password = Some(resolved.ok_or_else(|| ConfigError::MissingPassword {
                 node: node.name.clone(),
             })?);
+        }
+        Ok(())
+    }
+
+    /// Resolves `${ENV_VAR}` placeholders in the admin auth_token field,
+    /// matching the behavior documented in the field's comment.
+    fn resolve_admin_token(&mut self) -> Result<(), ConfigError> {
+        if let Some(ref raw) = self.admin.auth_token {
+            let resolved = pgpass::substitute_env_placeholders(raw).map_err(|source| {
+                ConfigError::PasswordSubstitution {
+                    node: "admin.auth_token".to_string(),
+                    source,
+                }
+            })?;
+            self.admin.auth_token = Some(resolved);
         }
         Ok(())
     }
@@ -1344,6 +1372,14 @@ pub(crate) mod tests {
             "127.0.0.1:5432:mydb:proxy_user:pgpass-secret\n",
             "pgpassfile",
         );
+
+        // Set restrictive permissions on the pgpass file (required by permission check).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pgpass_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
         std::env::set_var("PGPASSFILE", &pgpass_path);
 
         let yaml = minimal_yaml("", "127.0.0.1", 5432, "mydb", "proxy_user");

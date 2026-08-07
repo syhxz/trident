@@ -58,10 +58,16 @@ struct RouterReloadTarget {
     /// Admin console's routing config snapshot — updated on reload so
     /// `GET /api/config` reflects the current state even after SIGHUP.
     admin_routing_config: Option<Arc<arc_swap::ArcSwap<trident::config::RoutingConfig>>>,
+    /// Serializes concurrent reload operations to prevent interleaving
+    /// that could produce a mixed config state visible to queries.
+    reload_lock: std::sync::Mutex<()>,
 }
 
 impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
     fn apply(&self, routing: &trident::config::RoutingConfig) -> Result<(), String> {
+        // Serialize concurrent reloads so updates are not interleaved.
+        let _guard = self.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         // Apply the pattern set first: if it fails to compile (should not
         // happen, since `AppConfig::validate` already checked it), leave
         // the patterns, custom rules, settings, and consistency all
@@ -109,11 +115,18 @@ struct LiveNodeManager {
     max_pool_size: u32,
     pool_settings: NodePoolSettings,
     check_query: String,
+    /// Serializes dynamic node add/remove operations to prevent
+    /// interleaving that could corrupt state (e.g. a concurrent remove
+    /// during warm_up() of an add, or two adds of the same node racing).
+    mutation_lock: tokio::sync::Mutex<()>,
 }
 
 #[async_trait::async_trait]
 impl admin::NodeManager for LiveNodeManager {
     async fn add_node(&self, config: trident::config::NodeConfig) -> Result<(), String> {
+        // Serialize with other add/remove operations to prevent interleaving.
+        let _guard = self.mutation_lock.lock().await;
+
         // Validate: check connectivity first
         let probe = WireProtocolHealthProbe {
             target: ProbeTarget {
@@ -210,6 +223,13 @@ impl admin::NodeManager for LiveNodeManager {
     }
 
     fn remove_node(&self, node_id: &str) -> Result<(), String> {
+        // Serialize with other add/remove operations. Use try_lock since
+        // this is a sync function; if the lock is held by a concurrent
+        // add (which does async warm_up), reject rather than deadlock.
+        let _guard = self.mutation_lock.try_lock().map_err(|_| {
+            "another node add/remove operation is in progress".to_string()
+        })?;
+
         // Atomically check last-writer protection and remove under the
         // health checker's internal lock — prevents concurrent removes
         // from both passing the writer count check.
@@ -307,6 +327,9 @@ enum StartupError {
     #[error("invalid admin.listen_addr '{0}': {1}")]
     InvalidAdminListenAddr(String, std::net::AddrParseError),
 
+    #[error("failed to bind admin listener on '{0}': {1}")]
+    AdminBindFailed(String, String),
+
     #[error("client TLS configuration error: {0}")]
     ClientTls(String),
 
@@ -368,14 +391,31 @@ async fn run(
     // fails startup fast, alongside `proxy.listen_addr`), but the server
     // itself is spawned further down once the router/pattern-matcher/
     // default_consistency handles it needs for `POST /reload` exist.
-    let admin_listen_addr: Option<SocketAddr> = if config.admin.enabled {
-        Some(
-            config
-                .admin
-                .listen_addr
-                .parse()
-                .map_err(|e| StartupError::InvalidAdminListenAddr(config.admin.listen_addr.clone(), e))?,
-        )
+    // The TCP listener is also bound here so binding failures abort startup
+    // rather than silently letting the proxy run without admin access.
+    let admin_listener: Option<tokio::net::TcpListener> = if config.admin.enabled {
+        let addr: SocketAddr = config
+            .admin
+            .listen_addr
+            .parse()
+            .map_err(|e| StartupError::InvalidAdminListenAddr(config.admin.listen_addr.clone(), e))?;
+
+        // Warn when admin is on a non-loopback interface without auth_token.
+        // Read-only endpoints expose SQL text, client IPs, and node state.
+        let is_loopback = addr.ip().is_loopback();
+        if !is_loopback && config.admin.auth_token.as_deref().unwrap_or("").is_empty() {
+            tracing::warn!(
+                addr = %addr,
+                "⚠️  SECURITY: admin console bound to non-loopback address without auth_token. \
+                 Read-only endpoints (SQL logs, client IPs, node status, WebSocket logs) are \
+                 accessible to any network-reachable client. Configure admin.auth_token or \
+                 bind to 127.0.0.1 for production deployments."
+            );
+        }
+
+        Some(admin::bind_admin_listener(addr).await.map_err(|e| {
+            StartupError::AdminBindFailed(config.admin.listen_addr.clone(), e.to_string())
+        })?)
     } else {
         None
     };
@@ -805,6 +845,7 @@ async fn run(
         custom_rules: custom_rules.clone(),
         default_consistency: default_consistency.clone(),
         admin_routing_config: Some(routing_config_snapshot.clone()),
+        reload_lock: std::sync::Mutex::new(()),
     });
     tokio::spawn(trident::reload::watch_sighup(
         config_path.clone(),
@@ -820,7 +861,7 @@ async fn run(
     // `admin` module docs. `/healthz` reports healthy based on the same
     // health-check snapshot the router/pool manager use; `/reload`
     // reuses the same hot-reload target `SIGHUP` uses above.
-    if let Some(admin_listen_addr) = admin_listen_addr {
+    if let Some(admin_listener) = admin_listener {
         let node_manager: Arc<dyn admin::NodeManager> = Arc::new(LiveNodeManager {
             health_checker: health_checker.clone(),
             pool_manager: pool_manager.clone(),
@@ -830,6 +871,7 @@ async fn run(
             max_pool_size: config.pool.max_pool_size,
             pool_settings,
             check_query: config.pool.check_query.clone(),
+            mutation_lock: tokio::sync::Mutex::new(()),
         });
         let admin_snapshot_source = pool_manager.clone();
         let config_path_for_admin = config_path.clone();
@@ -847,7 +889,7 @@ async fn run(
         let pool_max_lifetime_admin = config.pool.max_lifetime.clone();
         tokio::spawn(async move {
             if let Err(e) = admin::run(
-                admin_listen_addr,
+                admin_listener,
                 prometheus_handle,
                 move || admin_snapshot_source.snapshot(),
                 Some((config_path_for_admin, reload_target)),

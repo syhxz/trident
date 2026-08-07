@@ -216,10 +216,10 @@ pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
 
     idle: Mutex<VecDeque<BackendConnection>>,
     active_connections: AtomicU32,
-    /// Backend PIDs currently owned by this pool. This makes `discard`
-    /// idempotent with respect to slot accounting and prevents a stale
-    /// metadata clone from underflowing `active_connections`.
-    known_connections: Mutex<HashSet<i32>>,
+    /// Composite identity (backend_pid, secret_key) of connections currently
+    /// owned by this pool. Using both fields prevents PID-reuse collisions
+    /// from incorrectly affecting another connection's slot accounting.
+    known_connections: Mutex<HashSet<(i32, i32)>>,
 
     /// Session mode: session ID -> complete connection while it is between
     /// statements. `acquire` moves it out and `release` moves it back.
@@ -236,7 +236,7 @@ pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
     release_notify: tokio::sync::Notify,
     /// Tracks checkout timestamps for leak detection. Only populated when
     /// `settings.leak_detection_threshold > 0`.
-    checkout_times: Mutex<HashMap<i32, Instant>>,
+    checkout_times: Mutex<HashMap<(i32, i32), Instant>>,
     /// Flag to indicate the pool is draining (no new acquires allowed).
     draining: std::sync::atomic::AtomicBool,
 }
@@ -319,7 +319,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     fn register_connection(&self, conn: &BackendConnection) {
         self.known_connections
             .lock()
-            .insert(conn.backend_pid);
+            .insert((conn.backend_pid, conn.secret_key));
     }
 
     async fn create_reserved_connection(&self) -> Result<BackendConnection, PoolError> {
@@ -416,12 +416,21 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
 
             match self.cleaner.validate(&mut conn).await {
                 Ok(()) => {
-                    // Connection is alive — put it back at the end
-                    conn.idle_since = Some(Instant::now());
-                    self.idle.lock().push_back(conn);
-                    // Wake one waiter that may have missed this connection
-                    // while it was temporarily removed for validation.
-                    self.release_notify.notify_one();
+                    // Re-check draining: if drain() was called while we
+                    // were awaiting the validation query, discard instead
+                    // of re-inserting into the idle queue.
+                    if self.draining.load(Ordering::SeqCst) {
+                        self.cleaner.discard(&conn);
+                        self.release_known_slot(&conn);
+                        discarded += 1;
+                    } else {
+                        // Connection is alive — put it back at the end
+                        conn.idle_since = Some(Instant::now());
+                        self.idle.lock().push_back(conn);
+                        // Wake one waiter that may have missed this connection
+                        // while it was temporarily removed for validation.
+                        self.release_notify.notify_one();
+                    }
                 }
                 Err(_) => {
                     // Connection is dead — discard it
@@ -464,7 +473,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         let removed = self
             .known_connections
             .lock()
-            .remove(&conn.backend_pid);
+            .remove(&(conn.backend_pid, conn.secret_key));
         if removed {
             self.release_slot();
         }
@@ -633,14 +642,14 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     fn record_checkout(&self, conn: &BackendConnection) {
         metrics::counter!("trident_pool_checkouts_total", "node_id" => self.node_id.clone()).increment(1);
         if !self.settings.leak_detection_threshold.is_zero() {
-            self.checkout_times.lock().insert(conn.backend_pid, Instant::now());
+            self.checkout_times.lock().insert((conn.backend_pid, conn.secret_key), Instant::now());
         }
     }
 
     /// Clears checkout tracking and warns if the connection was held too long.
     fn clear_checkout(&self, conn: &BackendConnection) {
         if !self.settings.leak_detection_threshold.is_zero() {
-            if let Some(checkout_time) = self.checkout_times.lock().remove(&conn.backend_pid) {
+            if let Some(checkout_time) = self.checkout_times.lock().remove(&(conn.backend_pid, conn.secret_key)) {
                 let held_duration = Instant::now().duration_since(checkout_time);
                 if held_duration >= self.settings.leak_detection_threshold {
                     tracing::warn!(
@@ -715,6 +724,14 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             match self.cleaner.clean(&mut conn).await {
                 Ok(()) => {
                     conn.dirty = false;
+                    // Re-check draining after async clean: drain() may have
+                    // been called while we were awaiting the DISCARD ALL.
+                    if self.draining.load(Ordering::SeqCst) {
+                        self.cleaner.discard(&conn);
+                        self.release_known_slot(&conn);
+                        self.release_notify.notify_waiters();
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     // Cleanup failed: for safety, discard this connection
@@ -821,7 +838,7 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
     }
 
     fn known_pids(&self) -> Vec<i32> {
-        self.known_connections.lock().iter().copied().collect()
+        self.known_connections.lock().iter().map(|(pid, _)| *pid).collect()
     }
 
     async fn validate_idle(&self) -> usize {

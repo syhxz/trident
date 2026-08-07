@@ -302,7 +302,19 @@ async fn auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let expected = state.auth_token.as_deref().unwrap_or("");
+    // Reject if no non-empty token is configured (should not reach here,
+    // but defense-in-depth against empty-token bypass).
+    let expected = match state.auth_token.as_deref() {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                r#"{"status":"error","message":"admin auth_token is empty or unconfigured; refusing to authenticate"}"#,
+            )
+                .into_response();
+        }
+    };
     let provided = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -391,7 +403,7 @@ fn build_router(
         .route("/api/config", get(config_get_handler).put(config_put_handler))
         .route("/ws/logs", get(ws_logs_handler));
 
-    if state.auth_token.is_some() {
+    if state.auth_token.as_deref().is_some_and(|t| !t.is_empty()) {
         let auth_state = state.clone();
         let protected_routes = protected_routes.layer(
             axum::middleware::from_fn(move |req, next| {
@@ -1079,9 +1091,22 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 ///
 /// `client_stats` backs `GET /client-stats`; always required (see
 /// `AdminState.client_stats` docs).
+///
+/// Binds the admin TCP listener at startup so that binding failures are
+/// detected before the proxy reports "started". Call this during init,
+/// then pass the listener to `run`.
+pub async fn bind_admin_listener(listen_addr: SocketAddr) -> Result<tokio::net::TcpListener, AdminError> {
+    tokio::net::TcpListener::bind(listen_addr)
+        .await
+        .map_err(|source| AdminError::Bind {
+            addr: listen_addr.to_string(),
+            source,
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    listen_addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     prometheus_handle: PrometheusHandle,
     snapshot_fn: impl Fn() -> Vec<BackendNodeSnapshot> + Send + Sync + 'static,
     reload: Option<(String, Arc<dyn RoutingReloadTarget>)>,
@@ -1120,14 +1145,11 @@ pub async fn run(
         auth_token,
     );
 
-    let listener = tokio::net::TcpListener::bind(listen_addr)
-        .await
-        .map_err(|source| AdminError::Bind {
-            addr: listen_addr.to_string(),
-            source,
-        })?;
-
-    tracing::info!(addr = %listen_addr, "admin console listening");
+    let local_addr = listener.local_addr().map_err(|source| AdminError::Bind {
+        addr: "unknown".to_string(),
+        source,
+    })?;
+    tracing::info!(addr = %local_addr, "admin console listening");
     axum::serve(listener, app).await.map_err(AdminError::Serve)
 }
 

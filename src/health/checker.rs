@@ -499,6 +499,10 @@ struct TrackedNode {
     /// Writer: last known `pg_current_wal_lsn()` value.
     last_current_wal_lsn: u64,
     last_replication_lag_ms: Option<u64>,
+    /// Monotonically increasing incarnation counter; incremented each time
+    /// a node with this ID is added. Allows rejecting stale probe results
+    /// from a previous incarnation after remove/re-add.
+    generation: u64,
 }
 
 /// Health checker: manages the health state and LSN/lag snapshots of a
@@ -549,6 +553,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                     last_replay_lsn: 0,
                     last_current_wal_lsn: 0,
                     last_replication_lag_ms: None,
+                    generation: 1,
                 },
             );
         }
@@ -599,7 +604,7 @@ impl<P: HealthProbe> HealthChecker<P> {
         Some(result)
     }
 
-    fn apply_result(&self, node_id: &str, result: HealthCheckResult) {
+    fn apply_result(&self, node_id: &str, probe_generation: u64, result: HealthCheckResult) {
         let node_type = {
             let nodes = self.nodes.lock();
             nodes.get(node_id).map(|n| n.node_type)
@@ -620,6 +625,19 @@ impl<P: HealthProbe> HealthChecker<P> {
 
         let mut nodes = self.nodes.lock();
         if let Some(node) = nodes.get_mut(node_id) {
+            // Reject stale probe results from a previous incarnation.
+            // After remove/re-add the node's generation advances; an
+            // in-flight probe from the old address must not update the
+            // new node's health state.
+            if node.generation != probe_generation {
+                tracing::debug!(
+                    node_id,
+                    probe_generation,
+                    current_generation = node.generation,
+                    "discarding stale health probe result (generation mismatch)"
+                );
+                return;
+            }
             let was_healthy = node.state.healthy();
             node.state.observe(success);
             let is_healthy_now = node.state.healthy();
@@ -645,10 +663,17 @@ impl<P: HealthProbe> HealthChecker<P> {
     /// Runs a single check and feeds the result into this node's health
     /// state machine, updating its snapshot.
     pub async fn check_and_update(&self, node_id: &str) {
+        let generation = {
+            let nodes = self.nodes.lock();
+            match nodes.get(node_id) {
+                Some(n) => n.generation,
+                None => return,
+            }
+        };
         let Some(result) = self.check_once(node_id).await else {
             return;
         };
-        self.apply_result(node_id, result);
+        self.apply_result(node_id, generation, result);
         self.refresh_cached_snapshot();
     }
 
@@ -667,13 +692,13 @@ impl<P: HealthProbe> HealthChecker<P> {
                 .filter_map(|(node_id, probe)| {
                     nodes
                         .get(node_id)
-                        .map(|node| (node_id.clone(), node.node_type, Arc::clone(probe)))
+                        .map(|node| (node_id.clone(), node.node_type, node.generation, Arc::clone(probe)))
                 })
                 .collect()
         };
 
         let mut tasks = tokio::task::JoinSet::new();
-        for (node_id, node_type, probe) in checks {
+        for (node_id, node_type, generation, probe) in checks {
             let check_timeout = self.check_timeout;
             tasks.spawn(async move {
                 let result = match timeout(check_timeout, probe.probe(node_type)).await {
@@ -683,13 +708,13 @@ impl<P: HealthProbe> HealthChecker<P> {
                         ..Default::default()
                     },
                 };
-                (node_id, result)
+                (node_id, generation, result)
             });
         }
 
         while let Some(completed) = tasks.join_next().await {
             match completed {
-                Ok((node_id, result)) => self.apply_result(&node_id, result),
+                Ok((node_id, generation, result)) => self.apply_result(&node_id, generation, result),
                 Err(error) => {
                     tracing::error!(%error, "backend health-check task failed");
                 }
@@ -815,6 +840,15 @@ impl<P: HealthProbe> HealthChecker<P> {
         // This prevents an intermediate state where a node exists without
         // its probe (or vice versa) visible to the health-check loop.
         let mut probes = self.probes.write();
+        // Determine generation: if a previous incarnation existed, we would
+        // have already removed it, but compute a safe generation in case of
+        // rapid add/remove/add cycles where snapshot data persists.
+        let gen = nodes
+            .values()
+            .map(|n| n.generation)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         nodes.insert(
             node_id.clone(),
             TrackedNode {
@@ -824,6 +858,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                 last_replay_lsn: 0,
                 last_current_wal_lsn: 0,
                 last_replication_lag_ms: None,
+                generation: gen,
             },
         );
         probes.insert(node_id.clone(), Arc::new(probe));
@@ -831,7 +866,7 @@ impl<P: HealthProbe> HealthChecker<P> {
         drop(nodes);
 
         self.refresh_cached_snapshot();
-        tracing::info!(node_id = %node_id, "dynamically added node to health checker");
+        tracing::info!(node_id = %node_id, generation = gen, "dynamically added node to health checker");
         true
     }
 

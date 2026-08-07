@@ -34,13 +34,57 @@ fn consistency_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?is)^CONSISTENCY\s*\(\s*(EVENTUAL|SESSION|GLOBAL)\s*\)$").unwrap())
 }
 
+/// Extracts the leading comment/whitespace prefix of a SQL statement,
+/// stopping before the first non-comment, non-whitespace character.
+/// This prevents hint injection via string literals or identifiers.
+fn leading_comment_prefix(sql: &str) -> &str {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Skip whitespace
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        // Block comment: /* ... */
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment: -- ...
+        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Non-comment, non-whitespace character reached — this is where
+        // the real SQL statement starts.
+        break;
+    }
+    &sql[..i]
+}
+
 /// Default hint parser implementation based on regex matching
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RegexHintParser;
 
 impl HintParser for RegexHintParser {
     fn parse_hint(&self, sql: &str) -> RouteHint {
-        let Some(caps) = hint_comment_regex().captures(sql) else {
+        // Only search for hints in the leading comments/whitespace prefix,
+        // not in SQL string literals or other body content. This prevents
+        // a string like '/*+ ROUTE_TO_READER */' inside an UPDATE from
+        // being misinterpreted as a routing hint.
+        let prefix = leading_comment_prefix(sql);
+        let Some(caps) = hint_comment_regex().captures(prefix) else {
             return RouteHint::None;
         };
         let inner = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
@@ -87,9 +131,12 @@ mod tests {
             hint_kw in prop_oneof![
                 Just("ROUTE_TO_WRITER"), Just("ROUTE_TO_READER"), Just("ROUTE_TO_ANALYTICS"),
             ],
-            prefix in "[a-zA-Z ]{0,10}",
+            prefix in "[ \t\n]{0,10}",
             suffix in "[a-zA-Z0-9 =*]{0,20}",
         ) {
+            // Hints must only be recognized in leading whitespace/comments,
+            // not after SQL body content has begun. Use whitespace-only
+            // prefix to test valid leading hint placement.
             let sql = format!("{prefix}/*+ {hint_kw} */ {suffix}");
             let p = parser();
             let hint = p.parse_hint(&sql);
@@ -177,6 +224,34 @@ mod tests {
     fn case_insensitive_hint_keyword() {
         assert_eq!(
             parser().parse_hint("/*+ route_to_writer */ SELECT 1"),
+            RouteHint::ForceWriter
+        );
+    }
+
+    #[test]
+    fn hint_inside_sql_body_is_ignored() {
+        // A hint appearing after a non-comment keyword (inside the SQL body)
+        // must NOT be treated as a routing hint — this prevents injection
+        // via string literals like UPDATE t SET x = '/*+ ROUTE_TO_READER */'.
+        assert_eq!(
+            parser().parse_hint("UPDATE t SET x = '/*+ ROUTE_TO_READER */'"),
+            RouteHint::None
+        );
+        assert_eq!(
+            parser().parse_hint("SELECT /*+ ROUTE_TO_WRITER */ 1"),
+            RouteHint::None
+        );
+    }
+
+    #[test]
+    fn hint_after_leading_comment_is_recognized() {
+        // A hint that follows other leading comments/whitespace is valid.
+        assert_eq!(
+            parser().parse_hint("-- setup\n/*+ ROUTE_TO_READER */ SELECT 1"),
+            RouteHint::ForceReader
+        );
+        assert_eq!(
+            parser().parse_hint("/* pre */ /*+ ROUTE_TO_WRITER */ SELECT 1"),
             RouteHint::ForceWriter
         );
     }
