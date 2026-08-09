@@ -124,6 +124,12 @@ lsn_tracking:
   # has been enabled in the AWS control plane. That mode also requires
   # pool.mode=session and at least one Reader node, and uses
   # routing.default_consistency as its consistency level.
+  #
+  # For Aurora PostgreSQL clusters (without Write Forwarding), use
+  # `aurora_native` — it queries `aurora_replica_status()` for accurate
+  # LSN values instead of community WAL functions that may not work
+  # correctly on Aurora's shared-storage architecture. Requires at least
+  # one Writer and one Reader node.
   mode: auto
   pipeline:
     internal_query_timeout_ms: 100

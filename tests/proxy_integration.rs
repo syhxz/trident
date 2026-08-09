@@ -110,7 +110,7 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         password: Some(TEST_DB_PASSWORD.to_string()),
         ssl_mode: trident::config::SslMode::Disable,
     };
-    let probe = WireProtocolHealthProbe { target: target.clone() };
+    let probe = WireProtocolHealthProbe { target: target.clone(), aurora_native: false };
     let health_checker = Arc::new(HealthChecker::new(
         vec![("primary".to_string(), NodeType::Writer, 1, probe)],
         1000,
@@ -479,7 +479,7 @@ async fn failed_node_is_excluded_and_recovers() {
         password: Some(TEST_DB_PASSWORD.to_string()),
         ssl_mode: trident::config::SslMode::Disable,
     };
-    let probe = WireProtocolHealthProbe { target };
+    let probe = WireProtocolHealthProbe { target, aurora_native: false };
     let checker = HealthChecker::new(
         vec![("writer".to_string(), NodeType::Writer, 1, probe)],
         1000,

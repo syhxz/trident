@@ -3,23 +3,23 @@
 //! Maintains each session's write LSN (Session_Write_LSN) and the global
 //! write LSN (Global_Write_LSN).
 //!
-//! ## Global LSN staleness (by design)
+//! ## Global LSN staleness mitigation
 //!
-//! The `global_write_lsn` is only advanced when a session's write LSN is
-//! actually resolved (either via pipeline, extension GUC, or lazy
-//! resolution). Under `lazy_fallback: true`, a session that writes and
-//! never subsequently reads from a reader will never resolve its pending
-//! LSN, meaning `global_write_lsn` can lag behind the true WAL position.
+//! The `global_write_lsn` is advanced from two sources:
+//! 1. Session LSN resolution (pipeline, extension GUC, or lazy resolution)
+//! 2. Health checker Writer probes (`advance_global_lsn`)
 //!
-//! This is acceptable because:
-//! - **Session consistency** uses only `session_write_lsn`, unaffected.
-//! - **Global consistency** is conservative: a stale (lower) global LSN
-//!   means readers need to have replayed *less*, not more — it may allow
-//!   a slightly stale read but never violates monotonic-read guarantees
-//!   for the writer session itself.
-//! - The alternative (eagerly resolving every write's LSN) would defeat
-//!   the purpose of `lazy_fallback` and re-introduce the overhead that
-//!   the optimization was designed to eliminate.
+//! The health checker periodically queries the Writer's actual WAL position
+//! and advances the global floor. This ensures that even under
+//! `lazy_fallback: true`, where a write-only session may never resolve its
+//! pending LSN, the global watermark stays within one health-check interval
+//! of the Writer's true position.
+//!
+//! **Bounded staleness**: Global consistency reads may see data up to
+//! `health.check_interval` old (typically 3s) rather than unbounded
+//! staleness. This is a practical trade-off: strict linearizability would
+//! require eagerly resolving every write's LSN, defeating the purpose of
+//! `lazy_fallback`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +35,13 @@ pub trait LsnTracker: Send + Sync {
     fn session_write_lsn(&self, session_id: &str) -> u64;
 
     fn global_write_lsn(&self) -> u64;
+
+    /// Advances the global write LSN to at least `lsn` without associating
+    /// it with any session. Used by the health checker to keep the global
+    /// watermark current based on the Writer's actual WAL position,
+    /// preventing staleness when sessions with `pending_write` never
+    /// resolve their LSN (the "lazy_fallback Global consistency gap").
+    fn advance_global_lsn(&self, lsn: u64);
 }
 
 /// Default `LsnTracker` implementation based on an in-memory `HashMap` plus
@@ -96,6 +103,21 @@ impl LsnTracker for InMemoryLsnTracker {
 
     fn global_write_lsn(&self) -> u64 {
         self.global_lsn.load(Ordering::SeqCst)
+    }
+
+    fn advance_global_lsn(&self, lsn: u64) {
+        let mut current = self.global_lsn.load(Ordering::SeqCst);
+        while lsn > current {
+            match self.global_lsn.compare_exchange(
+                current,
+                lsn,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -174,5 +196,28 @@ mod tests {
         tracker.record_write("a", 50); // an older LSN arrives
         assert_eq!(tracker.session_write_lsn("a"), 100);
         assert_eq!(tracker.global_write_lsn(), 100);
+    }
+
+    #[test]
+    fn advance_global_lsn_raises_floor_without_session() {
+        let tracker = InMemoryLsnTracker::new();
+        assert_eq!(tracker.global_write_lsn(), 0);
+
+        // Advance global to 500 (simulates health checker observing Writer WAL)
+        tracker.advance_global_lsn(500);
+        assert_eq!(tracker.global_write_lsn(), 500);
+
+        // A session write at a lower LSN does not decrease global
+        tracker.record_write("a", 200);
+        assert_eq!(tracker.global_write_lsn(), 500);
+        assert_eq!(tracker.session_write_lsn("a"), 200);
+
+        // A session write above the floor advances global further
+        tracker.record_write("b", 700);
+        assert_eq!(tracker.global_write_lsn(), 700);
+
+        // advance_global_lsn below current is a no-op
+        tracker.advance_global_lsn(300);
+        assert_eq!(tracker.global_write_lsn(), 700);
     }
 }

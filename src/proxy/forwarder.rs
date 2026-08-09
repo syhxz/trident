@@ -28,6 +28,8 @@ use crate::protocol::writer::encode_query;
 #[cfg(test)]
 use crate::protocol::writer::encode_backend_message;
 use crate::protocol::ProtocolError;
+
+use crate::config::LsnTrackingMode;
 use crate::session::lsn::LsnTracker;
 use crate::session::session::TxState;
 
@@ -180,6 +182,10 @@ pub struct QueryForwardOptions<'a> {
     /// the extra backend round trip that a standalone `execute_internal_query`
     /// would require. Expects the backend to remain in Idle state after SET.
     pub appname_prefix: Option<&'a str>,
+    /// The LSN tracking mode, used to select the correct SQL for the
+    /// pipelined WAL position query. In `AuroraNative` mode the proxy
+    /// queries `aurora_replica_status()` instead of `pg_current_wal_lsn()`.
+    pub lsn_mode: LsnTrackingMode,
 }
 
 impl Default for QueryForwardOptions<'_> {
@@ -191,6 +197,7 @@ impl Default for QueryForwardOptions<'_> {
             copy_idle_timeout: Duration::ZERO,
             begin_prefix: None,
             appname_prefix: None,
+            lsn_mode: LsnTrackingMode::Auto,
         }
     }
 }
@@ -265,7 +272,7 @@ where
         }
     };
     if options.pipeline_lsn {
-        query_bytes.extend_from_slice(&encode_query("SELECT pg_current_wal_lsn()"));
+        query_bytes.extend_from_slice(&encode_query(lsn_pipeline_sql(options.lsn_mode)));
     }
     backend
         .write_all(&query_bytes)
@@ -642,6 +649,18 @@ where
     }
 }
 
+/// Returns the SQL statement used to obtain the Writer's current WAL
+/// position, depending on the configured `LsnTrackingMode`. Community
+/// PostgreSQL modes use `pg_current_wal_lsn()`; Aurora native mode uses
+/// `aurora_replica_status()` to read `durable_lsn` from the Writer row.
+pub fn lsn_pipeline_sql(mode: LsnTrackingMode) -> &'static str {
+    match mode {
+        LsnTrackingMode::AuroraNative => {
+            "SELECT durable_lsn FROM aurora_replica_status() WHERE session_id = 'MASTER_SESSION_ID'"
+        }
+        _ => "SELECT pg_current_wal_lsn()",
+    }
+}
 
 /// Issues `SELECT pg_current_wal_lsn()` against the backend (a Writer node)
 /// as a follow-up round trip after a write statement completes, and parses
@@ -653,7 +672,21 @@ pub async fn fetch_current_wal_lsn<B>(backend: &mut B) -> Result<Option<u64>, Pr
 where
     B: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let query_bytes = encode_query("SELECT pg_current_wal_lsn()");
+    fetch_wal_lsn_with_mode(backend, LsnTrackingMode::Pipeline).await
+}
+
+/// Mode-aware LSN fetch. Sends the appropriate query for the configured
+/// tracking mode and parses the response. In `AuroraNative` mode, queries
+/// `aurora_replica_status()` for `durable_lsn`; in all other modes, uses
+/// the standard `pg_current_wal_lsn()`.
+pub async fn fetch_wal_lsn_with_mode<B>(
+    backend: &mut B,
+    mode: LsnTrackingMode,
+) -> Result<Option<u64>, ProtocolError>
+where
+    B: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let query_bytes = encode_query(lsn_pipeline_sql(mode));
     backend.write_all(&query_bytes).await?;
     backend.flush().await?;
 

@@ -115,6 +115,7 @@ struct LiveNodeManager {
     max_pool_size: u32,
     pool_settings: NodePoolSettings,
     check_query: String,
+    aurora_native: bool,
     /// Serializes dynamic node add/remove operations to prevent
     /// interleaving that could corrupt state (e.g. a concurrent remove
     /// during warm_up() of an add, or two adds of the same node racing).
@@ -137,6 +138,7 @@ impl admin::NodeManager for LiveNodeManager {
                 password: config.password.clone(),
                 ssl_mode: config.ssl_mode,
             },
+            aurora_native: self.aurora_native,
         };
 
         // Add to health checker (starts as unhealthy)
@@ -353,6 +355,8 @@ async fn run(
         .map_err(|e| StartupError::InvalidListenAddr(config.proxy.listen_addr.clone(), e))?;
 
     // --- Health checker: one WireProtocolHealthProbe per configured node ---
+    let aurora_native_mode =
+        config.lsn_tracking.mode == trident::config::LsnTrackingMode::AuroraNative;
     let node_probes = config
         .nodes
         .iter()
@@ -366,6 +370,7 @@ async fn run(
                     password: node.password.clone(),
                     ssl_mode: node.ssl_mode,
                 },
+                aurora_native: aurora_native_mode,
             };
             (node.name.clone(), node.node_type, node.weight, probe)
         })
@@ -374,12 +379,18 @@ async fn run(
     let check_timeout = parse_duration_or(&config.health.check_timeout, Duration::from_secs(2));
     let check_interval = parse_duration_or(&config.health.check_interval, Duration::from_secs(3));
 
-    let health_checker = Arc::new(HealthChecker::with_max_retries(
-        node_probes,
-        config.routing.max_replication_lag_ms,
-        check_timeout,
-        config.health.max_retries,
-    ));
+    let lsn_tracker = Arc::new(InMemoryLsnTracker::new());
+
+    let health_checker = Arc::new({
+        let mut checker = HealthChecker::with_max_retries(
+            node_probes,
+            config.routing.max_replication_lag_ms,
+            check_timeout,
+            config.health.max_retries,
+        );
+        checker.set_lsn_tracker(lsn_tracker.clone());
+        checker
+    });
 
     // Run health checks in the background for the lifetime of the process.
     let health_checker_bg = health_checker.clone();
@@ -682,7 +693,7 @@ async fn run(
         .with_custom_rules(custom_rules.clone()),
     );
 
-    let lsn_tracker = Arc::new(InMemoryLsnTracker::new());
+    let lsn_tracker_for_proxy = lsn_tracker.clone();
 
     // --- Proxy server ---
     let server = ProxyServer::new(listen_addr, config.proxy.max_clients);
@@ -730,7 +741,7 @@ async fn run(
     let deps = ProxyDeps {
         router: router.clone(),
         pool_manager: pool_manager.clone(),
-        lsn_tracker,
+        lsn_tracker: lsn_tracker_for_proxy,
         cancel_registry,
         node_addresses: node_addresses.clone(),
         default_consistency: default_consistency.clone(),
@@ -871,6 +882,7 @@ async fn run(
             max_pool_size: config.pool.max_pool_size,
             pool_settings,
             check_query: config.pool.check_query.clone(),
+            aurora_native: aurora_native_mode,
             mutation_lock: tokio::sync::Mutex::new(()),
         });
         let admin_snapshot_source = pool_manager.clone();

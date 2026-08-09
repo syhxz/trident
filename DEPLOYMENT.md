@@ -268,7 +268,7 @@ Controls how Trident obtains write LSN positions for consistency checks. **Resta
 
 ```yaml
 lsn_tracking:
-  mode: auto   # auto | pipeline | extension | aurora_write_forwarding
+  mode: auto   # auto | pipeline | extension | aurora_write_forwarding | aurora_native
 ```
 
 | Mode | Requirements | Overhead | Description |
@@ -277,6 +277,7 @@ lsn_tracking:
 | `extension` | `pg_lsn_track` extension on backend | Zero | Reads LSN from `ParameterStatus` GUC report |
 | `auto` | None | Same as pipeline until extension detected | Starts as pipeline; switches to extension if GUC report observed |
 | `aurora_write_forwarding` | Aurora with Write Forwarding enabled; `pool.mode: session`; ≥1 reader node | N/A | No LSN tracking; all SQL goes to one pinned Reader; writes forwarded by Aurora |
+| `aurora_native` | Aurora PostgreSQL; ≥1 writer + ≥1 reader node | ~tens of μs per write | Uses `aurora_replica_status()` for LSN tracking instead of community WAL functions |
 
 ### Extension Mode Setup (`pg_lsn_track`)
 
@@ -293,11 +294,46 @@ lsn_tracking:
    ```
 3. The extension reports the commit LSN via a GUC (`pg_lsn_track.last_commit_lsn`) that emits a `ParameterStatus` message after each committed write transaction. Trident captures this value, suppresses it from the client, and uses it for session/global consistency checks — zero overhead compared to the pipeline approach.
 
+### Aurora Native Mode Setup (`aurora_native`)
+
+For Aurora PostgreSQL clusters that do **not** use Write Forwarding but still need accurate LSN-based consistency routing. The standard `pg_current_wal_lsn()` / `pg_last_wal_replay_lsn()` functions may return inaccurate or unavailable values on Aurora's shared-storage architecture; `aurora_native` mode uses Aurora's built-in `aurora_replica_status()` system function instead.
+
+**How it works:**
+- **Writer**: Trident queries `durable_lsn` from `aurora_replica_status() WHERE session_id = 'MASTER_SESSION_ID'` — this is the highest LSN durably committed to Aurora's shared storage layer.
+- **Reader (health check)**: Trident queries `current_read_lsn` from `aurora_replica_status() WHERE server_id = aurora_db_instance_identifier()` — this is the Reader's current read position in the shared volume.
+- **Routing decision**: The existing consistency checker compares `reader.replay_lsn >= session_write_lsn` (or `global_write_lsn` for Global consistency), routing reads only to Readers that have caught up.
+
+**Configuration:**
+```yaml
+lsn_tracking:
+  mode: aurora_native
+  pipeline:
+    internal_query_timeout_ms: 100
+    lazy_fallback: true
+```
+
+**Requirements:**
+- Aurora PostgreSQL (any supported version with `aurora_replica_status()` available)
+- At least one node with `type: writer` and one with `type: reader`
+- No special extensions or Aurora-specific features need to be enabled
+- Works with both `pool.mode: transaction` and `pool.mode: session`
+
+**When to use `aurora_native` vs `aurora_write_forwarding`:**
+
+| Criteria | `aurora_native` | `aurora_write_forwarding` |
+|----------|----------------|--------------------------|
+| Architecture | Standard Writer + Reader topology | All traffic through one Reader |
+| Write path | Direct to Writer | Reader forwards to Writer (higher latency) |
+| Pool mode | Any | Must be `session` |
+| Consistency | Session/Global via LSN comparison | Delegated to Aurora's `apg_write_forward.consistency_mode` GUC |
+| Use case | General purpose Aurora deployment | Latency-insensitive writes where single-endpoint simplicity is preferred |
+
 ### Choosing a Mode
 
 | Scenario | Recommended |
 |----------|-------------|
-| Standard PostgreSQL / Aurora without Write Forwarding | `auto` or `pipeline` |
+| Standard PostgreSQL (non-Aurora) | `auto` or `pipeline` |
 | Backend has LSN-reporting extension installed | `extension` or `auto` |
+| Aurora PostgreSQL (standard Writer + Reader topology) | `aurora_native` |
 | Aurora with Write Forwarding enabled + acceptable write latency + session pool mode | `aurora_write_forwarding` |
 | Write-latency-sensitive or needs SERIALIZABLE | `pipeline` or `extension` (direct Writer path) |

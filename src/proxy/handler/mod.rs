@@ -25,7 +25,7 @@ use helpers::{
 #[cfg(test)]
 use helpers::{
     aurora_consistency_sql, ensure_application_name, execute_internal_query,
-    pipeline_safe_sql, query_has_write_intent, transaction_status_for_state,
+    pipeline_safe_sql, query_has_write_intent,
 };
 
 use std::collections::HashMap;

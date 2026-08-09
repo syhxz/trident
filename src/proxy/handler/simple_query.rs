@@ -15,7 +15,7 @@ use crate::protocol::writer::encode_backend_message;
 use crate::protocol::ProtocolError;
 use crate::proxy::error::ProxyError;
 use crate::proxy::forwarder::{
-    apply_ready_for_query, fetch_current_wal_lsn, forward_simple_query,
+    apply_ready_for_query, fetch_wal_lsn_with_mode, forward_simple_query,
     forward_simple_query_with_options, QueryForwardOptions,
 };
 use crate::router::router::{RouteDecision, RoutingContext};
@@ -145,10 +145,12 @@ where
             LsnTrackingMode::Extension | LsnTrackingMode::Auto => {
                 Some(self.lsn_tracking.extension.guc_name.as_str())
             }
-            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraWriteForwarding => None,
+            LsnTrackingMode::Pipeline
+            | LsnTrackingMode::AuroraWriteForwarding
+            | LsnTrackingMode::AuroraNative => None,
         };
         let pipeline_mode = match self.lsn_tracking.mode {
-            LsnTrackingMode::Pipeline => true,
+            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraNative => true,
             LsnTrackingMode::Auto => !session.extension_detected,
             LsnTrackingMode::Extension | LsnTrackingMode::AuroraWriteForwarding => false,
         };
@@ -177,6 +179,7 @@ where
                 copy_idle_timeout: self.client_idle_timeout,
                 begin_prefix: None,
                 appname_prefix: None,
+                lsn_mode: self.lsn_tracking.mode,
             },
         )
         .await;
@@ -500,7 +503,7 @@ where
                 let held = session.held_backend.as_mut().expect("checked above");
                 tokio::time::timeout(
                     timeout_duration,
-                    fetch_current_wal_lsn(&mut held.conn.stream),
+                    fetch_wal_lsn_with_mode(&mut held.conn.stream, self.lsn_tracking.mode),
                 )
                 .await
             };
@@ -550,7 +553,7 @@ where
         }
 
         let result =
-            tokio::time::timeout(timeout_duration, fetch_current_wal_lsn(&mut conn.stream)).await;
+            tokio::time::timeout(timeout_duration, fetch_wal_lsn_with_mode(&mut conn.stream, self.lsn_tracking.mode)).await;
         match result {
             Ok(Ok(lsn)) => {
                 if let Err(error) = pool.release(&session.state.id, conn).await {
@@ -604,7 +607,7 @@ where
 
         let commit_attempt = session.tx_has_writes && transaction_end_tag(sql) == Some("COMMIT");
         let pipeline_mode = match self.lsn_tracking.mode {
-            LsnTrackingMode::Pipeline => true,
+            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraNative => true,
             LsnTrackingMode::Auto => !session.extension_detected,
             LsnTrackingMode::Extension | LsnTrackingMode::AuroraWriteForwarding => false,
         };
@@ -612,7 +615,9 @@ where
             LsnTrackingMode::Extension | LsnTrackingMode::Auto => {
                 Some(self.lsn_tracking.extension.guc_name.as_str())
             }
-            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraWriteForwarding => None,
+            LsnTrackingMode::Pipeline
+            | LsnTrackingMode::AuroraWriteForwarding
+            | LsnTrackingMode::AuroraNative => None,
         };
 
         self.cancel_registry.mark_active(
@@ -634,6 +639,7 @@ where
                 copy_idle_timeout: self.client_idle_timeout,
                 begin_prefix: None,
                 appname_prefix: None,
+                lsn_mode: self.lsn_tracking.mode,
             },
         )
         .await;
@@ -1137,10 +1143,12 @@ where
             LsnTrackingMode::Extension | LsnTrackingMode::Auto => {
                 Some(self.lsn_tracking.extension.guc_name.as_str())
             }
-            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraWriteForwarding => None,
+            LsnTrackingMode::Pipeline
+            | LsnTrackingMode::AuroraWriteForwarding
+            | LsnTrackingMode::AuroraNative => None,
         };
         let pipeline_mode = match self.lsn_tracking.mode {
-            LsnTrackingMode::Pipeline => true,
+            LsnTrackingMode::Pipeline | LsnTrackingMode::AuroraNative => true,
             LsnTrackingMode::Auto => !session.extension_detected,
             LsnTrackingMode::Extension | LsnTrackingMode::AuroraWriteForwarding => false,
         };
@@ -1177,6 +1185,7 @@ where
                 copy_idle_timeout: self.client_idle_timeout,
                 begin_prefix: delayed_begin,
                 appname_prefix: None,
+                lsn_mode: self.lsn_tracking.mode,
             },
         )
         .await;

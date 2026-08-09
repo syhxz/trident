@@ -224,6 +224,10 @@ pub struct ProbeTarget {
 /// authentication are supported using the node's configured password.
 pub struct WireProtocolHealthProbe {
     pub target: ProbeTarget,
+    /// When true, the probe uses Aurora-native functions
+    /// (`aurora_replica_status()`) to obtain LSN values instead of
+    /// community PostgreSQL WAL functions.
+    pub aurora_native: bool,
 }
 
 impl HealthProbe for WireProtocolHealthProbe {
@@ -257,15 +261,25 @@ impl HealthProbe for WireProtocolHealthProbe {
         }
 
         if node_type == NodeType::Writer {
-            if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
+            if self.aurora_native {
+                if let Ok(Some(lsn)) = query_aurora_durable_lsn(&mut stream).await {
+                    result.current_wal_lsn = Some(lsn);
+                }
+            } else if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
                 result.current_wal_lsn = Some(lsn);
             }
         } else if node_type == NodeType::Reader {
-            if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
-                result.replay_lsn = Some(lsn);
-            }
-            if let Ok(Some(lag)) = query_replication_lag_ms(&mut stream).await {
-                result.replication_lag_ms = Some(lag);
+            if self.aurora_native {
+                if let Ok(Some(lsn)) = query_aurora_current_read_lsn(&mut stream).await {
+                    result.replay_lsn = Some(lsn);
+                }
+            } else {
+                if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
+                    result.replay_lsn = Some(lsn);
+                }
+                if let Ok(Some(lag)) = query_replication_lag_ms(&mut stream).await {
+                    result.replication_lag_ms = Some(lag);
+                }
             }
         }
 
@@ -474,6 +488,35 @@ async fn query_replication_lag_ms<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(value.and_then(|v| v.parse::<f64>().ok()).map(|ms| ms.max(0.0) as u64))
 }
 
+/// Queries the Writer's durable LSN from Aurora's `aurora_replica_status()`
+/// system function. The Writer row is identified by `session_id = 'MASTER_SESSION_ID'`.
+/// Returns the LSN in the same `u64` format used throughout the codebase
+/// (parsed from Aurora's hex `X/YYYYYYYY` representation).
+async fn query_aurora_durable_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+) -> Result<Option<u64>, ()> {
+    let value = run_simple_query_first_column(
+        stream,
+        "SELECT durable_lsn FROM aurora_replica_status() WHERE session_id = 'MASTER_SESSION_ID'",
+    )
+    .await?;
+    Ok(value.and_then(|v| parse_lsn(&v)))
+}
+
+/// Queries this Reader's current read LSN from Aurora's `aurora_replica_status()`.
+/// Executed on the Reader itself, so we use `aurora_db_instance_identifier()`
+/// to identify the local row.
+async fn query_aurora_current_read_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+) -> Result<Option<u64>, ()> {
+    let value = run_simple_query_first_column(
+        stream,
+        "SELECT current_read_lsn FROM aurora_replica_status() WHERE server_id = aurora_db_instance_identifier()",
+    )
+    .await?;
+    Ok(value.and_then(|v| parse_lsn(&v)))
+}
+
 /// Parses a PostgreSQL LSN text representation (e.g. `"16/B374D848"`) into
 /// a `u64`. Returns `None` for unparseable input or the zero LSN (`0/0`),
 /// which is the extension GUC's initial/unset value.
@@ -519,6 +562,11 @@ pub struct HealthChecker<P: HealthProbe> {
     /// lock-free (just an atomic pointer load), avoiding the per-query
     /// mutex contention that `nodes.lock()` would introduce on the hot path.
     cached_snapshot: ArcSwap<Vec<BackendNodeSnapshot>>,
+    /// Optional LSN tracker reference. When set, the health checker
+    /// advances `global_write_lsn` on every successful Writer probe,
+    /// ensuring the global watermark stays current even when individual
+    /// sessions never resolve their `pending_write` LSN.
+    lsn_tracker: Option<Arc<dyn crate::session::lsn::LsnTracker>>,
 }
 
 impl<P: HealthProbe> HealthChecker<P> {
@@ -576,7 +624,15 @@ impl<P: HealthProbe> HealthChecker<P> {
             nodes: Mutex::new(nodes),
             check_timeout,
             cached_snapshot: ArcSwap::new(Arc::new(initial_snapshot)),
+            lsn_tracker: None,
         }
+    }
+
+    /// Sets the LSN tracker reference. When configured, the health checker
+    /// will advance `global_write_lsn` on every successful Writer probe,
+    /// closing the Global consistency gap under `lazy_fallback: true`.
+    pub fn set_lsn_tracker(&mut self, tracker: Arc<dyn crate::session::lsn::LsnTracker>) {
+        self.lsn_tracker = Some(tracker);
     }
 
     /// Runs a single check against one node: probing plus applying the
@@ -655,6 +711,17 @@ impl<P: HealthProbe> HealthChecker<P> {
             }
             if let Some(lsn) = result.current_wal_lsn {
                 node.last_current_wal_lsn = lsn;
+                // Advance the global write LSN floor from the Writer's
+                // actual WAL position. This closes the Global consistency
+                // staleness gap: even if sessions with pending_write never
+                // resolve their LSN (lazy_fallback optimization), the
+                // health checker periodically brings the global watermark
+                // up to the Writer's true position.
+                if node.node_type == NodeType::Writer {
+                    if let Some(ref tracker) = self.lsn_tracker {
+                        tracker.advance_global_lsn(lsn);
+                    }
+                }
             }
             node.last_replication_lag_ms = result.replication_lag_ms;
         }
@@ -1207,5 +1274,62 @@ mod tests {
         let result = checker.check_once("slow").await.unwrap();
         assert!(result.timed_out);
         assert!(!result.is_success());
+    }
+
+    #[tokio::test]
+    async fn health_checker_advances_global_lsn_from_writer_probe() {
+        use crate::session::lsn::{InMemoryLsnTracker, LsnTracker};
+
+        let tracker = Arc::new(InMemoryLsnTracker::new());
+        assert_eq!(tracker.global_write_lsn(), 0);
+
+        // Simulate a Writer probe that returns a WAL LSN
+        let writer_lsn = (0x16u64 << 32) | 0xB374D848;
+        let probe_result = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(writer_lsn),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+        };
+
+        let mut checker = HealthChecker::new(
+            vec![(
+                "writer".to_string(),
+                NodeType::Writer,
+                1,
+                MockProbe { result: probe_result },
+            )],
+            1000,
+            Duration::from_secs(1),
+        );
+        checker.set_lsn_tracker(tracker.clone());
+
+        // Before any checks, global is 0
+        assert_eq!(tracker.global_write_lsn(), 0);
+
+        // After a health check, global should advance to the Writer's WAL LSN
+        checker.check_and_update("writer").await;
+        assert_eq!(tracker.global_write_lsn(), writer_lsn);
+
+        // A session that writes at a lower LSN does not decrease global
+        tracker.record_write("session-a", 100);
+        assert_eq!(tracker.global_write_lsn(), writer_lsn);
+
+        // A higher Writer LSN in a subsequent check advances global further
+        let higher_lsn = writer_lsn + 1000;
+        // Directly call apply_result to simulate a new probe
+        checker.apply_result("writer", 1, HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(higher_lsn),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+        });
+        assert_eq!(tracker.global_write_lsn(), higher_lsn);
     }
 }

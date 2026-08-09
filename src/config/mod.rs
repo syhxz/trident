@@ -60,6 +60,12 @@ pub enum LsnTrackingMode {
     Pipeline,
     Extension,
     AuroraWriteForwarding,
+    /// Aurora-native LSN tracking using `aurora_replica_status()`.
+    /// Uses `durable_lsn` from the Writer and `current_read_lsn` from
+    /// Readers instead of community PostgreSQL WAL functions. This mode
+    /// does NOT depend on Aurora Write Forwarding and works with standard
+    /// Writer/Reader topologies on Aurora.
+    AuroraNative,
 }
 
 /// LSN tracking settings for Trident's internal query pipeline.
@@ -507,6 +513,12 @@ pub enum ConfigError {
     #[error("Aurora write forwarding LSN tracking requires at least one node with type 'reader'")]
     AuroraWriteForwardingRequiresReader,
 
+    #[error("Aurora native LSN tracking requires at least one node with type 'reader'")]
+    AuroraNativeRequiresReader,
+
+    #[error("Aurora native LSN tracking requires at least one node with type 'writer'")]
+    AuroraNativeRequiresWriter,
+
     #[error("configuration validation error: {0}")]
     Validation(String),
 }
@@ -566,6 +578,18 @@ impl AppConfig {
             }
             if !self.nodes.iter().any(|n| n.node_type == NodeType::Reader) {
                 return Err(ConfigError::AuroraWriteForwardingRequiresReader);
+            }
+        }
+
+        // Aurora native mode uses aurora_replica_status() for LSN tracking
+        // and requires both a Writer (for durable_lsn) and at least one
+        // Reader (for current_read_lsn).
+        if self.lsn_tracking.mode == LsnTrackingMode::AuroraNative {
+            if !self.nodes.iter().any(|n| n.node_type == NodeType::Writer) {
+                return Err(ConfigError::AuroraNativeRequiresWriter);
+            }
+            if !self.nodes.iter().any(|n| n.node_type == NodeType::Reader) {
+                return Err(ConfigError::AuroraNativeRequiresReader);
             }
         }
 
@@ -1165,6 +1189,7 @@ pub(crate) mod tests {
                 "aurora_write_forwarding",
                 LsnTrackingMode::AuroraWriteForwarding,
             ),
+            ("aurora_native", LsnTrackingMode::AuroraNative),
         ] {
             let parsed: LsnTrackingMode = serde_yaml::from_str(yaml_name).unwrap();
             assert_eq!(parsed, expected);
@@ -1216,6 +1241,34 @@ pub(crate) mod tests {
         cfg.nodes.retain(|node| node.node_type == NodeType::Reader);
         assert!(matches!(
             cfg.validate(),
+            Err(ConfigError::MissingWriterNode)
+        ));
+    }
+
+    #[test]
+    fn aurora_native_mode_requires_writer_and_reader() {
+        let mut cfg = valid_config();
+        cfg.lsn_tracking.mode = LsnTrackingMode::AuroraNative;
+
+        // Should pass with both Writer and Reader present
+        if !cfg.nodes.iter().any(|n| n.node_type == NodeType::Reader) {
+            cfg.nodes.push(sample_node("reader-1", NodeType::Reader));
+        }
+        assert!(cfg.validate().is_ok());
+
+        // Remove all readers: should fail
+        let mut cfg2 = cfg.clone();
+        cfg2.nodes.retain(|n| n.node_type != NodeType::Reader);
+        assert!(matches!(
+            cfg2.validate(),
+            Err(ConfigError::AuroraNativeRequiresReader)
+        ));
+
+        // Remove all writers: MissingWriterNode fires first (it runs earlier)
+        let mut cfg3 = cfg.clone();
+        cfg3.nodes.retain(|n| n.node_type != NodeType::Writer);
+        assert!(matches!(
+            cfg3.validate(),
             Err(ConfigError::MissingWriterNode)
         ));
     }

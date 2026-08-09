@@ -117,7 +117,7 @@ psql -h 127.0.0.1 -p 6432 -U <username> -d <database>
 | `proxy` | Listen address, max clients |
 | `nodes` | Backend nodes (writer/reader/analytics) with weights, auth, SSL mode |
 | `routing` | Routing strategy, transaction split, hint/cost routing, analytics patterns, custom rules |
-| `lsn_tracking` | LSN consistency tracking mode (auto/pipeline/extension/aurora_write_forwarding) |
+| `lsn_tracking` | LSN consistency tracking mode (auto/pipeline/extension/aurora_write_forwarding/aurora_native) |
 | `pool` | Pool mode (transaction/session), sizes, timeouts, lifetime |
 | `health` | Check interval, timeout, retries |
 | `logging` | Log level, query trace, slow query threshold, file rotation |
