@@ -223,6 +223,25 @@ After upgrading the EC2 proxy instance from **c7g.large (2 vCPU / 4 GB)** to **c
    - Pool Stress (200-500 clients): **+50% ~ +74%**
 4. **TPC-B Mixed at 50 clients is tied** — True write-heavy improvement is +3% ~ +12%, lower than initial tests suggested (some earlier gains were warm-up artifacts)
 
+### Health Check Interval Tuning
+
+`health.check_interval` controls how frequently Trident refreshes each Reader's `replay_lsn` snapshot. This directly affects **Session consistency + transaction split** performance: after a write, the next transaction's read can only route to a Reader once the health check confirms the Reader has caught up.
+
+| Interval | Write-then-read Reader hit rate | Overhead per node |
+|----------|--------------------------------|-------------------|
+| 2s (default) | Low in tight loops | 0.5 queries/sec |
+| 500ms | Good for most workloads | 2 queries/sec |
+| 200ms | High (Aurora replication ~20ms) | 5 queries/sec |
+
+**Recommendation**: Set `health.check_interval: 500ms` for production workloads with Session consistency. For latency-sensitive applications where write-then-read patterns are common, use `200ms`. The overhead is negligible (a single `SELECT` per node per interval).
+
+This setting can be adjusted at runtime without restart via the admin API:
+```bash
+curl -X PUT http://localhost:9090/api/config \
+  -H "Authorization: Bearer <token>" \
+  -d '{"health_check_interval_ms": 500}'
+```
+
 ## Deployment
 
 Three deployment options are provided:
