@@ -517,15 +517,24 @@ async fn query_aurora_current_read_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>
     Ok(value.and_then(|v| parse_lsn(&v)))
 }
 
-/// Parses a PostgreSQL LSN text representation (e.g. `"16/B374D848"`) into
-/// a `u64`. Returns `None` for unparseable input or the zero LSN (`0/0`),
-/// which is the extension GUC's initial/unset value.
+/// Parses a PostgreSQL LSN text representation into a `u64`.
+/// Supports two formats:
+/// - Standard PostgreSQL: `"16/B374D848"` (hex/hex)
+/// - Aurora numeric: `"576765581"` (plain decimal integer)
+/// Returns `None` for unparseable input or the zero LSN.
 pub fn parse_lsn(text: &str) -> Option<u64> {
-    let (hi, lo) = text.split_once('/')?;
-    let hi = u64::from_str_radix(hi, 16).ok()?;
-    let lo = u64::from_str_radix(lo, 16).ok()?;
-    let lsn = (hi << 32) | lo;
-    if lsn == 0 { None } else { Some(lsn) }
+    let trimmed = text.trim();
+    if let Some((hi, lo)) = trimmed.split_once('/') {
+        // Standard PostgreSQL LSN format: hex/hex
+        let hi = u64::from_str_radix(hi, 16).ok()?;
+        let lo = u64::from_str_radix(lo, 16).ok()?;
+        let lsn = (hi << 32) | lo;
+        if lsn == 0 { None } else { Some(lsn) }
+    } else {
+        // Aurora numeric format: plain decimal integer
+        let lsn = trimmed.parse::<u64>().ok()?;
+        if lsn == 0 { None } else { Some(lsn) }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -567,6 +576,8 @@ pub struct HealthChecker<P: HealthProbe> {
     /// ensuring the global watermark stays current even when individual
     /// sessions never resolve their `pending_write` LSN.
     lsn_tracker: Option<Arc<dyn crate::session::lsn::LsnTracker>>,
+    /// Dynamically adjustable check interval in milliseconds.
+    check_interval_ms: std::sync::atomic::AtomicU64,
 }
 
 impl<P: HealthProbe> HealthChecker<P> {
@@ -625,6 +636,7 @@ impl<P: HealthProbe> HealthChecker<P> {
             check_timeout,
             cached_snapshot: ArcSwap::new(Arc::new(initial_snapshot)),
             lsn_tracker: None,
+            check_interval_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -830,8 +842,12 @@ impl<P: HealthProbe> HealthChecker<P> {
                                 Some(0)
                             } else {
                                 // Genuine lag — use the timestamp value if
-                                // available, otherwise estimate from bytes.
-                                node.last_replication_lag_ms
+                                // available, otherwise estimate from LSN gap.
+                                // Aurora replicates at ~100 MB/s; estimate:
+                                // 1 MB gap ≈ 10ms lag.
+                                node.last_replication_lag_ms.or_else(|| {
+                                    Some(lsn_diff / (1024 * 1024) * 10)
+                                })
                             }
                         }
                     } else {
@@ -880,11 +896,44 @@ impl<P: HealthProbe> HealthChecker<P> {
         } else {
             interval
         };
+        // Store the initial interval for dynamic adjustment.
+        self.check_interval_ms.store(
+            safe_interval.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut ticker = tokio::time::interval(safe_interval);
         loop {
             ticker.tick().await;
             self.check_all_and_update().await;
+            // Check if the interval was dynamically adjusted.
+            let current_ms = self.check_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let current_period = Duration::from_millis(current_ms);
+            if current_period != ticker.period() && !current_period.is_zero() {
+                ticker = tokio::time::interval(current_period);
+                // Consume the immediate first tick so we don't double-fire.
+                ticker.tick().await;
+                tracing::info!(
+                    new_interval_ms = current_ms,
+                    "health check interval dynamically adjusted"
+                );
+            }
         }
+    }
+
+    /// Dynamically adjusts the health check interval at runtime.
+    /// Takes effect after the current check cycle completes.
+    pub fn set_check_interval(&self, interval: Duration) {
+        let ms = interval.as_millis() as u64;
+        if ms > 0 {
+            self.check_interval_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the current health check interval.
+    pub fn check_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.check_interval_ms.load(std::sync::atomic::Ordering::Relaxed)
+        )
     }
 
     /// Aggregates the current snapshot of all nodes, for use by the

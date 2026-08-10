@@ -946,7 +946,7 @@ where
     /// node is logged but never surfaced to the (already-closing) client
     /// connection.
     async fn handle_cancel_request(&self, backend_pid: i32, secret_key: i32) {
-        let Some((node_id, real_backend_pid, real_secret_key)) = self
+        let Some((node_id, real_backend_pid, real_secret_key, session_id)) = self
             .cancel_registry
             .resolve_cancel_target(backend_pid, secret_key)
         else {
@@ -965,6 +965,19 @@ where
             tracing::warn!(node_id = %node_id, "cannot forward CancelRequest: no known address for node");
             return;
         };
+
+        // FIX (TOCTOU): After establishing the TCP connection for the
+        // cancel but before sending, re-verify that the original session
+        // still has an active query on this backend_pid. If the connection
+        // was returned to the pool and reused, skip the cancel.
+        if !self.cancel_registry.verify_cancel_target(&session_id, real_backend_pid) {
+            metrics::counter!("trident_cancel_requests_total", "outcome" => "stale").increment(1);
+            tracing::debug!(
+                session_id = %session_id,
+                "skipping CancelRequest: target session no longer active on this backend"
+            );
+            return;
+        }
 
         if let Err(e) = send_cancel_request_with_timeout(
             addr,

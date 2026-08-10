@@ -381,10 +381,12 @@ async fn upgrade_to_tls_verified(
             .with_root_certificates(root_store)
             .with_no_client_auth()
     } else {
-        // verify-ca: verify cert chain but skip hostname check
-        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| ConnError::AuthFailed(format!("failed to build cert verifier: {}", e)))?;
+        // verify-ca: verify cert chain but skip hostname check.
+        // We use a custom verifier that delegates chain validation to
+        // WebPkiServerVerifier but ignores the server name.
+        let verifier = Arc::new(CaOnlyVerifier {
+            roots: Arc::new(root_store),
+        });
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
@@ -456,6 +458,93 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
             rustls::SignatureScheme::ED25519,
             rustls::SignatureScheme::ED448,
         ]
+    }
+}
+
+/// Certificate verifier for `verify-ca` mode: validates the certificate chain
+/// against trusted roots but does NOT check the hostname/SAN. This matches
+/// PostgreSQL's `sslmode=verify-ca` semantics.
+#[derive(Debug)]
+struct CaOnlyVerifier {
+    roots: Arc<rustls::RootCertStore>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CaOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Build the chain verifier and verify just the chain (ignore server_name).
+        let verifier = rustls::client::WebPkiServerVerifier::builder(self.roots.clone())
+            .build()
+            .map_err(|e| rustls::Error::General(format!("verifier build error: {}", e)))?;
+        // We call verify_server_cert with a dummy name that we know won't
+        // match, but WebPkiServerVerifier checks the chain first, and we
+        // catch the specific hostname mismatch error to allow it through.
+        // Actually, WebPkiServerVerifier does chain + hostname together.
+        // So we use webpki directly for chain-only validation.
+        let mut chain = vec![end_entity.clone()];
+        chain.extend_from_slice(intermediates);
+        // Use the webpki anchors to verify the chain.
+        let _ = verifier; // just to suppress unused
+        // Simpler approach: use the same verifier but catch hostname errors.
+        // rustls doesn't separate chain from hostname easily.
+        // Best approach: just do chain validation via webpki directly.
+        // Use a placeholder name — if chain is invalid, it'll fail before
+        // hostname check. If chain is valid but hostname mismatches, the
+        // WebPkiServerVerifier returns InvalidCertificate(NotValidForName).
+        // We accept that specific error for verify-ca.
+        let dummy_name = rustls::pki_types::ServerName::try_from("verify-ca-placeholder.invalid")
+            .map_err(|_| rustls::Error::General("internal error".into()))?;
+        let inner_verifier = rustls::client::WebPkiServerVerifier::builder(self.roots.clone())
+            .build()
+            .map_err(|e| rustls::Error::General(format!("{}", e)))?;
+        match inner_verifier.verify_server_cert(end_entity, intermediates, &dummy_name, _ocsp_response, now) {
+            Ok(v) => Ok(v),
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
+                // Chain is valid, hostname just doesn't match — that's OK for verify-ca
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

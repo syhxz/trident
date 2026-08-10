@@ -295,7 +295,11 @@ impl CancelRegistry {
     /// be forwarded to: `(node_id, real_backend_pid, real_secret_key)`.
     /// Returns `None` if the cancel key is unknown, or if the session it
     /// maps to currently has no active query in flight.
-    pub fn resolve_cancel_target(&self, backend_pid: i32, secret_key: i32) -> Option<(String, i32, i32)> {
+    ///
+    /// FIX (TOCTOU): Also returns the session_id so the caller can
+    /// re-verify the target is still active after establishing the cancel
+    /// connection but before sending the cancel bytes.
+    pub fn resolve_cancel_target(&self, backend_pid: i32, secret_key: i32) -> Option<(String, i32, i32, String)> {
         let session_id = {
             let sessions = self.sessions_by_key.lock();
             sessions.get(&(backend_pid, secret_key)).cloned()
@@ -303,7 +307,18 @@ impl CancelRegistry {
         let active = self.active_backends.lock();
         active
             .get(&session_id)
-            .map(|a| (a.node_id.clone(), a.backend_pid, a.secret_key))
+            .map(|a| (a.node_id.clone(), a.backend_pid, a.secret_key, session_id.clone()))
+    }
+
+    /// Re-verifies that the given session still has an active query targeting
+    /// the specified backend_pid. Returns false if the target has changed
+    /// (connection was released/reassigned).
+    pub fn verify_cancel_target(&self, session_id: &str, expected_pid: i32) -> bool {
+        let active = self.active_backends.lock();
+        active
+            .get(session_id)
+            .map(|a| a.backend_pid == expected_pid)
+            .unwrap_or(false)
     }
 }
 
@@ -383,7 +398,7 @@ mod tests {
             let expected_forward = has_registration && has_active_query;
             prop_assert_eq!(resolved.is_some(), expected_forward);
             if expected_forward {
-                prop_assert_eq!(resolved, Some(("writer".to_string(), 1, 2)));
+                prop_assert_eq!(resolved, Some(("writer".to_string(), 1, 2, session_id.clone())));
             }
         }
     }
@@ -427,7 +442,7 @@ mod tests {
 
         assert_eq!(
             registry.resolve_cancel_target(1, 2),
-            Some(("writer".to_string(), 555, 666))
+            Some(("writer".to_string(), 555, 666, "session-a".to_string()))
         );
     }
 

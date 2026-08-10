@@ -436,6 +436,65 @@ async fn negotiate_client_tls(
     let code = i32::from_be_bytes([peek_buf[4], peek_buf[5], peek_buf[6], peek_buf[7]]);
 
     const SSL_REQUEST_CODE: i32 = 80877103;
+    const GSSENC_REQUEST_CODE: i32 = 80877104;
+
+    // FIX: Handle GSSENCRequest → SSLRequest fallback sequence.
+    // libpq 15+ sends GSSENCRequest first; on 'N' response, it retries
+    // with SSLRequest. We must handle both in a loop.
+    if length == 8 && code == GSSENC_REQUEST_CODE {
+        // Consume the GSSENCRequest
+        let mut discard = [0u8; 8];
+        stream.read_exact(&mut discard).await.map_err(|e| {
+            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+        })?;
+        // Respond 'N' (GSSENC not supported)
+        stream.write_all(b"N").await.map_err(|e| {
+            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+        })?;
+
+        // Now peek again for the next request (SSLRequest or StartupMessage)
+        loop {
+            let n = stream.peek(&mut peek_buf).await.map_err(|e| {
+                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+            })?;
+            if n == 0 {
+                return Ok(ClientStream::Plain(stream));
+            }
+            if n >= 8 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // Re-read the length and code for the next message
+        let length = i32::from_be_bytes([peek_buf[0], peek_buf[1], peek_buf[2], peek_buf[3]]);
+        let code = i32::from_be_bytes([peek_buf[4], peek_buf[5], peek_buf[6], peek_buf[7]]);
+
+        if length == 8 && code == SSL_REQUEST_CODE {
+            // Consume the SSLRequest
+            let mut discard = [0u8; 8];
+            stream.read_exact(&mut discard).await.map_err(|e| {
+                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+            })?;
+
+            if let Some(acceptor) = tls_acceptor {
+                stream.write_all(b"S").await.map_err(|e| {
+                    crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+                })?;
+                let tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                    crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+                })?;
+                metrics::counter!("trident_client_tls_connections_total").increment(1);
+                return Ok(ClientStream::Tls(Box::new(tls_stream)));
+            } else {
+                stream.write_all(b"N").await.map_err(|e| {
+                    crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
+                })?;
+                return Ok(ClientStream::Plain(stream));
+            }
+        }
+        // Not SSLRequest — it's a StartupMessage, pass through as plain
+        return Ok(ClientStream::Plain(stream));
+    }
 
     if length == 8 && code == SSL_REQUEST_CODE {
         // Consume the SSLRequest from the stream (we only peeked above)

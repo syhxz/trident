@@ -899,6 +899,8 @@ async fn run(
         let pool_max_idle_admin = config.pool.max_idle_time.clone();
         let pool_conn_timeout_admin = config.pool.connection_timeout.clone();
         let pool_max_lifetime_admin = config.pool.max_lifetime.clone();
+        let hc_for_interval = health_checker.clone();
+        let hc_for_interval_get = health_checker.clone();
         tokio::spawn(async move {
             if let Err(e) = admin::run(
                 admin_listener,
@@ -919,6 +921,8 @@ async fn run(
                 pool_max_lifetime_admin,
                 Some(node_manager),
                 config.admin.auth_token.clone(),
+                Some(Box::new(move |d| hc_for_interval.set_check_interval(d))),
+                Some(Box::new(move || hc_for_interval_get.check_interval())),
             )
             .await
             {

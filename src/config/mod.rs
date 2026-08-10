@@ -170,6 +170,7 @@ fn default_client_auth() -> ClientAuthMode {
 
 /// Proxy listener configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub listen_addr: String,
     pub max_clients: usize,
@@ -410,6 +411,7 @@ fn default_log_max_file_size_mb() -> u64 {
 /// See `trident::admin` module docs -- this endpoint is unauthenticated,
 /// so `listen_addr` should be bound to a private/internal address only.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -439,6 +441,7 @@ fn default_admin_listen_addr() -> String {
 
 /// Top-level application configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub proxy: ProxyConfig,
     pub nodes: Vec<NodeConfig>,

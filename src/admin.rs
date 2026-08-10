@@ -53,6 +53,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Json, State, WebSocketUpgrade};
@@ -292,6 +293,10 @@ struct AdminState {
     node_manager: Option<Arc<dyn NodeManager>>,
     /// Bearer token for admin API authentication. `None` = no auth required.
     auth_token: Option<String>,
+    /// Dynamic health check interval setter. `None` if not wired up.
+    set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
+    /// Dynamic health check interval getter.
+    get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
 }
 
 /// Bearer token authentication middleware. Checks the `Authorization`
@@ -360,6 +365,8 @@ fn build_router(
     pool_max_lifetime: String,
     node_manager: Option<Arc<dyn NodeManager>>,
     auth_token: Option<String>,
+    set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
+    get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
 ) -> Router {
     let state = Arc::new(AdminState {
         prometheus_handle,
@@ -379,6 +386,8 @@ fn build_router(
         pool_max_lifetime,
         node_manager,
         auth_token,
+        set_check_interval_fn,
+        get_check_interval_fn,
     });
 
     // Public routes: always accessible (Prometheus scraper, k8s probes, console UI)
@@ -873,6 +882,7 @@ struct ConfigResponse {
     pool_max_idle_time: String,
     pool_connection_timeout: String,
     pool_max_lifetime: String,
+    health_check_interval_ms: u64,
 }
 
 async fn config_get_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -896,6 +906,11 @@ async fn config_get_handler(State(state): State<Arc<AdminState>>) -> impl IntoRe
         pool_max_idle_time: state.pool_max_idle_time.clone(),
         pool_connection_timeout: state.pool_connection_timeout.clone(),
         pool_max_lifetime: state.pool_max_lifetime.clone(),
+        health_check_interval_ms: state
+            .get_check_interval_fn
+            .as_ref()
+            .map(|f| f().as_millis() as u64)
+            .unwrap_or(0),
     };
     Json(resp).into_response()
 }
@@ -914,6 +929,8 @@ struct ConfigPutBody {
     /// The handler rejects an attempt to *change* it rather than
     /// pretending the change applied.
     max_replication_lag_ms: Option<u64>,
+    /// Dynamically adjustable health check interval in milliseconds.
+    health_check_interval_ms: Option<u64>,
 }
 
 /// Applies the edited routing parameters from the console directly to the
@@ -986,6 +1003,21 @@ async fn config_put_handler(
                     .to_string(),
             )
                 .into_response();
+        }
+    }
+
+    // Dynamically adjust health check interval if requested.
+    if let Some(ms) = body.health_check_interval_ms {
+        if ms < 100 {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"status":"error","reason":"health_check_interval_ms must be >= 100"}"#
+                    .to_string(),
+            )
+                .into_response();
+        }
+        if let Some(ref setter) = state.set_check_interval_fn {
+            setter(Duration::from_millis(ms));
         }
     }
 
@@ -1124,6 +1156,8 @@ pub async fn run(
     pool_max_lifetime: String,
     node_manager: Option<Arc<dyn NodeManager>>,
     auth_token: Option<String>,
+    check_interval_setter: Option<Box<dyn Fn(Duration) + Send + Sync>>,
+    check_interval_getter: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
 ) -> Result<(), AdminError> {
     let app = build_router(
         prometheus_handle,
@@ -1143,6 +1177,8 @@ pub async fn run(
         pool_max_lifetime,
         node_manager,
         auth_token,
+        check_interval_setter,
+        check_interval_getter,
     );
 
     let local_addr = listener.local_addr().map_err(|source| AdminError::Bind {
@@ -1271,6 +1307,8 @@ mod tests {
             "30m".to_string(),
             None, // node_manager
             Some("test-token".to_string()), // auth_token
+            None, // check_interval_setter
+            None, // check_interval_getter
         )
     }
 
@@ -1377,6 +1415,8 @@ mod tests {
             "30m".to_string(),
             None, // node_manager
             Some("test-token".to_string()), // auth_token
+            None, // check_interval_setter
+            None, // check_interval_getter
         );
 
         let response = app
@@ -1419,6 +1459,8 @@ mod tests {
             "30m".to_string(),
             None, // node_manager
             Some("test-token".to_string()), // auth_token
+            None, // check_interval_setter
+            None, // check_interval_getter
         );
 
         let response = app
@@ -1463,6 +1505,8 @@ mod tests {
             "30m".to_string(),
             None, // node_manager
             Some("test-token".to_string()), // auth_token
+            None, // check_interval_setter
+            None, // check_interval_getter
         )
     }
 
@@ -1596,6 +1640,8 @@ mod tests {
             "30m".to_string(),
             None, // node_manager
             Some("test-token".to_string()), // auth_token
+            None, // check_interval_setter
+            None, // check_interval_getter
         )
     }
 

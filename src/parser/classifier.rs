@@ -84,7 +84,10 @@ mod once_cell_lite {
 }
 
 static FOR_UPDATE_OR_SHARE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?is)\bFOR\s+(UPDATE|SHARE)\b").unwrap());
+    Lazy::new(|| Regex::new(r"(?is)\bFOR\s+(NO\s+KEY\s+UPDATE|KEY\s+SHARE|UPDATE|SHARE)\b").unwrap());
+
+static SELECT_INTO: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)\bINTO\s+(TEMP\w*\s+|TEMPORARY\s+|UNLOGGED\s+)?(TABLE\s+)?\w+\s+FROM\b").unwrap());
 
 static SET_LOCAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)^SET\s+LOCAL\b").unwrap());
 
@@ -463,6 +466,8 @@ impl Classifier for KeywordClassifier {
             "SELECT" => {
                 if FOR_UPDATE_OR_SHARE.is_match(body) {
                     SqlKind::SelectForUpdate
+                } else if SELECT_INTO.is_match(body) {
+                    SqlKind::Write
                 } else {
                     SqlKind::Select
                 }

@@ -53,7 +53,44 @@ where
         // Preserve PostgreSQL's failed-transaction semantics: with the
         // physical connection already lost, the batch must not run as
         // autocommit on a fresh connection. Match the Simple Query path.
+        //
+        // FIX (Bug 8): Allow ROLLBACK/COMMIT through to reset the Failed
+        // state, matching the Simple Query path's recovery logic. Without
+        // this, Extended protocol clients cannot recover from a failed
+        // transaction when the backend connection was lost.
         if session.state.tx_state == TxState::Failed && session.held_backend.is_none() {
+            // Check if any Parse in this batch is a transaction-ending command.
+            let has_txn_end = batch.iter().any(|frame| {
+                if frame.tag == frontend_tag::PARSE {
+                    if let Some(sql) = frame.parse_sql() {
+                        return crate::session::transaction::transaction_end_tag(sql).is_some();
+                    }
+                }
+                false
+            });
+            if has_txn_end {
+                // Reset to Idle locally (no backend to send to).
+                session.state.tx_state = TxState::Idle;
+                session.state.tx_split = None;
+                session.tx_has_writes = false;
+                // Send synthetic ParseComplete + BindComplete + CommandComplete(ROLLBACK) + RFQ(I)
+                let parse_complete = [b'1', 0, 0, 0, 4];
+                let bind_complete = [b'2', 0, 0, 0, 4];
+                let cmd = crate::protocol::writer::encode_backend_message(
+                    &crate::protocol::message::BackendMessage::CommandComplete {
+                        tag: "ROLLBACK".to_string(),
+                    },
+                );
+                client_stream.write_all(&parse_complete).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                client_stream.write_all(&bind_complete).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                client_stream.write_all(&cmd).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                send_ready_for_query(client_stream, TxState::Idle).await?;
+                return Ok(());
+            }
+
             let error = PgError::simple(
                 "ERROR",
                 "25P02",
@@ -66,10 +103,98 @@ where
 
         // Fast path: if a backend is already held (pinned connection or
         // in-transaction), skip routing/snapshot entirely and reuse it.
+        //
+        // FIX (Bug 2): Before forwarding, check if there is a pending
+        // deferred BEGIN (tx_split state is pending but not yet active).
+        // When a session has a pinned connection and a new explicit
+        // transaction was started via Simple Query (which sets tx_split to
+        // pending and tx_state to InTransaction without sending BEGIN to
+        // the backend), the Extended Query batch that follows must first
+        // issue the deferred BEGIN on the held backend. Without this, the
+        // statements execute outside any transaction on the backend, which
+        // is a semantic correctness violation.
         if session.held_backend.is_some() {
-            return self
-                .forward_extended_on_held_backend(client_stream, session, batch)
-                .await;
+            // Inject deferred BEGIN if needed.
+            if let Some(ref split) = session.state.tx_split {
+                if !split.active {
+                    let begin_sql = split.begin_sql().to_string();
+                    let held = session.held_backend.as_mut().expect("checked above");
+                    let begin_bytes = crate::protocol::writer::encode_query(&begin_sql);
+                    held.conn.stream.write_all(&begin_bytes).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    held.conn.stream.flush().await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    // Drain the BEGIN response (CommandComplete + ReadyForQuery).
+                    loop {
+                        let msg = crate::protocol::reader::read_backend_message(
+                            &mut held.conn.stream,
+                        )
+                        .await
+                        .map_err(ProxyError::Protocol)?;
+                        if matches!(msg, crate::protocol::message::BackendMessage::ReadyForQuery(_))
+                        {
+                            break;
+                        }
+                    }
+                    // Mark the split as active now that BEGIN was sent.
+                    // Determine on_reader by checking if the held node is a writer.
+                    let held_node_id = held.conn.node_id.clone();
+                    let is_writer = self
+                        .pool_manager
+                        .snapshot()
+                        .iter()
+                        .any(|n| n.node_id == held_node_id && n.node_type == NodeType::Writer);
+                    if let Some(ref mut s) = session.state.tx_split {
+                        s.active = true;
+                        s.on_reader = !is_writer;
+                    }
+                }
+            }
+
+            // FIX (Bug 2): If the held backend is a Reader and this batch
+            // contains a write operation, we cannot forward it there. Release
+            // the Reader and fall through to the normal routing path which
+            // will select a Writer.
+            let held = session.held_backend.as_ref().expect("checked above");
+            let held_is_reader = self
+                .pool_manager
+                .snapshot()
+                .iter()
+                .any(|n| n.node_id == held.conn.node_id && n.node_type == NodeType::Reader);
+            if held_is_reader {
+                let batch_has_write = batch.iter().any(|frame| {
+                    if frame.tag == frontend_tag::PARSE {
+                        if let Some(sql) = frame.parse_sql() {
+                            return requires_writer(&KeywordClassifier, sql);
+                        }
+                    }
+                    false
+                });
+                if batch_has_write {
+                    // Release the Reader connection and fall through to
+                    // normal routing which will pick a Writer.
+                    let held = session.held_backend.take().unwrap();
+                    if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
+                        if held.conn.pinned {
+                            let _ = pool.discard(held.conn);
+                        } else {
+                            pool.release(&session.state.id, held.conn).await?;
+                        }
+                    }
+                    // Update tx_split state: we're no longer on reader.
+                    if let Some(ref mut s) = session.state.tx_split {
+                        s.on_reader = false;
+                        s.need_upgrade = true;
+                    }
+                    // Fall through to the normal routing path below.
+                }
+            }
+
+            if session.held_backend.is_some() {
+                return self
+                    .forward_extended_on_held_backend(client_stream, session, batch)
+                    .await;
+            }
         }
 
         // Determine routing: prefer Parse SQL, then named statement lookup,
@@ -133,26 +258,50 @@ where
         // should not reach the backend. If the only Parse SQL in the batch
         // is a consistency SET, handle it locally and return synthetic
         // ParseComplete + BindComplete + CommandComplete + ReadyForQuery.
+        //
+        // FIX (Bug 4): Only intercept if this is the SOLE operation in the
+        // batch. In pipeline mode, a batch may contain Parse(SET) + Parse(SELECT)
+        // + Bind + Execute. If we return early, the subsequent frames are lost.
+        // Only intercept when the batch has exactly one Parse frame.
         if let Some(sql) = route_sql {
             if session.state.tx_state != TxState::Failed
                 && session.state.apply_consistency_set_command(sql)
             {
-                use crate::protocol::writer::encode_backend_message;
-                use crate::protocol::message::BackendMessage;
-                // Send ParseComplete ('1'), BindComplete ('2'), CommandComplete, RFQ
-                let parse_complete = [b'1', 0, 0, 0, 4];
-                let bind_complete = [b'2', 0, 0, 0, 4];
-                let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                    tag: "SET".to_string(),
-                });
-                client_stream.write_all(&parse_complete).await
-                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                client_stream.write_all(&bind_complete).await
-                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                client_stream.write_all(&cmd_complete).await
-                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                send_ready_for_query(client_stream, session.state.tx_state).await?;
-                return Ok(());
+                let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
+                if parse_count <= 1 {
+                    use crate::protocol::writer::encode_backend_message;
+                    use crate::protocol::message::BackendMessage;
+                    // Send ParseComplete ('1'), BindComplete ('2'), CommandComplete, RFQ
+                    let parse_complete = [b'1', 0, 0, 0, 4];
+                    let bind_complete = [b'2', 0, 0, 0, 4];
+                    let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                        tag: "SET".to_string(),
+                    });
+                    client_stream.write_all(&parse_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    client_stream.write_all(&bind_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    client_stream.write_all(&cmd_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    send_ready_for_query(client_stream, session.state.tx_state).await?;
+                    return Ok(());
+                } else {
+                    // Multi-Parse pipeline batch: the SET was applied to the
+                    // session above, but we must NOT return early. Re-route
+                    // using the next non-SET Parse SQL so the remaining
+                    // operations are forwarded to the backend.
+                    // Find the next non-SET parse SQL for routing.
+                    route_sql = batch.iter()
+                        .filter(|f| f.tag == frontend_tag::PARSE)
+                        .filter_map(|f| f.parse_sql())
+                        .find(|s| !session.state.is_consistency_set_command(s));
+                    // Re-check force_writer for the new route_sql
+                    if let Some(new_sql) = route_sql {
+                        if requires_writer(&classifier, new_sql) {
+                            force_writer = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -250,13 +399,44 @@ where
         } else if let Some(node_id) = tracked_node {
             // Named statement was previously parsed on this node: reuse that
             // route without touching the pool snapshot at all.
+            //
+            // FIX (Bug 1): The tracked_node fast path must still enforce
+            // pending_write protection. If pending_write is set and the
+            // tracked node is not a Writer, force routing to the Writer to
+            // preserve session consistency guarantees. Without this check,
+            // a Bind/Execute referencing a previously-parsed SELECT on a
+            // Reader would bypass the pending_write guard entirely.
+            let effective_node_id = if session.pending_write
+                && session.state.consistency != ConsistencyLevel::Eventual
+            {
+                // Check if tracked node is a Reader by consulting the pool snapshot.
+                let is_reader = self
+                    .pool_manager
+                    .snapshot()
+                    .iter()
+                    .any(|n| n.node_id == node_id && n.node_type != NodeType::Writer);
+                if is_reader {
+                    // Override to Writer.
+                    self.pool_manager
+                        .snapshot()
+                        .iter()
+                        .find(|n| n.node_type == NodeType::Writer && n.healthy)
+                        .map(|n| n.node_id.clone())
+                        .unwrap_or(node_id.clone())
+                } else {
+                    node_id
+                }
+            } else {
+                node_id
+            };
+
             // If a split transaction is pending, capture the deferred BEGIN.
             let begin = if session.state.tx_split.as_ref().is_some_and(|s| !s.active) {
                 session.state.tx_split.as_ref().map(|s| s.begin_sql().to_string())
             } else {
                 None
             };
-            (node_id, begin)
+            (effective_node_id, begin)
         } else {
             // Route based on the SQL from Parse. The pool snapshot (which
             // clones every node's state) is only taken on this branch and
@@ -462,7 +642,11 @@ where
 
         // Relay backend responses until ReadyForQuery.
         let mut had_error = false;
-        let mut write_detected = false;
+        // FIX (Bug 6): If the SQL was classified as a write during routing
+        // (e.g. SELECT setval(), SELECT lo_create()), pre-set write_detected
+        // so pending_write is recorded even though the CommandComplete tag
+        // will just say "SELECT 1".
+        let mut write_detected = force_writer;
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {

@@ -99,7 +99,7 @@ pub async fn read_startup_packet<R: AsyncRead + Unpin + Send>(
     if total_len < 4 {
         return Err(ProtocolError::InvalidLength(total_len));
     }
-    const MAX_STARTUP_LEN: i32 = 10 * 1024 * 1024; // 10MiB cap, defensive guard
+    const MAX_STARTUP_LEN: i32 = 64 * 1024; // 64KiB cap for pre-auth startup messages
     let body_len = total_len - 4;
     if body_len > MAX_STARTUP_LEN {
         return Err(ProtocolError::InvalidLength(total_len));

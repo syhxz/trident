@@ -81,6 +81,12 @@ impl SessionState {
             None => false,
         }
     }
+
+    /// Returns true if the SQL is a `SET trident.consistency` command
+    /// without actually applying it.
+    pub fn is_consistency_set_command(&self, sql: &str) -> bool {
+        parse_consistency_set_command(sql).is_some()
+    }
 }
 
 /// Parses `SET trident.consistency = '<value>'` (case-insensitive, with

@@ -204,6 +204,30 @@ impl Default for NodePoolSettings {
     }
 }
 
+/// RAII guard for a reserved pool slot. If dropped without calling `defuse()`,
+/// it releases the slot back, preventing leaks on async cancellation.
+struct SlotGuard<'a> {
+    active_connections: &'a AtomicU32,
+    release_notify: &'a tokio::sync::Notify,
+    armed: bool,
+}
+
+impl<'a> SlotGuard<'a> {
+    /// Disarm the guard, taking ownership of the reserved slot.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<'a> Drop for SlotGuard<'a> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.active_connections.fetch_sub(1, Ordering::SeqCst);
+            self.release_notify.notify_one();
+        }
+    }
+}
+
 /// Default `ConnectionPool` implementation: manages the connection pool
 /// for a single backend node.
 pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
@@ -316,6 +340,17 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         self.active_connections.fetch_sub(1, Ordering::SeqCst);
     }
 
+    /// RAII guard that ensures a reserved slot is released if the future
+    /// holding it is cancelled (dropped). Call `defuse()` to take ownership
+    /// of the slot without releasing it.
+    fn reserve_slot_guard(&self) -> SlotGuard<'_> {
+        SlotGuard {
+            active_connections: &self.active_connections,
+            release_notify: &self.release_notify,
+            armed: true,
+        }
+    }
+
     fn register_connection(&self, conn: &BackendConnection) {
         self.known_connections
             .lock()
@@ -323,6 +358,10 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     }
 
     async fn create_reserved_connection(&self) -> Result<BackendConnection, PoolError> {
+        // The caller has already reserved a slot via try_reserve_slot().
+        // Use a guard to ensure the slot is released if this future is
+        // cancelled (dropped) before we return the connection.
+        let mut guard = self.reserve_slot_guard();
         match timeout(
             self.settings.connection_timeout,
             self.factory.create(&self.node_id),
@@ -332,8 +371,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             Ok(Ok(conn)) => {
                 if self.draining.load(Ordering::SeqCst) {
                     self.cleaner.discard(&conn);
-                    self.release_slot();
-                    self.release_notify.notify_one();
+                    // Guard will release slot on drop.
                     return Err(PoolError::Exhausted(format!(
                         "{} (draining)",
                         self.node_id
@@ -341,16 +379,17 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 }
                 self.register_connection(&conn);
                 metrics::counter!("trident_pool_connections_established_total", "node_id" => self.node_id.clone()).increment(1);
+                // Connection created successfully — defuse the guard so
+                // the slot remains reserved (owned by the connection).
+                guard.defuse();
                 Ok(conn)
             }
             Ok(Err(error)) => {
-                self.release_slot();
-                self.release_notify.notify_one();
+                // Guard releases slot on drop.
                 Err(error)
             }
             Err(_) => {
-                self.release_slot();
-                self.release_notify.notify_one();
+                // Guard releases slot on drop.
                 Err(PoolError::ConnectTimeout {
                     node_id: self.node_id.clone(),
                     timeout_ms: self.settings.connection_timeout.as_millis(),
