@@ -270,8 +270,9 @@ impl HealthProbe for WireProtocolHealthProbe {
             }
         } else if node_type == NodeType::Reader {
             if self.aurora_native {
-                if let Ok(Some(lsn)) = query_aurora_current_read_lsn(&mut stream).await {
-                    result.replay_lsn = Some(lsn);
+                if let Ok((lsn, lag)) = query_aurora_reader_status(&mut stream).await {
+                    result.replay_lsn = lsn;
+                    result.replication_lag_ms = lag;
                 }
             } else {
                 if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
@@ -503,18 +504,38 @@ async fn query_aurora_durable_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(value.and_then(|v| parse_lsn(&v)))
 }
 
-/// Queries this Reader's current read LSN from Aurora's `aurora_replica_status()`.
-/// Executed on the Reader itself, so we use `aurora_db_instance_identifier()`
-/// to identify the local row.
-async fn query_aurora_current_read_lsn<S: AsyncRead + AsyncWrite + Unpin + Send>(
+/// Queries this Reader's current_read_lsn and replica_lag_in_msec from
+/// Aurora's `aurora_replica_status()` in a single query to minimize
+/// health check overhead.
+async fn query_aurora_reader_status<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
-) -> Result<Option<u64>, ()> {
-    let value = run_simple_query_first_column(
-        stream,
-        "SELECT current_read_lsn FROM aurora_replica_status() WHERE server_id = aurora_db_instance_identifier()",
-    )
-    .await?;
-    Ok(value.and_then(|v| parse_lsn(&v)))
+) -> Result<(Option<u64>, Option<u64>), ()> {
+    let query_bytes = crate::protocol::writer::encode_query(
+        "SELECT current_read_lsn, replica_lag_in_msec FROM aurora_replica_status() WHERE server_id = aurora_db_instance_identifier()"
+    );
+    stream.write_all(&query_bytes).await.map_err(|_| ())?;
+    stream.flush().await.map_err(|_| ())?;
+
+    let mut lsn: Option<u64> = None;
+    let mut lag_ms: Option<u64> = None;
+    loop {
+        match crate::protocol::reader::read_backend_message(stream).await {
+            Ok(crate::protocol::message::BackendMessage::DataRow(cols)) => {
+                if let Some(Some(bytes)) = cols.first() {
+                    lsn = String::from_utf8(bytes.clone()).ok().and_then(|v| parse_lsn(&v));
+                }
+                if let Some(Some(bytes)) = cols.get(1) {
+                    lag_ms = String::from_utf8(bytes.clone())
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                }
+            }
+            Ok(crate::protocol::message::BackendMessage::ReadyForQuery(_)) => break,
+            Ok(_) => continue,
+            Err(_) => return Err(()),
+        }
+    }
+    Ok((lsn, lag_ms))
 }
 
 /// Parses a PostgreSQL LSN text representation into a `u64`.
@@ -842,12 +863,9 @@ impl<P: HealthProbe> HealthChecker<P> {
                                 Some(0)
                             } else {
                                 // Genuine lag — use the timestamp value if
-                                // available, otherwise estimate from LSN gap.
-                                // Aurora replicates at ~100 MB/s; estimate:
-                                // 1 MB gap ≈ 10ms lag.
-                                node.last_replication_lag_ms.or_else(|| {
-                                    Some(lsn_diff / (1024 * 1024) * 10)
-                                })
+                                // available (from Aurora's replica_lag_in_msec
+                                // or PostgreSQL's replication lag query).
+                                node.last_replication_lag_ms
                             }
                         }
                     } else {
