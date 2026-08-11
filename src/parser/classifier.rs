@@ -87,7 +87,7 @@ static FOR_UPDATE_OR_SHARE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)\bFOR\s+(NO\s+KEY\s+UPDATE|KEY\s+SHARE|UPDATE|SHARE)\b").unwrap());
 
 static SELECT_INTO: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?is)\bINTO\s+(TEMP\w*\s+|TEMPORARY\s+|UNLOGGED\s+)?(TABLE\s+)?\w+\s+FROM\b").unwrap());
+    Lazy::new(|| Regex::new(r"(?is)\bINTO\s+(TEMP\w*\s+|TEMPORARY\s+|UNLOGGED\s+)?(TABLE\s+)?\w+").unwrap());
 
 static SET_LOCAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)^SET\s+LOCAL\b").unwrap());
 

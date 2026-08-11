@@ -328,12 +328,14 @@ async fn upgrade_probe_stream(
                                     .with_root_certificates(root_store)
                                     .with_no_client_auth()
                             } else {
-                                // verify-ca: verify chain but not hostname
-                                let verifier = rustls::client::WebPkiServerVerifier::builder(
-                                    Arc::new(root_store),
-                                )
-                                .build()
-                                .map_err(|_| ())?;
+                                // verify-ca: verify chain but not hostname.
+                                // Use the same CaOnlyVerifier as the pool
+                                // connections to get consistent behavior.
+                                let verifier = Arc::new(
+                                    crate::pool::conn::CaOnlyVerifier {
+                                        roots: Arc::new(root_store),
+                                    },
+                                );
                                 rustls::ClientConfig::builder()
                                     .dangerous()
                                     .with_custom_certificate_verifier(verifier)

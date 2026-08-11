@@ -273,7 +273,7 @@ impl StartupHandler for Md5PasswordStartupHandler {
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Read PasswordMessage ('p')
-        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
                 "expected PasswordMessage ('p'), got '{}'",
@@ -478,7 +478,7 @@ impl StartupHandler for ScramStartupHandler {
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Step 2: Receive SASLInitialResponse (client-first-message)
-        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
                 "expected SASLInitialResponse ('p'), got '{}'", tag as char
@@ -561,7 +561,7 @@ impl StartupHandler for ScramStartupHandler {
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Step 4: Receive SASLResponse (client-final-message)
-        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
                 "expected SASLResponse ('p'), got '{}'", tag as char
@@ -730,7 +730,7 @@ impl StartupHandler for PassthroughStartupHandler {
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Read PasswordMessage ('p')
-        let (tag, body) = crate::protocol::reader::read_tagged_frame(stream).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
                 "expected PasswordMessage ('p'), got '{}'",

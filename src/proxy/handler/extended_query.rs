@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{ConsistencyLevel, LsnTrackingMode, NodeType};
-use crate::parser::classifier::{requires_writer, KeywordClassifier};
+use crate::parser::classifier::{requires_writer, Classifier, KeywordClassifier};
 use crate::pool::pinning::detects_pinning_trigger;
 use crate::protocol::message::{PgError, TransactionStatus};
 use crate::protocol::reader::{frontend_tag, read_tagged_frame};
@@ -54,41 +54,56 @@ where
         // physical connection already lost, the batch must not run as
         // autocommit on a fresh connection. Match the Simple Query path.
         //
-        // FIX (Bug 8): Allow ROLLBACK/COMMIT through to reset the Failed
-        // state, matching the Simple Query path's recovery logic. Without
-        // this, Extended protocol clients cannot recover from a failed
-        // transaction when the backend connection was lost.
+        // FIX (Bug 8/9): Allow ROLLBACK/COMMIT through to reset the Failed
+        // state, matching the Simple Query path's recovery logic. Only
+        // recognize a transaction-end if the batch contains Parse + Bind +
+        // Execute (i.e. the client intends to actually run the command, not
+        // just prepare it). Use the actual command tag (COMMIT or ROLLBACK).
         if session.state.tx_state == TxState::Failed && session.held_backend.is_none() {
-            // Check if any Parse in this batch is a transaction-ending command.
-            let has_txn_end = batch.iter().any(|frame| {
+            // Find the transaction-ending Parse SQL (if any).
+            let txn_end_tag = batch.iter().find_map(|frame| {
                 if frame.tag == frontend_tag::PARSE {
-                    if let Some(sql) = frame.parse_sql() {
-                        return crate::session::transaction::transaction_end_tag(sql).is_some();
-                    }
+                    frame.parse_sql().and_then(crate::session::transaction::transaction_end_tag)
+                } else {
+                    None
                 }
-                false
             });
-            if has_txn_end {
-                // Reset to Idle locally (no backend to send to).
-                session.state.tx_state = TxState::Idle;
-                session.state.tx_split = None;
-                session.tx_has_writes = false;
-                // Send synthetic ParseComplete + BindComplete + CommandComplete(ROLLBACK) + RFQ(I)
-                let parse_complete = [b'1', 0, 0, 0, 4];
-                let bind_complete = [b'2', 0, 0, 0, 4];
-                let cmd = crate::protocol::writer::encode_backend_message(
-                    &crate::protocol::message::BackendMessage::CommandComplete {
-                        tag: "ROLLBACK".to_string(),
-                    },
-                );
-                client_stream.write_all(&parse_complete).await
-                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                client_stream.write_all(&bind_complete).await
-                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                client_stream.write_all(&cmd).await
-                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                send_ready_for_query(client_stream, TxState::Idle).await?;
-                return Ok(());
+            // Only act on it if the batch also has Bind + Execute (meaning
+            // the client intends to execute, not just prepare the statement).
+            let has_bind = batch.iter().any(|f| f.tag == frontend_tag::BIND);
+            let has_execute = batch.iter().any(|f| f.tag == frontend_tag::EXECUTE);
+            if let Some(tag) = txn_end_tag {
+                if has_bind && has_execute {
+                    // Full execution cycle: reset to Idle.
+                    session.state.tx_state = TxState::Idle;
+                    session.state.tx_split = None;
+                    session.tx_has_writes = false;
+                    // Synthetic ParseComplete + BindComplete + CommandComplete(tag) + RFQ(I)
+                    let parse_complete = [b'1', 0, 0, 0, 4];
+                    let bind_complete = [b'2', 0, 0, 0, 4];
+                    let cmd = crate::protocol::writer::encode_backend_message(
+                        &crate::protocol::message::BackendMessage::CommandComplete {
+                            tag: tag.to_string(),
+                        },
+                    );
+                    client_stream.write_all(&parse_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    client_stream.write_all(&bind_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    client_stream.write_all(&cmd).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    send_ready_for_query(client_stream, TxState::Idle).await?;
+                    return Ok(());
+                } else {
+                    // Parse-only: client is preparing the statement but not
+                    // executing yet. Return ParseComplete without changing
+                    // transaction state.
+                    let parse_complete = [b'1', 0, 0, 0, 4];
+                    client_stream.write_all(&parse_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    send_ready_for_query(client_stream, TxState::Failed).await?;
+                    return Ok(());
+                }
             }
 
             let error = PgError::simple(
@@ -104,6 +119,54 @@ where
         // Fast path: if a backend is already held (pinned connection or
         // in-transaction), skip routing/snapshot entirely and reuse it.
         //
+        // But first: intercept proxy-local SET trident.consistency even on
+        // the held path — this GUC must never reach the backend.
+        if session.held_backend.is_some() {
+            // Check if this is a single-Parse consistency SET batch.
+            let held_route_sql = batch.iter()
+                .filter(|f| f.tag == frontend_tag::PARSE)
+                .find_map(|f| f.parse_sql());
+            if let Some(sql) = held_route_sql {
+                if session.state.is_consistency_set_command(sql) {
+                    let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
+                    let has_execute = batch.iter().any(|f| f.tag == frontend_tag::EXECUTE);
+                    let has_bind = batch.iter().any(|f| f.tag == frontend_tag::BIND);
+                    if parse_count <= 1 {
+                        if has_bind && has_execute {
+                            session.state.apply_consistency_set_command(sql);
+                            use crate::protocol::writer::encode_backend_message;
+                            use crate::protocol::message::BackendMessage;
+                            let parse_complete = [b'1', 0, 0, 0, 4];
+                            let bind_complete = [b'2', 0, 0, 0, 4];
+                            let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                                tag: "SET".to_string(),
+                            });
+                            client_stream.write_all(&parse_complete).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            client_stream.write_all(&bind_complete).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            client_stream.write_all(&cmd_complete).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            send_ready_for_query(client_stream, session.state.tx_state).await?;
+                            return Ok(());
+                        } else {
+                            // Parse-only: don't apply yet.
+                            let parse_complete = [b'1', 0, 0, 0, 4];
+                            client_stream.write_all(&parse_complete).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            send_ready_for_query(client_stream, session.state.tx_state).await?;
+                            return Ok(());
+                        }
+                    }
+                    // Multi-Parse: apply if executing, then fall through to
+                    // forward remaining batch to held backend.
+                    if has_execute {
+                        session.state.apply_consistency_set_command(sql);
+                    }
+                }
+            }
+        }
+
         // FIX (Bug 2): Before forwarding, check if there is a pending
         // deferred BEGIN (tx_split state is pending but not yet active).
         // When a session has a pinned connection and a new explicit
@@ -165,23 +228,61 @@ where
                 let batch_has_write = batch.iter().any(|frame| {
                     if frame.tag == frontend_tag::PARSE {
                         if let Some(sql) = frame.parse_sql() {
-                            return requires_writer(&KeywordClassifier, sql);
+                            let kind = KeywordClassifier.classify(sql);
+                            return requires_writer(&KeywordClassifier, sql) || !kind.readable();
                         }
                     }
                     false
                 });
                 if batch_has_write {
-                    // Release the Reader connection and fall through to
-                    // normal routing which will pick a Writer.
-                    let held = session.held_backend.take().unwrap();
-                    if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                        if held.conn.pinned {
-                            let _ = pool.discard(held.conn);
-                        } else {
-                            pool.release(&session.state.id, held.conn).await?;
+                    // Reader→Writer upgrade: follow the contract documented in
+                    // transaction.rs — ROLLBACK Reader, then BEGIN Writer.
+                    let mut held = session.held_backend.take().unwrap();
+                    let reader_node_id = held.conn.node_id.clone();
+                    let reader_pool = match self.resolve_pool_existing(&reader_node_id, session) {
+                        Some(pool) => pool,
+                        None => {
+                            // Pool disappeared — connection will be dropped,
+                            // but we cannot safely continue the transaction.
+                            session.state.tx_state = TxState::Failed;
+                            return Err(ProxyError::Pool(
+                                crate::pool::pool::PoolError::CleanupFailed(format!(
+                                    "pool for split Reader '{}' no longer exists",
+                                    reader_node_id
+                                )),
+                            ));
+                        }
+                    };
+
+                    // (1) Send ROLLBACK to the Reader so it leaves the
+                    // transaction state cleanly before being returned/discarded.
+                    if let Err(error) = execute_internal_query(
+                        &mut held.conn.stream,
+                        "ROLLBACK",
+                        TransactionStatus::Idle,
+                    ).await {
+                        // ROLLBACK failed — discard the connection.
+                        let _ = reader_pool.discard(held.conn);
+                        session.state.tx_state = TxState::Failed;
+                        return Err(ProxyError::Protocol(error));
+                    }
+
+                    // (2) Release or discard the Reader connection.
+                    {
+                        use crate::config::PoolMode;
+                        match reader_pool.mode() {
+                            PoolMode::Transaction => {
+                                held.conn.dirty = false;
+                                reader_pool.release(&session.state.id, held.conn).await?;
+                            }
+                            PoolMode::Session => {
+                                let _ = reader_pool.discard(held.conn);
+                            }
                         }
                     }
-                    // Update tx_split state: we're no longer on reader.
+
+                    // (3) Update tx_split state: mark upgrade needed so the
+                    // downstream code will issue BEGIN on the Writer.
                     if let Some(ref mut s) = session.state.tx_split {
                         s.on_reader = false;
                         s.need_upgrade = true;
@@ -224,10 +325,16 @@ where
             if route_sql.is_none() {
                 route_sql = Some(sql);
             }
-            // Check SQL classification
-            if requires_writer(&classifier, sql) {
-                route_sql = Some(sql);
-                force_writer = true;
+            // Check SQL classification: anything that explicitly requires
+            // Writer OR anything not classified as readable (e.g. DO $$,
+            // CALL, WITH...INSERT) must go to Writer. This mirrors the
+            // Router's own logic which sends !readable() to Writer.
+            if !force_writer {
+                let kind = classifier.classify(sql);
+                if requires_writer(&classifier, sql) || !kind.readable() {
+                    route_sql = Some(sql);
+                    force_writer = true;
+                }
             }
             // Check routing hints — ForceWriter wins over ForceReader.
             // When ForceWriter is triggered, route_sql is set to that SQL
@@ -255,9 +362,11 @@ where
 
         // Intercept `SET trident.consistency = '...'` in extended protocol.
         // Like the simple query path, this is a proxy-local setting that
-        // should not reach the backend. If the only Parse SQL in the batch
-        // is a consistency SET, handle it locally and return synthetic
-        // ParseComplete + BindComplete + CommandComplete + ReadyForQuery.
+        // should not reach the backend. However, per PostgreSQL extended
+        // protocol semantics, Parse only creates a prepared statement and
+        // does NOT execute it. The SET should only take effect when the
+        // batch includes Bind + Execute (meaning the client intends to
+        // actually run the statement).
         //
         // FIX (Bug 4): Only intercept if this is the SOLE operation in the
         // batch. In pipeline mode, a batch may contain Parse(SET) + Parse(SELECT)
@@ -265,31 +374,50 @@ where
         // Only intercept when the batch has exactly one Parse frame.
         if let Some(sql) = route_sql {
             if session.state.tx_state != TxState::Failed
-                && session.state.apply_consistency_set_command(sql)
+                && session.state.is_consistency_set_command(sql)
             {
                 let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
+                let has_execute = batch.iter().any(|f| f.tag == frontend_tag::EXECUTE);
+                let has_bind = batch.iter().any(|f| f.tag == frontend_tag::BIND);
+
                 if parse_count <= 1 {
-                    use crate::protocol::writer::encode_backend_message;
-                    use crate::protocol::message::BackendMessage;
-                    // Send ParseComplete ('1'), BindComplete ('2'), CommandComplete, RFQ
-                    let parse_complete = [b'1', 0, 0, 0, 4];
-                    let bind_complete = [b'2', 0, 0, 0, 4];
-                    let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                        tag: "SET".to_string(),
-                    });
-                    client_stream.write_all(&parse_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    client_stream.write_all(&bind_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    client_stream.write_all(&cmd_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    send_ready_for_query(client_stream, session.state.tx_state).await?;
-                    return Ok(());
+                    if has_bind && has_execute {
+                        // Full Parse+Bind+Execute cycle: apply the SET and
+                        // return the complete synthetic response.
+                        session.state.apply_consistency_set_command(sql);
+                        use crate::protocol::writer::encode_backend_message;
+                        use crate::protocol::message::BackendMessage;
+                        let parse_complete = [b'1', 0, 0, 0, 4];
+                        let bind_complete = [b'2', 0, 0, 0, 4];
+                        let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                            tag: "SET".to_string(),
+                        });
+                        client_stream.write_all(&parse_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        client_stream.write_all(&bind_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        client_stream.write_all(&cmd_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        return Ok(());
+                    } else {
+                        // Parse-only (no Execute): the client is only
+                        // preparing the statement. Do NOT apply the SET yet.
+                        // Return only ParseComplete + ReadyForQuery.
+                        let parse_complete = [b'1', 0, 0, 0, 4];
+                        client_stream.write_all(&parse_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        return Ok(());
+                    }
                 } else {
-                    // Multi-Parse pipeline batch: the SET was applied to the
-                    // session above, but we must NOT return early. Re-route
-                    // using the next non-SET Parse SQL so the remaining
-                    // operations are forwarded to the backend.
+                    // Multi-Parse pipeline batch: apply SET only if there is
+                    // an Execute in the batch (meaning the SET will actually
+                    // run). Then re-route using the next non-SET Parse SQL
+                    // so the remaining operations are forwarded to the backend.
+                    if has_execute {
+                        session.state.apply_consistency_set_command(sql);
+                    }
                     // Find the next non-SET parse SQL for routing.
                     route_sql = batch.iter()
                         .filter(|f| f.tag == frontend_tag::PARSE)
@@ -464,6 +592,9 @@ where
             let global_write_lsn = self.lsn_tracker.global_write_lsn();
             let mut tx_split = session.state.tx_split.take();
             let split_was_pending = tx_split.as_ref().is_some_and(|state| !state.active);
+            // Capture whether the held_backend fast-path already requested
+            // an upgrade (need_upgrade=true) before the Router resets it.
+            let pre_route_need_upgrade = tx_split.as_ref().is_some_and(|s| s.need_upgrade);
             let decision = {
                 let mut ctx = RoutingContext {
                     tx_state: session.state.tx_state,
@@ -497,7 +628,10 @@ where
 
             // Capture deferred BEGIN SQL for split transactions that have
             // not yet opened a real backend transaction.
-            let deferred_begin_sql = if split_was_pending || decision.requires_split_upgrade {
+            let needs_begin = split_was_pending
+                || decision.requires_split_upgrade
+                || pre_route_need_upgrade;
+            let deferred_begin_sql = if needs_begin {
                 session
                     .state
                     .tx_split
@@ -890,7 +1024,18 @@ where
 
         // Relay backend responses until ReadyForQuery.
         let mut had_error = false;
-        let mut write_detected = false;
+        // Pre-detect write function calls (setval, lo_*, etc.) in Parse SQL
+        // so pending_write is correctly recorded even when CommandComplete
+        // just says "SELECT 1". Mirrors the non-held path's force_writer
+        // initialization.
+        let mut write_detected = batch.iter().any(|frame| {
+            if frame.tag == frontend_tag::PARSE {
+                if let Some(sql) = frame.parse_sql() {
+                    return requires_writer(&KeywordClassifier, sql);
+                }
+            }
+            false
+        });
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {

@@ -465,8 +465,8 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// against trusted roots but does NOT check the hostname/SAN. This matches
 /// PostgreSQL's `sslmode=verify-ca` semantics.
 #[derive(Debug)]
-struct CaOnlyVerifier {
-    roots: Arc<rustls::RootCertStore>,
+pub(crate) struct CaOnlyVerifier {
+    pub(crate) roots: Arc<rustls::RootCertStore>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for CaOnlyVerifier {

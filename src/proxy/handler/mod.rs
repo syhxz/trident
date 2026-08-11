@@ -50,7 +50,7 @@ use crate::protocol::writer::encode_backend_message;
 use crate::protocol::ProtocolError;
 use crate::proxy::error::ProxyError;
 use crate::proxy::forwarder::ExtendedQueryRouteTracker;
-use crate::proxy::registry::{send_cancel_request_with_timeout, CancelRegistry, ConnectionRegistry, NodeAddress};
+use crate::proxy::registry::{CancelRegistry, ConnectionRegistry, NodeAddress};
 use crate::router::consistency::ConsistencyChecker;
 use crate::router::cost::CostEstimator;
 use crate::router::router::{RouteDecision, Router, RoutingContext};
@@ -966,10 +966,42 @@ where
             return;
         };
 
-        // FIX (TOCTOU): After establishing the TCP connection for the
-        // cancel but before sending, re-verify that the original session
-        // still has an active query on this backend_pid. If the connection
-        // was returned to the pool and reused, skip the cancel.
+        // Establish the TCP connection first, then verify the target is
+        // still active. This closes the TOCTOU window: if the original
+        // session's query finishes and the connection is reused between
+        // resolve and send, the post-connect check will catch it.
+        let connect_fut = tokio::net::TcpStream::connect((addr.host.as_str(), addr.port));
+        let mut stream = if self.cancel_connect_timeout.is_zero() {
+            match connect_fut.await {
+                Ok(s) => s,
+                Err(e) => {
+                    metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed")
+                        .increment(1);
+                    tracing::warn!(node_id = %node_id, error = %e, "failed to connect for CancelRequest");
+                    return;
+                }
+            }
+        } else {
+            match tokio::time::timeout(self.cancel_connect_timeout, connect_fut).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed")
+                        .increment(1);
+                    tracing::warn!(node_id = %node_id, error = %e, "failed to connect for CancelRequest");
+                    return;
+                }
+                Err(_) => {
+                    metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed")
+                        .increment(1);
+                    tracing::warn!(node_id = %node_id, "CancelRequest connect timed out");
+                    return;
+                }
+            }
+        };
+
+        // Post-connect verification: re-check that the session still has an
+        // active query on this backend_pid. The TCP connect may have taken
+        // time during which the connection was returned to the pool.
         if !self.cancel_registry.verify_cancel_target(&session_id, real_backend_pid) {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "stale").increment(1);
             tracing::debug!(
@@ -979,17 +1011,15 @@ where
             return;
         }
 
-        if let Err(e) = send_cancel_request_with_timeout(
-            addr,
-            real_backend_pid,
-            real_secret_key,
-            self.cancel_connect_timeout,
-        )
-        .await
-        {
+        use crate::protocol::writer::encode_frontend_message;
+        let bytes = encode_frontend_message(&FrontendMessage::CancelRequest {
+            backend_pid: real_backend_pid,
+            secret_key: real_secret_key,
+        });
+        if let Err(e) = stream.write_all(&bytes).await {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "send_failed")
                 .increment(1);
-            tracing::warn!(node_id = %node_id, error = %e, "failed to forward CancelRequest to backend");
+            tracing::warn!(node_id = %node_id, error = %e, "failed to send CancelRequest to backend");
         } else {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "forwarded")
                 .increment(1);
@@ -1110,10 +1140,12 @@ where
                             if !already_relayed {
                                 send_error_response(client_stream, &e).await?;
                             }
-                            send_ready_for_query(client_stream, session.state.tx_state).await?;
+                            // Transition internal state BEFORE sending RFQ so
+                            // the status byte reflects the actual proxy state.
                             if session.state.tx_state != TxState::Idle {
                                 self.fail_open_transaction(session);
                             }
+                            send_ready_for_query(client_stream, session.state.tx_state).await?;
                         }
                     }
                     client_stream

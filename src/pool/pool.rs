@@ -228,6 +228,37 @@ impl<'a> Drop for SlotGuard<'a> {
     }
 }
 
+/// RAII guard for a connection that has been removed from the idle queue for
+/// validation or cleaning. If the async future is cancelled (dropped) before
+/// the connection is returned to idle or explicitly discarded, the guard
+/// ensures the slot is released from `known_connections` and the counter is
+/// decremented, preventing capacity leaks.
+struct KnownSlotGuard<'a> {
+    known_connections: &'a Mutex<HashSet<(i32, i32)>>,
+    active_connections: &'a AtomicU32,
+    release_notify: &'a tokio::sync::Notify,
+    key: (i32, i32),
+    armed: bool,
+}
+
+impl<'a> KnownSlotGuard<'a> {
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<'a> Drop for KnownSlotGuard<'a> {
+    fn drop(&mut self) {
+        if self.armed {
+            let removed = self.known_connections.lock().remove(&self.key);
+            if removed {
+                self.active_connections.fetch_sub(1, Ordering::SeqCst);
+                self.release_notify.notify_one();
+            }
+        }
+    }
+}
+
 /// Default `ConnectionPool` implementation: manages the connection pool
 /// for a single backend node.
 pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
@@ -453,8 +484,23 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 continue;
             }
 
-            match self.cleaner.validate(&mut conn).await {
+            // Cancellation safety: arm a KnownSlotGuard so that if the
+            // validate future is cancelled, the slot is automatically
+            // released from known_connections and the counter decremented.
+            let mut slot_guard = KnownSlotGuard {
+                known_connections: &self.known_connections,
+                active_connections: &self.active_connections,
+                release_notify: &self.release_notify,
+                key: (conn.backend_pid, conn.secret_key),
+                armed: true,
+            };
+
+            let validate_result = self.cleaner.validate(&mut conn).await;
+
+            match validate_result {
                 Ok(()) => {
+                    // Defuse guard — we handle the connection ourselves.
+                    slot_guard.defuse();
                     // Re-check draining: if drain() was called while we
                     // were awaiting the validation query, discard instead
                     // of re-inserting into the idle queue.
@@ -472,6 +518,8 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                     }
                 }
                 Err(_) => {
+                    // Defuse guard — we discard explicitly.
+                    slot_guard.defuse();
                     // Connection is dead — discard it
                     self.cleaner.discard(&conn);
                     self.release_known_slot(&conn);
@@ -760,7 +808,20 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         }
 
         if conn.dirty {
-            match self.cleaner.clean(&mut conn).await {
+            // Cancellation safety: arm a KnownSlotGuard so that if the
+            // clean future is cancelled, the slot is released.
+            let mut slot_guard = KnownSlotGuard {
+                known_connections: &self.known_connections,
+                active_connections: &self.active_connections,
+                release_notify: &self.release_notify,
+                key: (conn.backend_pid, conn.secret_key),
+                armed: true,
+            };
+
+            let clean_result = self.cleaner.clean(&mut conn).await;
+            // Defuse the guard — from here we handle the slot explicitly.
+            slot_guard.defuse();
+            match clean_result {
                 Ok(()) => {
                     conn.dirty = false;
                     // Re-check draining after async clean: drain() may have

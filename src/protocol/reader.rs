@@ -331,6 +331,21 @@ pub trait MessageReader {
 pub(crate) async fn read_tagged_frame<R: AsyncRead + Unpin + Send>(
     stream: &mut R,
 ) -> Result<(u8, Vec<u8>), ProtocolError> {
+    read_tagged_frame_bounded(stream, MAX_MESSAGE_BODY_LEN).await
+}
+
+/// Maximum body length for normal protocol messages (256 MiB).
+const MAX_MESSAGE_BODY_LEN: i32 = 256 * 1024 * 1024;
+
+/// Maximum body length for authentication-phase messages (64 KiB).
+/// Prevents unauthenticated clients from forcing large allocations.
+pub(crate) const MAX_AUTH_MESSAGE_BODY_LEN: i32 = 64 * 1024;
+
+/// Read a tagged frame with a configurable maximum body length.
+pub(crate) async fn read_tagged_frame_bounded<R: AsyncRead + Unpin + Send>(
+    stream: &mut R,
+    max_body_len: i32,
+) -> Result<(u8, Vec<u8>), ProtocolError> {
     let mut tag_buf = [0u8; 1];
     match stream.read_exact(&mut tag_buf).await {
         Ok(_) => {}
@@ -351,9 +366,8 @@ pub(crate) async fn read_tagged_frame<R: AsyncRead + Unpin + Send>(
     if total_len < 4 {
         return Err(ProtocolError::InvalidLength(total_len));
     }
-    const MAX_MESSAGE_BODY_LEN: i32 = 256 * 1024 * 1024; // 256MiB cap, defensive guard
     let body_len = total_len - 4;
-    if body_len > MAX_MESSAGE_BODY_LEN {
+    if body_len > max_body_len {
         return Err(ProtocolError::InvalidLength(total_len));
     }
 
