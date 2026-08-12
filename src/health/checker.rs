@@ -544,6 +544,7 @@ async fn query_aurora_reader_status<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// Supports two formats:
 /// - Standard PostgreSQL: `"16/B374D848"` (hex/hex)
 /// - Aurora numeric: `"576765581"` (plain decimal integer)
+///
 /// Returns `None` for unparseable input or the zero LSN.
 pub fn parse_lsn(text: &str) -> Option<u64> {
     let trimmed = text.trim();
@@ -758,9 +759,31 @@ impl<P: HealthProbe> HealthChecker<P> {
                 // resolve their LSN (lazy_fallback optimization), the
                 // health checker periodically brings the global watermark
                 // up to the Writer's true position.
-                if node.node_type == NodeType::Writer {
+                //
+                // FIX: Only advance when the probe is successful AND
+                // confirmed as a Writer (role-aware check passed). A failed
+                // probe or role-mismatched node should not influence the
+                // global watermark.
+                //
+                // FIX (timeline isolation): If the Writer's LSN is lower
+                // than the current global LSN, this indicates a timeline
+                // switch (failover to a new primary with lower LSN). Reset
+                // the global watermark to the new Writer's position to
+                // prevent Global consistency reads from blocking forever.
+                if success && node.node_type == NodeType::Writer {
                     if let Some(ref tracker) = self.lsn_tracker {
-                        tracker.advance_global_lsn(lsn);
+                        let current_global = tracker.global_write_lsn();
+                        if lsn < current_global {
+                            tracing::warn!(
+                                node_id,
+                                writer_lsn = lsn,
+                                global_lsn = current_global,
+                                "Writer LSN is below global watermark — timeline switch detected, resetting global LSN"
+                            );
+                            tracker.reset_global_lsn(lsn);
+                        } else {
+                            tracker.advance_global_lsn(lsn);
+                        }
                     }
                 }
             }

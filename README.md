@@ -60,7 +60,7 @@ proxy:
 | Read-Only SELECT | 38,117 TPS | 32,542 TPS |
 | TPC-B Mixed R/W | 2,832 TPS | 2,991 TPS |
 
-**Security recommendation:** Enable client-facing TLS (`proxy.tls_cert`/`proxy.tls_key`) when using passthrough mode, since credentials are transmitted as cleartext between client and proxy before the TLS layer. Trident enforces this at config validation — passthrough without TLS is only allowed on loopback interfaces.
+**Security recommendation:** Enable client-facing TLS (`proxy.tls_cert`/`proxy.tls_key`) when using passthrough mode, since credentials are transmitted as cleartext between client and proxy before the TLS layer. Trident emits a startup warning when passthrough is configured without TLS on a non-loopback interface, but does not block startup — this allows gradual TLS rollout in development environments.
 
 **Security features:**
 - Credentials are verified against the backend Writer **before** telling the client authentication succeeded
@@ -335,7 +335,7 @@ Enable with `admin.enabled: true` (default listen: `127.0.0.1:9090`):
 | `/client-stats` | GET | Per-IP client connection statistics |
 | `/custom-rules` | GET/POST/DELETE | Dynamic custom routing rules |
 
-**Security**: The admin interface has no authentication. Bind to a private address and restrict access via firewall/security groups.
+**Security**: When `admin.auth_token` is configured, all management endpoints (except `/metrics` and `/healthz`) require a `Bearer` token in the `Authorization` header. WebSocket endpoints (`/ws/logs`) also accept the token via a `?token=` query parameter. If no token is configured, protected routes are blocked entirely (fail-closed). Always bind to a private address or restrict access via firewall/security groups.
 
 ## Hot Reload
 

@@ -133,7 +133,12 @@ admin:
 
 ### Security
 
-The admin interface has **no authentication**. Always:
+When `admin.auth_token` is configured, all management endpoints (reload, custom-rules, config, stats, logs) require a `Authorization: Bearer <token>` header (or `?token=<token>` query parameter for WebSocket). Public endpoints (`/metrics`, `/healthz`, static console assets) remain accessible without a token.
+
+When no token is configured, all management endpoints are **blocked** (fail-closed) — only `/metrics`, `/healthz`, and static assets are served. This prevents accidental data exposure.
+
+Best practices:
+- Always set `admin.auth_token` in production
 - Bind to a private/loopback address
 - Restrict network access via firewall/security groups
 - Never expose to the public internet

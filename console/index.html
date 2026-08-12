@@ -594,11 +594,20 @@ document.getElementById('btn-save-routing').addEventListener('click', async () =
 });
 
 // Config: Rules
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
 async function fetchRules() {
   try {
     const data = await api('/custom-rules');
     const tbody = document.querySelector('#rules-table tbody');
-    tbody.innerHTML = data.map(r => `<tr><td>${r._name}</td><td>${r._type==='t'?'Table':'Function'}</td><td>${r.rw_mode==='w'?'Writer-only':'Reader-eligible'}</td><td><button class="btn btn-danger btn-sm" onclick="deleteRule('${r._name}','${r._type}')">Delete</button></td></tr>`).join('');
+    tbody.innerHTML = data.map(r => `<tr><td>${escapeHtml(r._name)}</td><td>${r._type==='t'?'Table':'Function'}</td><td>${r.rw_mode==='w'?'Writer-only':'Reader-eligible'}</td><td><button class="btn btn-danger btn-sm" data-rule-name="${escapeHtml(r._name)}" data-rule-type="${escapeHtml(r._type)}">Delete</button></td></tr>`).join('');
+    // Bind delete handlers via event delegation (avoids inline onclick with unescaped data)
+    tbody.querySelectorAll('button[data-rule-name]').forEach(btn => {
+      btn.addEventListener('click', () => deleteRule(btn.dataset.ruleName, btn.dataset.ruleType));
+    });
   } catch(e) { console.error(e); }
 }
 document.getElementById('btn-add-rule').addEventListener('click', async () => {
@@ -657,7 +666,10 @@ async function fetchPoolConfig() {
 function connectLogs() {
   if (logWs && logWs.readyState <= 1) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  logWs = new WebSocket(proto + '//' + location.host + '/ws/logs');
+  // Pass auth token via query parameter since browsers cannot set custom
+  // headers on WebSocket connections.
+  const tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';
+  logWs = new WebSocket(proto + '//' + location.host + '/ws/logs' + tokenParam);
   logWs.onmessage = (ev) => {
     logBuffer.push(ev.data);
     if (logBuffer.length > MAX_LOG_LINES) logBuffer.shift();

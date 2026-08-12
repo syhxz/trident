@@ -302,6 +302,38 @@ struct AdminState {
 /// Bearer token authentication middleware. Checks the `Authorization`
 /// header against the configured token. Returns 401 if missing/invalid.
 /// Uses constant-time comparison to prevent timing side-channel attacks.
+///
+/// For WebSocket connections (which cannot set custom headers from browser
+/// JavaScript), the token may also be provided via the `token` query
+/// parameter. Header-based auth takes priority over query parameter.
+///
+/// Simple percent-decoding for query parameter values (handles %XX escapes
+/// and '+' as space). No external crate needed for this limited use case.
+fn percent_decode(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 async fn auth_middleware(
     state: Arc<AdminState>,
     req: axum::http::Request<axum::body::Body>,
@@ -320,12 +352,29 @@ async fn auth_middleware(
                 .into_response();
         }
     };
+
+    // Try Authorization header first, then fall back to query parameter
+    // (needed for WebSocket connections from browsers).
     let provided = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
+        .map(|s| s.to_string())
+        .or_else(|| {
+            req.uri().query().and_then(|q| {
+                q.split('&')
+                    .find_map(|pair| {
+                        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                        if k == "token" {
+                            Some(percent_decode(v))
+                        } else {
+                            None
+                        }
+                    })
+            })
+        })
+        .unwrap_or_default();
 
     // Constant-time comparison to prevent timing attacks
     use subtle::ConstantTimeEq;
@@ -919,6 +968,7 @@ async fn config_get_handler(State(state): State<Arc<AdminState>>) -> impl IntoRe
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigPutBody {
     default_consistency: Option<String>,
     enable_transaction_split: Option<bool>,

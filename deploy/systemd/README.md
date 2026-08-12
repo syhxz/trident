@@ -41,8 +41,8 @@ sudo journalctl -u trident -f
   does not need filesystem write access at runtime (unless file logging is configured; see
   `ReadWritePaths`).
 - If Trident supports SIGHUP hot-reload (see the hot-reload section in `DEPLOYMENT.md`), you
-  can trigger it with `systemctl reload trident` (requires adding
-  `ExecReload=/bin/kill -HUP $MAINPID` to the unit file).
+  can trigger it with `systemctl reload trident`. The provided unit file already includes
+  `ExecReload=/bin/kill -HUP $MAINPID`, so no additional configuration is needed.
 
 ## Log Files and logrotate (optional)
 

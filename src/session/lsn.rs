@@ -42,6 +42,13 @@ pub trait LsnTracker: Send + Sync {
     /// preventing staleness when sessions with `pending_write` never
     /// resolve their LSN (the "lazy_fallback Global consistency gap").
     fn advance_global_lsn(&self, lsn: u64);
+
+    /// Resets the global write LSN to `lsn`, even if it is lower than the
+    /// current value. Used when a Writer failover or timeline switch is
+    /// detected — the new Writer may have a lower LSN than the old one.
+    /// Without this, Global consistency reads would block forever waiting
+    /// for the new Writer to reach the old watermark.
+    fn reset_global_lsn(&self, lsn: u64);
 }
 
 /// Default `LsnTracker` implementation based on an in-memory `HashMap` plus
@@ -118,6 +125,10 @@ impl LsnTracker for InMemoryLsnTracker {
                 Err(actual) => current = actual,
             }
         }
+    }
+
+    fn reset_global_lsn(&self, lsn: u64) {
+        self.global_lsn.store(lsn, Ordering::SeqCst);
     }
 }
 

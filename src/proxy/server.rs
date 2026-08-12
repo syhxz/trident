@@ -349,9 +349,25 @@ where
         };
 
         // Compute remaining time for auth phase from the shared deadline.
-        let remaining_startup_timeout = deadline
-            .map(|dl| dl.saturating_duration_since(tokio::time::Instant::now()))
-            .unwrap_or(std::time::Duration::ZERO);
+        // FIX: When a deadline was configured but TLS consumed all the time,
+        // `saturating_duration_since` returns ZERO. Previously this was
+        // indistinguishable from "no timeout configured" (both ZERO). Now
+        // we detect the expired case and fail immediately.
+        let remaining_startup_timeout = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    // Deadline already passed during TLS negotiation.
+                    return Err(crate::proxy::error::ProxyError::Protocol(
+                        crate::protocol::ProtocolError::Malformed(
+                            "startup timeout exceeded during TLS negotiation".into(),
+                        ),
+                    ));
+                }
+                remaining
+            }
+            None => std::time::Duration::ZERO, // No deadline → no timeout (handler treats ZERO as disabled)
+        };
 
         // Load the current node address snapshot for this connection's
         // lifetime. Dynamic add/remove updates the ArcSwap, so new

@@ -259,6 +259,24 @@ impl<'a> Drop for KnownSlotGuard<'a> {
     }
 }
 
+/// RAII guard that removes a session_id from `session_checkouts` on drop
+/// (if still armed). Ensures cancel safety: if `acquire_session_mode`'s
+/// future is dropped while awaiting a connection, the checkout marker is
+/// cleaned up automatically.
+struct SessionCheckoutGuard<'a> {
+    checkouts: &'a Mutex<HashSet<String>>,
+    session_id: String,
+    armed: bool,
+}
+
+impl<'a> Drop for SessionCheckoutGuard<'a> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.checkouts.lock().remove(&self.session_id);
+        }
+    }
+}
+
 /// Default `ConnectionPool` implementation: manages the connection pool
 /// for a single backend node.
 pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
@@ -495,7 +513,22 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 armed: true,
             };
 
-            let validate_result = self.cleaner.validate(&mut conn).await;
+            // FIX: Wrap validate with a timeout to prevent infinite hangs
+            // when the backend stops responding (e.g. network partition).
+            let validate_result = match tokio::time::timeout(
+                self.settings.connection_timeout,
+                self.cleaner.validate(&mut conn),
+            ).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        backend_pid = conn.backend_pid,
+                        "validate timed out — discarding connection"
+                    );
+                    Err(PoolError::CleanupFailed("validate timeout".into()))
+                }
+            };
 
             match validate_result {
                 Ok(()) => {
@@ -604,6 +637,16 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             }
         }
 
+        // FIX (cancel safety): Use a guard that removes the session_checkouts
+        // entry if this future is dropped (cancelled) before completion.
+        // Without this, a cancelled acquire leaves a stale entry that blocks
+        // all future acquires for this session.
+        let mut checkout_guard = SessionCheckoutGuard {
+            checkouts: &self.session_checkouts,
+            session_id: session_id.to_string(),
+            armed: true,
+        };
+
         let result = if let Some(conn) = self.take_reusable_idle() {
             Ok(conn)
         } else if self.try_reserve_slot() {
@@ -614,11 +657,14 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
 
         match result {
             Ok(conn) => {
+                // Success — keep the checkout marker, disarm the guard.
+                checkout_guard.armed = false;
                 self.record_checkout(&conn);
                 Ok(conn)
             }
             Err(error) => {
-                self.session_checkouts.lock().remove(session_id);
+                // Guard will clean up on drop, but we can also do it explicitly.
+                // (armed=true → drop will remove the entry)
                 Err(error)
             }
         }
@@ -818,7 +864,22 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 armed: true,
             };
 
-            let clean_result = self.cleaner.clean(&mut conn).await;
+            // FIX: Wrap clean with a timeout to prevent infinite hangs
+            // when the backend stops responding (e.g. network partition).
+            let clean_result = match tokio::time::timeout(
+                self.settings.connection_timeout,
+                self.cleaner.clean(&mut conn),
+            ).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        node_id = %self.node_id,
+                        backend_pid = conn.backend_pid,
+                        "clean (DISCARD ALL) timed out — discarding connection"
+                    );
+                    Err(PoolError::CleanupFailed("clean timeout".into()))
+                }
+            };
             // Defuse the guard — from here we handle the slot explicitly.
             slot_guard.defuse();
             match clean_result {

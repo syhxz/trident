@@ -49,10 +49,12 @@ spec:
               cpu: "1"
               memory: "512Mi"
           # Requires `admin.enabled: true` and `admin.listen_addr:
-          # "0.0.0.0:9090"` in config.yaml (see DEPLOYMENT.md section 4) --
-          # the admin endpoint is unauthenticated by design, so it is only
-          # ever reachable from inside the pod network here (no Service
-          # exposes it), never from outside the cluster.
+          # "0.0.0.0:9090"` in config.yaml (see DEPLOYMENT.md section 4).
+          # /healthz and /metrics are always accessible without auth, even
+          # when `admin.auth_token` is configured. Protected management
+          # endpoints require a Bearer token. The admin port is only
+          # reachable from inside the pod network (no Service exposes it),
+          # never from outside the cluster.
           readinessProbe:
             httpGet:
               path: /healthz

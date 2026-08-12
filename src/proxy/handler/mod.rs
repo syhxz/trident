@@ -142,6 +142,12 @@ pub struct ClientSession {
     /// creates a portal for a COMMIT/ROLLBACK statement, record it here
     /// so a subsequent Execute-only batch can resolve the tag.
     failed_state_portals: HashMap<String, &'static str>,
+    /// Virtual prepared statements for proxy-local SET commands (e.g.
+    /// `SET trident.consistency = ...`). When a Parse-only batch creates
+    /// a named statement for a local SET, it is recorded here so that a
+    /// subsequent cross-Sync Bind can resolve it locally without
+    /// forwarding to a backend that never received the Parse.
+    local_set_stmts: HashMap<String, String>,
 }
 
 /// A complete backend connection checked out exclusively by this client.
@@ -275,6 +281,7 @@ impl ClientSession {
             resolved_pools: HashMap::new(),
             application_name: String::new(),
             failed_state_portals: HashMap::new(),
+            local_set_stmts: HashMap::new(),
         }
     }
 
@@ -762,14 +769,46 @@ where
                                         error = %pool_err,
                                         "passthrough credential verification failed against backend"
                                     );
-                                    let pg_err = PgError::simple(
-                                        "FATAL",
-                                        "28P01",
-                                        &format!(
-                                            "password authentication failed for user \"{}\"",
-                                            creds.username
+                                    // FIX: Map pool errors to appropriate PG
+                                    // error codes instead of always 28P01.
+                                    // Infrastructure errors should not appear
+                                    // as authentication failures to the client.
+                                    let (code, msg) = match &pool_err {
+                                        crate::pool::pool::PoolError::Exhausted(_) => (
+                                            "53300",
+                                            "too many connections".to_string(),
                                         ),
-                                    );
+                                        crate::pool::pool::PoolError::AcquireTimeout { .. } => (
+                                            "53300",
+                                            "connection pool acquire timeout".to_string(),
+                                        ),
+                                        crate::pool::pool::PoolError::ConnectTimeout { .. } => (
+                                            "08006",
+                                            "backend connection timeout".to_string(),
+                                        ),
+                                        crate::pool::pool::PoolError::ConnectFailed(detail) => {
+                                            // ConnectFailed wraps backend auth errors
+                                            // (e.g. "password authentication failed")
+                                            // as well as TCP errors. Check if it looks
+                                            // like an auth error.
+                                            if detail.contains("28P01") || detail.contains("authentication failed") {
+                                                ("28P01", format!(
+                                                    "password authentication failed for user \"{}\"",
+                                                    creds.username
+                                                ))
+                                            } else {
+                                                ("08006", format!("backend connection failed: {}", detail))
+                                            }
+                                        }
+                                        _ => (
+                                            "28P01",
+                                            format!(
+                                                "password authentication failed for user \"{}\"",
+                                                creds.username
+                                            ),
+                                        ),
+                                    };
+                                    let pg_err = PgError::simple("FATAL", code, &msg);
                                     send_pg_error_response(&mut client_stream, pg_err).await?;
                                     client_stream
                                         .flush()

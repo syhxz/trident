@@ -233,12 +233,15 @@ logging:
 
 # Admin/observability HTTP server: GET /metrics (Prometheus),
 # GET /healthz (liveness/readiness), and POST /reload (hot reload, see
-# below). Disabled by default. This endpoint is UNAUTHENTICATED -- if
-# enabled, bind it to a private/internal address only and restrict network
-# access to it (see DEPLOYMENT.md).
+# below). Disabled by default. When `auth_token` is set, management
+# endpoints require a Bearer token; /metrics and /healthz remain public.
+# When no token is configured, all management endpoints are blocked
+# (fail-closed). Always bind to a private/internal address and restrict
+# network access (see DEPLOYMENT.md).
 admin:
   enabled: false
   listen_addr: "127.0.0.1:9090"
+  # auth_token: "your-secret-token-here"
 
 # Hot reload: send SIGHUP to the process, or POST to /reload above, to
 # re-read this file and apply these routing settings WITHOUT a restart:

@@ -72,6 +72,27 @@ pub(super) fn assemble_extended_outbound(batch: &[ExtendedFrame]) -> Vec<u8> {
     outbound
 }
 
+/// Like `assemble_extended_outbound` but skips frames at the specified indices.
+pub(super) fn assemble_extended_outbound_filtered(batch: &[ExtendedFrame], skip: &[usize]) -> Vec<u8> {
+    const SYNC_FRAME: [u8; 5] = [b'S', 0, 0, 0, 4];
+    let total: usize = batch.iter().enumerate()
+        .filter(|(i, _)| !skip.contains(i))
+        .map(|(_, f)| 5 + f.body.len())
+        .sum::<usize>() + SYNC_FRAME.len();
+    let mut outbound = Vec::with_capacity(total);
+    for (i, frame) in batch.iter().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        let len = (frame.body.len() as u32 + 4).to_be_bytes();
+        outbound.push(frame.tag);
+        outbound.extend_from_slice(&len);
+        outbound.extend_from_slice(&frame.body);
+    }
+    outbound.extend_from_slice(&SYNC_FRAME);
+    outbound
+}
+
 /// Records named-statement routes and forgets closed ones.
 pub(super) fn record_statement_routes(
     session: &mut ClientSession,
@@ -95,6 +116,10 @@ pub(super) fn record_statement_routes(
                 if let Some((b'S', name)) = frame.kind_and_name() {
                     if !name.is_empty() {
                         session.extended_route_tracker.forget_statement(name);
+                        // FIX (Bug 4): Clean up virtual prepared statement
+                        // caches when a statement is explicitly closed.
+                        session.state.prepared_stmts.remove(name);
+                        session.local_set_stmts.remove(name);
                     } else {
                         session.unnamed_parse_node = None;
                     }
