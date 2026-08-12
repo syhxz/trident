@@ -54,56 +54,181 @@ where
         // physical connection already lost, the batch must not run as
         // autocommit on a fresh connection. Match the Simple Query path.
         //
-        // FIX (Bug 8/9): Allow ROLLBACK/COMMIT through to reset the Failed
-        // state, matching the Simple Query path's recovery logic. Only
-        // recognize a transaction-end if the batch contains Parse + Bind +
-        // Execute (i.e. the client intends to actually run the command, not
-        // just prepare it). Use the actual command tag (COMMIT or ROLLBACK).
+        // FIX (Bug 2): Allow ROLLBACK/COMMIT through to reset the Failed
+        // state, matching the Simple Query path's recovery logic.
+        //  (a) Verify Bind references the same statement name as the Parse
+        //      that contains the COMMIT/ROLLBACK SQL.
+        //  (b) COMMIT in Failed state must report as ROLLBACK (PostgreSQL
+        //      semantics: COMMIT inside a failed transaction rolls back).
+        //  (c) Support cross-Sync: when no Parse is in the batch but Bind
+        //      references a previously prepared COMMIT/ROLLBACK statement,
+        //      use `prepared_stmts` cache to resolve the SQL.
         if session.state.tx_state == TxState::Failed && session.held_backend.is_none() {
-            // Find the transaction-ending Parse SQL (if any).
-            let txn_end_tag = batch.iter().find_map(|frame| {
-                if frame.tag == frontend_tag::PARSE {
-                    frame.parse_sql().and_then(crate::session::transaction::transaction_end_tag)
-                } else {
-                    None
+            // Step 0: Check for Execute-only batch referencing a previously
+            // bound virtual portal (cross-Sync Execute after Parse+Bind).
+            let execute_only_tag = if !batch.iter().any(|f| f.tag == frontend_tag::PARSE)
+                && !batch.iter().any(|f| f.tag == frontend_tag::BIND)
+            {
+                batch.iter()
+                    .filter(|f| f.tag == frontend_tag::EXECUTE)
+                    .find_map(|f| {
+                        f.execute_portal()
+                            .and_then(|p| session.failed_state_portals.get(p).copied())
+                    })
+            } else {
+                None
+            };
+
+            if let Some(tag) = execute_only_tag {
+                // Execute-only batch for a virtual COMMIT/ROLLBACK portal.
+                let effective_tag = if tag == "COMMIT" { "ROLLBACK" } else { tag };
+                session.state.tx_state = TxState::Idle;
+                session.state.tx_split = None;
+                session.tx_has_writes = false;
+                session.failed_state_portals.clear();
+                let cmd = crate::protocol::writer::encode_backend_message(
+                    &crate::protocol::message::BackendMessage::CommandComplete {
+                        tag: effective_tag.to_string(),
+                    },
+                );
+                client_stream.write_all(&cmd).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                let has_sync = batch.iter().any(|f| f.tag == frontend_tag::SYNC);
+                if has_sync {
+                    send_ready_for_query(client_stream, TxState::Idle).await?;
                 }
-            });
-            // Only act on it if the batch also has Bind + Execute (meaning
-            // the client intends to execute, not just prepare the statement).
-            let has_bind = batch.iter().any(|f| f.tag == frontend_tag::BIND);
-            let has_execute = batch.iter().any(|f| f.tag == frontend_tag::EXECUTE);
+                return Ok(());
+            }
+
+            // Step 1: Find transaction-ending SQL, either from a Parse in
+            // this batch or from the prepared_stmts cache via Bind.
+            let mut txn_end_tag: Option<&'static str> = None;
+            let mut txn_parse_stmt_name: Option<&str> = None;
+
+            // Check Parse frames in this batch for COMMIT/ROLLBACK.
+            for frame in batch.iter().filter(|f| f.tag == frontend_tag::PARSE) {
+                if let Some(sql) = frame.parse_sql() {
+                    if let Some(tag) = crate::session::transaction::transaction_end_tag(sql) {
+                        txn_end_tag = Some(tag);
+                        txn_parse_stmt_name = frame.parse_name();
+                        // Record in prepared_stmts cache for cross-Sync support.
+                        if let Some(name) = frame.parse_name() {
+                            if !name.is_empty() {
+                                session.state.prepared_stmts.insert(name.to_string(), sql.to_string());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // (c) Cross-Sync: no Parse with COMMIT/ROLLBACK in this batch,
+            // but Bind may reference a previously prepared statement.
+            if txn_end_tag.is_none() {
+                for frame in batch.iter().filter(|f| f.tag == frontend_tag::BIND) {
+                    if let Some(stmt_name) = frame.bind_statement() {
+                        if let Some(cached_sql) = session.state.prepared_stmts.get(stmt_name) {
+                            if let Some(tag) = crate::session::transaction::transaction_end_tag(cached_sql) {
+                                txn_end_tag = Some(tag);
+                                txn_parse_stmt_name = Some(stmt_name);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             if let Some(tag) = txn_end_tag {
-                if has_bind && has_execute {
+                // (a) Verify Bind references the correct statement.
+                let has_matching_bind = txn_parse_stmt_name.map_or(false, |stmt_name| {
+                    batch.iter().any(|f| {
+                        f.tag == frontend_tag::BIND
+                            && f.bind_statement() == Some(stmt_name)
+                    })
+                });
+
+                // Find the portal created by the matching Bind.
+                let txn_portal_name = txn_parse_stmt_name.and_then(|stmt_name| {
+                    batch.iter()
+                        .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(stmt_name))
+                        .find_map(|f| f.bind_portal())
+                });
+
+                // Verify Execute references the correct portal.
+                let has_matching_execute = txn_portal_name.map_or(false, |portal| {
+                    batch.iter().any(|f| {
+                        f.tag == frontend_tag::EXECUTE
+                            && f.execute_portal() == Some(portal)
+                    })
+                });
+
+                if has_matching_bind && has_matching_execute {
+                    // (b) COMMIT in Failed state becomes ROLLBACK.
+                    let effective_tag = if tag == "COMMIT" { "ROLLBACK" } else { tag };
+
                     // Full execution cycle: reset to Idle.
                     session.state.tx_state = TxState::Idle;
                     session.state.tx_split = None;
                     session.tx_has_writes = false;
-                    // Synthetic ParseComplete + BindComplete + CommandComplete(tag) + RFQ(I)
+                    session.failed_state_portals.clear();
+                    // Synthetic ParseComplete + BindComplete + CommandComplete + RFQ(I)
                     let parse_complete = [b'1', 0, 0, 0, 4];
                     let bind_complete = [b'2', 0, 0, 0, 4];
                     let cmd = crate::protocol::writer::encode_backend_message(
                         &crate::protocol::message::BackendMessage::CommandComplete {
-                            tag: tag.to_string(),
+                            tag: effective_tag.to_string(),
                         },
                     );
-                    client_stream.write_all(&parse_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    // Only emit ParseComplete if there was a Parse in this batch.
+                    let has_parse_in_batch = batch.iter().any(|f| f.tag == frontend_tag::PARSE);
+                    if has_parse_in_batch {
+                        client_stream.write_all(&parse_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    }
                     client_stream.write_all(&bind_complete).await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     client_stream.write_all(&cmd).await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     send_ready_for_query(client_stream, TxState::Idle).await?;
                     return Ok(());
-                } else {
-                    // Parse-only: client is preparing the statement but not
-                    // executing yet. Return ParseComplete without changing
-                    // transaction state.
+                } else if has_matching_bind && !has_matching_execute {
+                    // Parse+Bind without Execute: the client is preparing
+                    // and binding but not yet executing. Return
+                    // ParseComplete + BindComplete without changing tx state.
+                    // Record the portal for cross-Sync Execute-only support.
+                    if let Some(portal) = txn_portal_name {
+                        session.failed_state_portals.insert(portal.to_string(), tag);
+                    }
+                    let has_sync = batch.iter().any(|f| f.tag == frontend_tag::SYNC);
+                    let has_parse_in_batch = batch.iter().any(|f| f.tag == frontend_tag::PARSE);
+                    if has_parse_in_batch {
+                        let parse_complete = [b'1', 0, 0, 0, 4];
+                        client_stream.write_all(&parse_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    }
+                    let bind_complete = [b'2', 0, 0, 0, 4];
+                    client_stream.write_all(&bind_complete).await
+                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    if has_sync {
+                        send_ready_for_query(client_stream, TxState::Failed).await?;
+                    }
+                    return Ok(());
+                } else if !has_matching_bind && !has_matching_execute {
+                    // Parse-only (no Bind/Execute): client is preparing
+                    // the statement but not executing yet. Record it and
+                    // return ParseComplete. Do NOT send RFQ unless there's
+                    // a Sync in the batch.
+                    let has_sync = batch.iter().any(|f| f.tag == frontend_tag::SYNC);
                     let parse_complete = [b'1', 0, 0, 0, 4];
                     client_stream.write_all(&parse_complete).await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    send_ready_for_query(client_stream, TxState::Failed).await?;
+                    if has_sync {
+                        send_ready_for_query(client_stream, TxState::Failed).await?;
+                    }
                     return Ok(());
                 }
+                // If Bind is present but references a different statement,
+                // fall through to the 25P02 error below.
             }
 
             let error = PgError::simple(
@@ -122,47 +247,82 @@ where
         // But first: intercept proxy-local SET trident.consistency even on
         // the held path — this GUC must never reach the backend.
         if session.held_backend.is_some() {
-            // Check if this is a single-Parse consistency SET batch.
-            let held_route_sql = batch.iter()
+            // Find the SET consistency Parse frame (if any).
+            let set_parse = batch.iter()
                 .filter(|f| f.tag == frontend_tag::PARSE)
-                .find_map(|f| f.parse_sql());
-            if let Some(sql) = held_route_sql {
-                if session.state.is_consistency_set_command(sql) {
-                    let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
-                    let has_execute = batch.iter().any(|f| f.tag == frontend_tag::EXECUTE);
-                    let has_bind = batch.iter().any(|f| f.tag == frontend_tag::BIND);
-                    if parse_count <= 1 {
-                        if has_bind && has_execute {
-                            session.state.apply_consistency_set_command(sql);
-                            use crate::protocol::writer::encode_backend_message;
-                            use crate::protocol::message::BackendMessage;
-                            let parse_complete = [b'1', 0, 0, 0, 4];
-                            let bind_complete = [b'2', 0, 0, 0, 4];
-                            let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                                tag: "SET".to_string(),
-                            });
-                            client_stream.write_all(&parse_complete).await
-                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                            client_stream.write_all(&bind_complete).await
-                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                            client_stream.write_all(&cmd_complete).await
-                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                .find(|f| {
+                    f.parse_sql()
+                        .map(|s| session.state.is_consistency_set_command(s))
+                        .unwrap_or(false)
+                });
+
+            if let Some(set_frame) = set_parse {
+                let sql = set_frame.parse_sql().unwrap(); // safe: filter above
+                let set_stmt_name = set_frame.parse_name().unwrap_or("");
+
+                // FIX (Bug 1): Verify Bind references THIS Parse's statement name.
+                let has_matching_bind = batch.iter().any(|f| {
+                    f.tag == frontend_tag::BIND
+                        && f.bind_statement() == Some(set_stmt_name)
+                });
+
+                // Find the portal created by the matching Bind.
+                let set_portal_name = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(set_stmt_name))
+                    .find_map(|f| f.bind_portal());
+
+                // Verify Execute references the correct portal.
+                let has_matching_execute = set_portal_name.map_or(false, |portal| {
+                    batch.iter().any(|f| {
+                        f.tag == frontend_tag::EXECUTE
+                            && f.execute_portal() == Some(portal)
+                    })
+                });
+
+                let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
+                let has_sync = batch.iter().any(|f| f.tag == frontend_tag::SYNC);
+
+                if parse_count <= 1 {
+                    if has_matching_bind && has_matching_execute {
+                        // Full Parse+Bind+Execute for the SET: apply and respond.
+                        session.state.apply_consistency_set_command(sql);
+                        use crate::protocol::writer::encode_backend_message;
+                        use crate::protocol::message::BackendMessage;
+                        let parse_complete = [b'1', 0, 0, 0, 4];
+                        let bind_complete = [b'2', 0, 0, 0, 4];
+                        let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                            tag: "SET".to_string(),
+                        });
+                        client_stream.write_all(&parse_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        client_stream.write_all(&bind_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        client_stream.write_all(&cmd_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        if has_sync {
                             send_ready_for_query(client_stream, session.state.tx_state).await?;
-                            return Ok(());
-                        } else {
-                            // Parse-only: don't apply yet.
-                            let parse_complete = [b'1', 0, 0, 0, 4];
-                            client_stream.write_all(&parse_complete).await
-                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                            send_ready_for_query(client_stream, session.state.tx_state).await?;
-                            return Ok(());
                         }
+                        return Ok(());
+                    } else if !has_matching_bind {
+                        // Parse-only: don't apply yet. Return ParseComplete.
+                        // FIX (Bug 1): Only send RFQ if Sync is present.
+                        let parse_complete = [b'1', 0, 0, 0, 4];
+                        client_stream.write_all(&parse_complete).await
+                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        if has_sync {
+                            send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        }
+                        return Ok(());
                     }
-                    // Multi-Parse: apply if executing, then fall through to
-                    // forward remaining batch to held backend.
-                    if has_execute {
+                    // Bind references a DIFFERENT statement than the SET Parse →
+                    // do NOT intercept, fall through to forward to backend.
+                } else {
+                    // Multi-Parse pipeline batch: apply SET only if there is
+                    // a matching Bind+Execute for the SET's statement.
+                    if has_matching_bind && has_matching_execute {
                         session.state.apply_consistency_set_command(sql);
                     }
+                    // Fall through to forward remaining batch to held backend.
                 }
             }
         }
@@ -182,26 +342,37 @@ where
                 if !split.active {
                     let begin_sql = split.begin_sql().to_string();
                     let held = session.held_backend.as_mut().expect("checked above");
-                    let begin_bytes = crate::protocol::writer::encode_query(&begin_sql);
-                    held.conn.stream.write_all(&begin_bytes).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    held.conn.stream.flush().await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    // Drain the BEGIN response (CommandComplete + ReadyForQuery).
-                    loop {
-                        let msg = crate::protocol::reader::read_backend_message(
-                            &mut held.conn.stream,
-                        )
-                        .await
-                        .map_err(ProxyError::Protocol)?;
-                        if matches!(msg, crate::protocol::message::BackendMessage::ReadyForQuery(_))
+                    // FIX (Bug 4): Use execute_internal_query which properly
+                    // validates ErrorResponse and confirms the final transaction
+                    // status is InTransaction. The previous manual loop ignored
+                    // errors and unconditionally marked the split as active.
+                    if let Err(error) = execute_internal_query(
+                        &mut held.conn.stream,
+                        &begin_sql,
+                        TransactionStatus::InTransaction,
+                    )
+                    .await
+                    {
+                        // BEGIN failed — the backend is not in a transaction.
+                        // Mark session as Failed and discard the held backend.
+                        session.state.tx_state = TxState::Failed;
+                        let held = session.held_backend.take().unwrap();
+                        if let Some(pool) =
+                            self.resolve_pool_existing(&held.conn.node_id, session)
                         {
-                            break;
+                            let _ = pool.discard(held.conn);
                         }
+                        return Err(ProxyError::Protocol(error));
                     }
-                    // Mark the split as active now that BEGIN was sent.
+                    // Mark the split as active now that BEGIN succeeded.
                     // Determine on_reader by checking if the held node is a writer.
-                    let held_node_id = held.conn.node_id.clone();
+                    let held_node_id = session
+                        .held_backend
+                        .as_ref()
+                        .expect("checked above")
+                        .conn
+                        .node_id
+                        .clone();
                     let is_writer = self
                         .pool_manager
                         .snapshot()
@@ -228,6 +399,13 @@ where
                 let batch_has_write = batch.iter().any(|frame| {
                     if frame.tag == frontend_tag::PARSE {
                         if let Some(sql) = frame.parse_sql() {
+                            // COMMIT/ROLLBACK are classified as SqlKind::Other
+                            // (not readable), but they MUST NOT trigger a
+                            // Reader→Writer upgrade. They should complete on
+                            // the current Reader to end the transaction there.
+                            if crate::session::transaction::transaction_end_tag(sql).is_some() {
+                                return false;
+                            }
                             let kind = KeywordClassifier.classify(sql);
                             return requires_writer(&KeywordClassifier, sql) || !kind.readable();
                         }
@@ -313,6 +491,12 @@ where
         // (ForceWriter vs ForceReader), Writer wins for safety.
         let mut route_sql: Option<&str> = None;
         let mut force_writer = false;
+        // FIX (Bug 6): Separate flag for SQL that semantically produces
+        // writes vs. routing hints that merely direct traffic to Writer.
+        // Only `sql_is_write` should seed `write_detected` for LSN tracking;
+        // a ForceWriter hint on a SELECT should not create a fake write
+        // watermark that forces subsequent reads to Writer.
+        let mut sql_is_write = false;
         let classifier = KeywordClassifier;
         let hint_parser = crate::parser::hint::RegexHintParser;
         use crate::parser::hint::{HintParser as _, RouteHint};
@@ -334,6 +518,7 @@ where
                 if requires_writer(&classifier, sql) || !kind.readable() {
                     route_sql = Some(sql);
                     force_writer = true;
+                    sql_is_write = true;
                 }
             }
             // Check routing hints — ForceWriter wins over ForceReader.
@@ -347,6 +532,8 @@ where
                     RouteHint::ForceWriter => {
                         route_sql = Some(sql);
                         force_writer = true;
+                        // Note: sql_is_write is NOT set here — a routing
+                        // hint does not imply the query produces writes.
                     }
                     RouteHint::ForceReader
                         if !requires_writer(&classifier, route_sql.unwrap_or("")) =>
@@ -358,6 +545,22 @@ where
                     _ => {}
                 }
             }
+            // FIX (Bug 5): Check custom routing rules for each Parse in the
+            // batch, not just the final sql passed to Router::route(). A
+            // custom rule that forces writer for "SELECT * FROM sensitive_table"
+            // must not be bypassed simply because a later Parse in the batch
+            // (e.g. "SELECT 1") overwrites route_sql.
+            if !force_writer {
+                if let Some(custom_rules) = self.router.custom_rules() {
+                    if custom_rules.forces_writer(sql).is_some() {
+                        route_sql = Some(sql);
+                        force_writer = true;
+                        // Custom rules forcing writer doesn't necessarily mean
+                        // the SQL produces writes (it may be a sensitive read).
+                        // Do NOT set sql_is_write here.
+                    }
+                }
+            }
         }
 
         // Intercept `SET trident.consistency = '...'` in extended protocol.
@@ -365,25 +568,50 @@ where
         // should not reach the backend. However, per PostgreSQL extended
         // protocol semantics, Parse only creates a prepared statement and
         // does NOT execute it. The SET should only take effect when the
-        // batch includes Bind + Execute (meaning the client intends to
-        // actually run the statement).
+        // batch includes a matching Bind + Execute cycle.
         //
-        // FIX (Bug 4): Only intercept if this is the SOLE operation in the
-        // batch. In pipeline mode, a batch may contain Parse(SET) + Parse(SELECT)
-        // + Bind + Execute. If we return early, the subsequent frames are lost.
-        // Only intercept when the batch has exactly one Parse frame.
-        if let Some(sql) = route_sql {
-            if session.state.tx_state != TxState::Failed
-                && session.state.is_consistency_set_command(sql)
-            {
+        // FIX (Bug 1): Verify Bind/Execute reference the SET Parse's
+        // statement name and portal, not an unrelated statement. Also,
+        // Parse-only should NOT return RFQ unless there's a Sync.
+        let set_parse_frame = batch.iter()
+            .filter(|f| f.tag == frontend_tag::PARSE)
+            .find(|f| {
+                f.parse_sql()
+                    .map(|s| session.state.is_consistency_set_command(s))
+                    .unwrap_or(false)
+            });
+
+        if let Some(set_frame) = set_parse_frame {
+            let sql = set_frame.parse_sql().unwrap(); // safe: filter above
+            if session.state.tx_state != TxState::Failed {
+                let set_stmt_name = set_frame.parse_name().unwrap_or("");
+
+                // FIX (Bug 1): Verify Bind references THIS Parse's statement name.
+                let has_matching_bind = batch.iter().any(|f| {
+                    f.tag == frontend_tag::BIND
+                        && f.bind_statement() == Some(set_stmt_name)
+                });
+
+                // Find the portal created by the matching Bind.
+                let set_portal_name = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(set_stmt_name))
+                    .find_map(|f| f.bind_portal());
+
+                // Verify Execute references the correct portal.
+                let has_matching_execute = set_portal_name.map_or(false, |portal| {
+                    batch.iter().any(|f| {
+                        f.tag == frontend_tag::EXECUTE
+                            && f.execute_portal() == Some(portal)
+                    })
+                });
+
                 let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
-                let has_execute = batch.iter().any(|f| f.tag == frontend_tag::EXECUTE);
-                let has_bind = batch.iter().any(|f| f.tag == frontend_tag::BIND);
+                let has_sync = batch.iter().any(|f| f.tag == frontend_tag::SYNC);
 
                 if parse_count <= 1 {
-                    if has_bind && has_execute {
-                        // Full Parse+Bind+Execute cycle: apply the SET and
-                        // return the complete synthetic response.
+                    if has_matching_bind && has_matching_execute {
+                        // Full Parse+Bind+Execute cycle for the SET: apply
+                        // and return synthetic response.
                         session.state.apply_consistency_set_command(sql);
                         use crate::protocol::writer::encode_backend_message;
                         use crate::protocol::message::BackendMessage;
@@ -398,24 +626,28 @@ where
                             .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         client_stream.write_all(&cmd_complete).await
                             .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        if has_sync {
+                            send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        }
                         return Ok(());
-                    } else {
-                        // Parse-only (no Execute): the client is only
-                        // preparing the statement. Do NOT apply the SET yet.
-                        // Return only ParseComplete + ReadyForQuery.
+                    } else if !has_matching_bind {
+                        // Parse-only (no matching Bind): client is only
+                        // preparing the statement. Return ParseComplete only.
+                        // FIX (Bug 1): Only send RFQ if Sync is present.
                         let parse_complete = [b'1', 0, 0, 0, 4];
                         client_stream.write_all(&parse_complete).await
                             .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        if has_sync {
+                            send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        }
                         return Ok(());
                     }
+                    // Bind references a DIFFERENT statement → do NOT intercept.
+                    // Fall through to normal routing.
                 } else {
-                    // Multi-Parse pipeline batch: apply SET only if there is
-                    // an Execute in the batch (meaning the SET will actually
-                    // run). Then re-route using the next non-SET Parse SQL
-                    // so the remaining operations are forwarded to the backend.
-                    if has_execute {
+                    // Multi-Parse pipeline batch: apply SET only if there's
+                    // a matching Bind+Execute for the SET statement.
+                    if has_matching_bind && has_matching_execute {
                         session.state.apply_consistency_set_command(sql);
                     }
                     // Find the next non-SET parse SQL for routing.
@@ -423,10 +655,11 @@ where
                         .filter(|f| f.tag == frontend_tag::PARSE)
                         .filter_map(|f| f.parse_sql())
                         .find(|s| !session.state.is_consistency_set_command(s));
-                    // Re-check force_writer for the new route_sql
+                    // Re-check sql_is_write for the new route_sql (in case
+                    // the non-SET SQL is a write, seed write_detected later).
                     if let Some(new_sql) = route_sql {
                         if requires_writer(&classifier, new_sql) {
-                            force_writer = true;
+                            sql_is_write = true;
                         }
                     }
                 }
@@ -776,11 +1009,11 @@ where
 
         // Relay backend responses until ReadyForQuery.
         let mut had_error = false;
-        // FIX (Bug 6): If the SQL was classified as a write during routing
-        // (e.g. SELECT setval(), SELECT lo_create()), pre-set write_detected
-        // so pending_write is recorded even though the CommandComplete tag
-        // will just say "SELECT 1".
-        let mut write_detected = force_writer;
+        // FIX (Bug 6): Only pre-seed write_detected when the SQL is
+        // semantically a write (e.g. SELECT setval(), SELECT lo_create()).
+        // A ForceWriter routing hint on a pure SELECT must NOT create a
+        // fake write watermark — it only affects routing, not LSN tracking.
+        let mut write_detected = sql_is_write;
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {

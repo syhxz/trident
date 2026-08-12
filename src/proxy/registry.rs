@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -208,6 +209,9 @@ struct ActiveBackend {
     node_id: String,
     backend_pid: i32,
     secret_key: i32,
+    /// Monotonically increasing generation that distinguishes successive
+    /// queries on the same session+backend_pid, preventing ABA cancellation.
+    generation: u64,
 }
 
 /// Implements correct single-instance handling of PostgreSQL `CancelRequest`
@@ -233,6 +237,10 @@ pub struct CancelRegistry {
     /// session_id -> the real backend connection it is currently waiting
     /// on a response from, if any.
     active_backends: Mutex<HashMap<String, ActiveBackend>>,
+    /// Monotonically increasing counter — each `mark_active` call gets a
+    /// unique generation so that `verify_cancel_target` can detect ABA
+    /// (same session+pid reused for a different query).
+    generation_counter: AtomicU64,
 }
 
 impl CancelRegistry {
@@ -240,6 +248,7 @@ impl CancelRegistry {
         CancelRegistry {
             sessions_by_key: Mutex::new(HashMap::new()),
             active_backends: Mutex::new(HashMap::new()),
+            generation_counter: AtomicU64::new(0),
         }
     }
 
@@ -271,6 +280,7 @@ impl CancelRegistry {
     /// real backend's own `backend_pid`/`secret_key`, as returned by
     /// `establish_connection` -- distinct from the proxy-issued cancel key).
     pub fn mark_active(&self, session_id: &str, node_id: &str, backend_pid: i32, secret_key: i32) {
+        let generation = self.generation_counter.fetch_add(1, Ordering::Relaxed);
         let mut active = self.active_backends.lock();
         active.insert(
             session_id.to_string(),
@@ -278,6 +288,7 @@ impl CancelRegistry {
                 node_id: node_id.to_string(),
                 backend_pid,
                 secret_key,
+                generation,
             },
         );
     }
@@ -299,7 +310,7 @@ impl CancelRegistry {
     /// FIX (TOCTOU): Also returns the session_id so the caller can
     /// re-verify the target is still active after establishing the cancel
     /// connection but before sending the cancel bytes.
-    pub fn resolve_cancel_target(&self, backend_pid: i32, secret_key: i32) -> Option<(String, i32, i32, String)> {
+    pub fn resolve_cancel_target(&self, backend_pid: i32, secret_key: i32) -> Option<(String, i32, i32, String, u64)> {
         let session_id = {
             let sessions = self.sessions_by_key.lock();
             sessions.get(&(backend_pid, secret_key)).cloned()
@@ -307,17 +318,18 @@ impl CancelRegistry {
         let active = self.active_backends.lock();
         active
             .get(&session_id)
-            .map(|a| (a.node_id.clone(), a.backend_pid, a.secret_key, session_id.clone()))
+            .map(|a| (a.node_id.clone(), a.backend_pid, a.secret_key, session_id.clone(), a.generation))
     }
 
     /// Re-verifies that the given session still has an active query targeting
-    /// the specified backend_pid. Returns false if the target has changed
-    /// (connection was released/reassigned).
-    pub fn verify_cancel_target(&self, session_id: &str, expected_pid: i32) -> bool {
+    /// the specified backend_pid at the expected generation. Returns false if
+    /// the target has changed (connection was released/reassigned) or if a
+    /// new query has started (ABA scenario).
+    pub fn verify_cancel_target(&self, session_id: &str, expected_pid: i32, expected_generation: u64) -> bool {
         let active = self.active_backends.lock();
         active
             .get(session_id)
-            .map(|a| a.backend_pid == expected_pid)
+            .map(|a| a.backend_pid == expected_pid && a.generation == expected_generation)
             .unwrap_or(false)
     }
 }
@@ -398,7 +410,7 @@ mod tests {
             let expected_forward = has_registration && has_active_query;
             prop_assert_eq!(resolved.is_some(), expected_forward);
             if expected_forward {
-                prop_assert_eq!(resolved, Some(("writer".to_string(), 1, 2, session_id.clone())));
+                prop_assert_eq!(resolved, Some(("writer".to_string(), 1, 2, session_id.clone(), 0)));
             }
         }
     }
@@ -442,7 +454,7 @@ mod tests {
 
         assert_eq!(
             registry.resolve_cancel_target(1, 2),
-            Some(("writer".to_string(), 555, 666, "session-a".to_string()))
+            Some(("writer".to_string(), 555, 666, "session-a".to_string(), 0))
         );
     }
 

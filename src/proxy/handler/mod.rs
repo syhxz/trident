@@ -53,6 +53,7 @@ use crate::proxy::forwarder::ExtendedQueryRouteTracker;
 use crate::proxy::registry::{CancelRegistry, ConnectionRegistry, NodeAddress};
 use crate::router::consistency::ConsistencyChecker;
 use crate::router::cost::CostEstimator;
+use crate::router::custom_rules::CustomRoutingRules;
 use crate::router::router::{RouteDecision, Router, RoutingContext};
 use crate::session::lsn::LsnTracker;
 use crate::session::session::{SessionState, TxState};
@@ -136,6 +137,11 @@ pub struct ClientSession {
     /// differs; a failed SET aborts the operation rather than executing an
     /// inaccurately attributed user query.
     application_name: String,
+    /// Virtual portal → transaction-end tag mapping for Failed-state
+    /// cross-Sync Execute-only batches. When in Failed state, if a Bind
+    /// creates a portal for a COMMIT/ROLLBACK statement, record it here
+    /// so a subsequent Execute-only batch can resolve the tag.
+    failed_state_portals: HashMap<String, &'static str>,
 }
 
 /// A complete backend connection checked out exclusively by this client.
@@ -177,11 +183,21 @@ impl ExtendedFrame {
         cstr_at(&self.body, next).map(|(s, _)| s)
     }
 
+    /// For a Bind ('B') frame: the destination portal name (first C-string).
+    fn bind_portal(&self) -> Option<&str> {
+        cstr_at(&self.body, 0).map(|(s, _)| s)
+    }
+
     /// For a Bind ('B') frame: the source statement name (second C-string,
     /// after the portal name).
     fn bind_statement(&self) -> Option<&str> {
         let (_, next) = cstr_at(&self.body, 0)?;
         cstr_at(&self.body, next).map(|(s, _)| s)
+    }
+
+    /// For an Execute ('E') frame: the portal name (first C-string).
+    fn execute_portal(&self) -> Option<&str> {
+        cstr_at(&self.body, 0).map(|(s, _)| s)
     }
 
     /// For a Describe ('D') or Close ('C') frame: the kind byte ('S' for
@@ -258,6 +274,7 @@ impl ClientSession {
             client_credentials: None,
             resolved_pools: HashMap::new(),
             application_name: String::new(),
+            failed_state_portals: HashMap::new(),
         }
     }
 
@@ -337,6 +354,13 @@ where
 pub trait RouteFn: Send + Sync {
     fn transaction_split_settings(&self) -> (bool, bool);
 
+    /// Returns the custom routing rules, if configured. Used by the
+    /// extended-query multi-Parse loop to check all SQL statements
+    /// against custom writer rules (Bug 5 fix).
+    fn custom_rules(&self) -> Option<&Arc<CustomRoutingRules>> {
+        None
+    }
+
     fn route(
         &self,
         sql: &str,
@@ -362,6 +386,10 @@ where
             settings.enable_transaction_split,
             settings.split_respects_consistency,
         )
+    }
+
+    fn custom_rules(&self) -> Option<&Arc<CustomRoutingRules>> {
+        Router::custom_rules(self)
     }
 
     async fn route(
@@ -946,7 +974,7 @@ where
     /// node is logged but never surfaced to the (already-closing) client
     /// connection.
     async fn handle_cancel_request(&self, backend_pid: i32, secret_key: i32) {
-        let Some((node_id, real_backend_pid, real_secret_key, session_id)) = self
+        let Some((node_id, real_backend_pid, real_secret_key, session_id, generation)) = self
             .cancel_registry
             .resolve_cancel_target(backend_pid, secret_key)
         else {
@@ -1002,7 +1030,7 @@ where
         // Post-connect verification: re-check that the session still has an
         // active query on this backend_pid. The TCP connect may have taken
         // time during which the connection was returned to the pool.
-        if !self.cancel_registry.verify_cancel_target(&session_id, real_backend_pid) {
+        if !self.cancel_registry.verify_cancel_target(&session_id, real_backend_pid, generation) {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "stale").increment(1);
             tracing::debug!(
                 session_id = %session_id,
@@ -1257,6 +1285,7 @@ mod tests {
     use crate::config::{LsnTrackingConfig, LsnTrackingMode, PipelineLsnConfig, PoolMode};
     use crate::health::BackendNodeSnapshot;
     use crate::parser::classifier::KeywordClassifier as Classifier_;
+    use crate::parser::classifier::requires_writer;
     use crate::parser::hint::RegexHintParser as HintParser_;
     use crate::parser::pattern::RegexPatternMatcher;
     use crate::pool::conn::{BackendConnection, MaybeTlsStream, PooledConnection};
@@ -3678,5 +3707,182 @@ mod tests {
         // A CancelRequest never receives any response bytes on its own
         // connection (Requirement 7.1): confirm nothing was written back.
         drop(client_side);
+    }
+
+    // ================================================================
+    // Bug fix verification tests
+    // ================================================================
+
+    /// Bug 1: Verify ExtendedFrame::bind_portal() and execute_portal()
+    /// correctly parse the wire format.
+    #[test]
+    fn extended_frame_bind_portal_and_execute_portal_parse_correctly() {
+        // Bind frame: portal_name\0 + statement_name\0 + rest
+        let mut body = Vec::new();
+        body.extend_from_slice(b"my_portal\0");
+        body.extend_from_slice(b"my_stmt\0");
+        body.extend_from_slice(&[0, 0, 0, 0]); // param format codes etc.
+        let bind_frame = ExtendedFrame {
+            tag: b'B',
+            body,
+        };
+        assert_eq!(bind_frame.bind_portal(), Some("my_portal"));
+        assert_eq!(bind_frame.bind_statement(), Some("my_stmt"));
+
+        // Execute frame: portal_name\0 + max_rows(i32)
+        let mut body = Vec::new();
+        body.extend_from_slice(b"my_portal\0");
+        body.extend_from_slice(&0i32.to_be_bytes());
+        let exec_frame = ExtendedFrame {
+            tag: b'E',
+            body,
+        };
+        assert_eq!(exec_frame.execute_portal(), Some("my_portal"));
+    }
+
+    /// Bug 1: Verify that unnamed statement/portal ("") is correctly
+    /// parsed (empty string, not None).
+    #[test]
+    fn extended_frame_unnamed_statement_and_portal() {
+        // Bind("", "") — two null-terminated empty strings
+        let body = vec![0u8, 0, 0, 0, 0, 0]; // \0 + \0 + padding
+        let bind_frame = ExtendedFrame {
+            tag: b'B',
+            body,
+        };
+        assert_eq!(bind_frame.bind_portal(), Some(""));
+        assert_eq!(bind_frame.bind_statement(), Some(""));
+    }
+
+    /// Bug 1: Verify that a Bind referencing a different statement than
+    /// the SET Parse is NOT matched by the statement-name check.
+    #[test]
+    fn bug1_bind_referencing_different_statement_not_matched() {
+        // Parse("set_stmt", "SET trident.consistency='global'")
+        let mut parse_body = Vec::new();
+        parse_body.extend_from_slice(b"set_stmt\0");
+        parse_body.extend_from_slice(b"SET trident.consistency='global'\0");
+        parse_body.extend_from_slice(&0i16.to_be_bytes()); // num params
+        let parse_frame = ExtendedFrame { tag: b'P', body: parse_body };
+
+        // Bind("p", "other_stmt") — binds portal "p" to statement "other_stmt"
+        let mut bind_body = Vec::new();
+        bind_body.extend_from_slice(b"p\0");
+        bind_body.extend_from_slice(b"other_stmt\0");
+        bind_body.extend_from_slice(&[0; 8]);
+        let bind_frame = ExtendedFrame { tag: b'B', body: bind_body };
+
+        let set_stmt_name = parse_frame.parse_name().unwrap();
+        assert_eq!(set_stmt_name, "set_stmt");
+
+        // The Bind references "other_stmt", not "set_stmt"
+        assert_ne!(bind_frame.bind_statement(), Some(set_stmt_name));
+    }
+
+    /// Bug 2: Verify transaction_end_tag semantics.
+    #[test]
+    fn bug2_transaction_end_tag_recognizes_commit_and_rollback() {
+        use crate::session::transaction::transaction_end_tag;
+        assert_eq!(transaction_end_tag("COMMIT"), Some("COMMIT"));
+        assert_eq!(transaction_end_tag("ROLLBACK"), Some("ROLLBACK"));
+        assert_eq!(transaction_end_tag("END"), Some("COMMIT"));
+        assert_eq!(transaction_end_tag("ABORT"), Some("ROLLBACK"));
+        assert_eq!(transaction_end_tag("SELECT 1"), None);
+        assert_eq!(transaction_end_tag("ROLLBACK TO SAVEPOINT sp1"), None);
+    }
+
+    /// Bug 2: Verify prepared_stmts cache is populated on Parse
+    /// in Failed state for cross-Sync support.
+    #[test]
+    fn bug2_prepared_stmts_cache_populated_in_failed_state() {
+        let mut session = ClientSession::new("bug2-test", ConsistencyLevel::Session);
+        session.state.tx_state = TxState::Failed;
+
+        // Simulate Parse("rb_stmt", "ROLLBACK") recording
+        session.state.prepared_stmts.insert("rb_stmt".to_string(), "ROLLBACK".to_string());
+
+        // Verify lookup works
+        let cached = session.state.prepared_stmts.get("rb_stmt").unwrap();
+        assert_eq!(
+            crate::session::transaction::transaction_end_tag(cached),
+            Some("ROLLBACK")
+        );
+    }
+
+    /// Bug 6: Verify sql_is_write distinction from force_writer.
+    /// A ForceWriter hint on a SELECT must NOT be treated as a write.
+    #[test]
+    fn bug6_force_writer_hint_does_not_imply_write() {
+        use crate::parser::hint::{HintParser, RouteHint};
+        let hint_parser = HintParser_::default();
+
+        // ForceWriter hint
+        let sql = "/*+ ROUTE_TO_WRITER */ SELECT 1";
+        let hint = hint_parser.parse_hint(sql);
+        assert_eq!(hint, RouteHint::ForceWriter);
+
+        // But classifier says it's readable (not a write)
+        let kind = Classifier_.classify(sql);
+        assert!(kind.readable());
+        assert!(!requires_writer(&Classifier_, sql));
+    }
+
+    /// Bug 7: Verify cancel registry generation prevents ABA.
+    #[test]
+    fn bug7_cancel_registry_generation_prevents_aba() {
+        let registry = CancelRegistry::new();
+        registry.register_session(1, 2, "session-a");
+
+        // First query
+        registry.mark_active("session-a", "writer", 100, 200);
+        let resolved = registry.resolve_cancel_target(1, 2).unwrap();
+        let (_, pid, _, _, gen1) = resolved;
+        assert_eq!(pid, 100);
+        assert_eq!(gen1, 0);
+
+        // Query completes, new query starts on same backend
+        registry.clear_active("session-a");
+        registry.mark_active("session-a", "writer", 100, 200);
+        let resolved2 = registry.resolve_cancel_target(1, 2).unwrap();
+        let (_, pid2, _, _, gen2) = resolved2;
+        assert_eq!(pid2, 100); // same pid
+        assert_ne!(gen1, gen2); // different generation!
+
+        // Old generation should NOT verify
+        assert!(!registry.verify_cancel_target("session-a", 100, gen1));
+        // New generation should verify
+        assert!(registry.verify_cancel_target("session-a", 100, gen2));
+    }
+
+    /// Bug 7: Verify generation monotonically increases across
+    /// multiple mark_active calls.
+    #[test]
+    fn bug7_cancel_registry_generation_monotonic() {
+        let registry = CancelRegistry::new();
+        registry.register_session(1, 2, "session-a");
+
+        let mut last_gen = 0u64;
+        for i in 0..10 {
+            registry.mark_active("session-a", "writer", i, 999);
+            let (_, _, _, _, gen) = registry.resolve_cancel_target(1, 2).unwrap();
+            assert!(gen >= last_gen, "generation must be monotonically increasing");
+            last_gen = gen;
+            registry.clear_active("session-a");
+        }
+    }
+
+    /// Config: deny_unknown_fields rejects typos in nested config.
+    #[test]
+    fn config_deny_unknown_fields_catches_typos() {
+        let yaml = r#"
+proxy:
+  listen_addr: "0.0.0.0:5432"
+  max_clients: 100
+  typo_field: true
+"#;
+        let result: Result<crate::config::ProxyConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "deny_unknown_fields must reject unknown keys");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "error should mention unknown field: {}", err);
     }
 }

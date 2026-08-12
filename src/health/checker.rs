@@ -601,6 +601,10 @@ pub struct HealthChecker<P: HealthProbe> {
     lsn_tracker: Option<Arc<dyn crate::session::lsn::LsnTracker>>,
     /// Dynamically adjustable check interval in milliseconds.
     check_interval_ms: std::sync::atomic::AtomicU64,
+    /// Monotonically increasing generation counter for node incarnations.
+    /// Prevents ABA: even if a node is removed and re-added, the new
+    /// incarnation gets a strictly higher generation than any previous one.
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 impl<P: HealthProbe> HealthChecker<P> {
@@ -660,6 +664,8 @@ impl<P: HealthProbe> HealthChecker<P> {
             cached_snapshot: ArcSwap::new(Arc::new(initial_snapshot)),
             lsn_tracker: None,
             check_interval_ms: std::sync::atomic::AtomicU64::new(0),
+            // Start at 2 since initial nodes use generation=1.
+            next_generation: std::sync::atomic::AtomicU64::new(2),
         }
     }
 
@@ -849,26 +855,25 @@ impl<P: HealthProbe> HealthChecker<P> {
                     if writer_wal_lsn > 0 && node.last_replay_lsn > 0 {
                         let lsn_diff = writer_wal_lsn.saturating_sub(node.last_replay_lsn);
                         if lsn_diff == 0 {
-                            // LSN fully caught up — override any stale
-                            // timestamp-based lag value.
+                            // LSN fully caught up — the reader has replayed
+                            // every WAL byte the writer produced. Override
+                            // any stale timestamp-based lag value.
                             Some(0)
                         } else {
-                            // Use the timestamp-based lag if available
-                            // (it gives a time dimension), but cap it: if
-                            // LSN diff is tiny (< 16 MB) and timestamp lag
-                            // is huge, it means the writer has been idle
-                            // and the timestamp is misleading — use 0.
-                            let lsn_lag_threshold = 16 * 1024 * 1024; // 16 MB
-                            if lsn_diff < lsn_lag_threshold {
-                                // Small LSN gap — likely just idle writer,
-                                // not real lag.
-                                Some(0)
-                            } else {
-                                // Genuine lag — use the timestamp value if
-                                // available (from Aurora's replica_lag_in_msec
-                                // or PostgreSQL's replication lag query).
-                                node.last_replication_lag_ms
-                            }
+                            // LSN gap > 0: the reader is behind by `lsn_diff`
+                            // bytes. Use the timestamp-based lag directly if
+                            // available — it gives the time dimension that
+                            // max_replication_lag_ms is configured in.
+                            //
+                            // No heuristic suppression: even a small LSN gap
+                            // with a moderate timestamp lag represents real
+                            // delay. The only false-positive case (idle writer
+                            // inflating timestamp lag) is detectable by
+                            // lsn_diff == 0, which is already handled above.
+                            // If lsn_diff > 0, the reader genuinely has
+                            // un-replayed WAL, so the timestamp reflects a
+                            // real delay.
+                            node.last_replication_lag_ms
                         }
                     } else {
                         // No writer LSN data yet — fall back to timestamp
@@ -976,15 +981,10 @@ impl<P: HealthProbe> HealthChecker<P> {
         // This prevents an intermediate state where a node exists without
         // its probe (or vice versa) visible to the health-check loop.
         let mut probes = self.probes.write();
-        // Determine generation: if a previous incarnation existed, we would
-        // have already removed it, but compute a safe generation in case of
-        // rapid add/remove/add cycles where snapshot data persists.
-        let gen = nodes
-            .values()
-            .map(|n| n.generation)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        // Monotonic generation counter prevents ABA: even if a node is
+        // removed and re-added rapidly, the new incarnation always gets a
+        // strictly higher generation than any prior one.
+        let gen = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         nodes.insert(
             node_id.clone(),
             TrackedNode {
@@ -1400,5 +1400,124 @@ mod tests {
             timed_out: false,
         });
         assert_eq!(tracker.global_write_lsn(), higher_lsn);
+    }
+
+    /// Health generation ABA fix: verify that add_node after remove_node
+    /// produces a strictly higher generation, even if the removed node
+    /// had the highest generation.
+    #[tokio::test]
+    async fn add_node_generation_never_reuses_removed_generation() {
+        let healthy = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: None,
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+        };
+        let checker = HealthChecker::new(
+            vec![
+                ("node-a".into(), NodeType::Writer, 1, MockProbe { result: healthy.clone() }),
+                ("node-b".into(), NodeType::Reader, 1, MockProbe { result: healthy.clone() }),
+            ],
+            1000,
+            Duration::from_secs(1),
+        );
+
+        // Remove node-b
+        assert!(checker.remove_node("node-b"));
+
+        // Re-add node-b: must get a generation strictly higher than any
+        // previous generation (including the now-removed one)
+        assert!(checker.add_node("node-b".into(), NodeType::Reader, 1, MockProbe { result: healthy }));
+
+        // Get the new generation by inspecting internal state
+        let nodes = checker.nodes.lock();
+        let node_a_gen = nodes.get("node-a").unwrap().generation;
+        let node_b_gen = nodes.get("node-b").unwrap().generation;
+        // node-b's new generation must be strictly greater than node-a's
+        assert!(
+            node_b_gen > node_a_gen,
+            "re-added node must have strictly higher generation: node_b={} vs node_a={}",
+            node_b_gen, node_a_gen
+        );
+    }
+
+    /// LSN lag: lsn_diff > 0 must trust timestamp lag, not suppress it.
+    #[tokio::test]
+    async fn lsn_gap_with_timestamp_reports_real_lag_not_zero() {
+        let healthy = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: None,
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+        };
+        let checker = HealthChecker::new(
+            vec![
+                ("writer".into(), NodeType::Writer, 1, MockProbe { result: healthy.clone() }),
+                ("reader".into(), NodeType::Reader, 1, MockProbe { result: healthy }),
+            ],
+            5000, // max_replication_lag_ms = 5s
+            Duration::from_secs(1),
+        );
+
+        // Simulate writer at LSN 100MB, reader at LSN 85MB (15MB gap)
+        // with timestamp lag of 3000ms (real lag, should NOT be suppressed)
+        {
+            let mut nodes = checker.nodes.lock();
+            nodes.get_mut("writer").unwrap().last_current_wal_lsn = 100 * 1024 * 1024;
+            nodes.get_mut("reader").unwrap().last_replay_lsn = 85 * 1024 * 1024;
+            nodes.get_mut("reader").unwrap().last_replication_lag_ms = Some(3000);
+        }
+        checker.refresh_cached_snapshot();
+
+        let snap = checker.snapshot();
+        let reader = snap.iter().find(|n| n.node_id == "reader").unwrap();
+        // With the fix, 15MB gap + 3000ms timestamp → lag = 3000ms (trusted)
+        // Previously this would have been forced to 0 (< 16MB threshold)
+        assert_eq!(reader.replication_lag_ms, Some(3000));
+        // Node should remain healthy since 3000ms < 5000ms max
+        assert!(reader.healthy);
+    }
+
+    /// LSN lag: lsn_diff == 0 must override timestamp to 0.
+    #[tokio::test]
+    async fn lsn_fully_caught_up_overrides_stale_timestamp() {
+        let healthy = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: None,
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+        };
+        let checker = HealthChecker::new(
+            vec![
+                ("writer".into(), NodeType::Writer, 1, MockProbe { result: healthy.clone() }),
+                ("reader".into(), NodeType::Reader, 1, MockProbe { result: healthy }),
+            ],
+            5000,
+            Duration::from_secs(1),
+        );
+
+        // Writer idle for 10 minutes: LSN same, but timestamp says 600s
+        {
+            let mut nodes = checker.nodes.lock();
+            nodes.get_mut("writer").unwrap().last_current_wal_lsn = 50 * 1024 * 1024;
+            nodes.get_mut("reader").unwrap().last_replay_lsn = 50 * 1024 * 1024; // fully caught up
+            nodes.get_mut("reader").unwrap().last_replication_lag_ms = Some(600_000); // stale
+        }
+        checker.refresh_cached_snapshot();
+
+        let snap = checker.snapshot();
+        let reader = snap.iter().find(|n| n.node_id == "reader").unwrap();
+        // lsn_diff == 0 → lag must be 0, timestamp is stale
+        assert_eq!(reader.replication_lag_ms, Some(0));
+        assert!(reader.healthy);
     }
 }

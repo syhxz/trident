@@ -104,6 +104,7 @@ pub struct CustomRoutingRules {
 /// Field names deliberately match the `_name`/`_type`/`rw_mode` parameter
 /// spec this module implements.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CustomRuleEntry {
     #[serde(rename = "_name")]
     pub name: String,

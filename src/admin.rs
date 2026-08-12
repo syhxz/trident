@@ -424,27 +424,30 @@ fn build_router(
             .merge(protected_routes)
             .with_state(state)
     } else {
-        // No auth token configured. Restrict mutating operations (POST/PUT/DELETE)
-        // by applying auth middleware unconditionally — all mutating requests will
-        // receive 401 Unauthorized. Read-only GET requests remain accessible.
-        // This prevents accidental exposure of node management and config changes
-        // when the admin console is bound to a non-loopback address without a token.
+        // No auth token configured. Block ALL requests to sensitive protected
+        // routes (both read and write). Only /metrics, /healthz, and the
+        // static console assets remain accessible without authentication.
+        // This prevents accidental information disclosure (SQL logs, node
+        // credentials, client IPs) when the admin console is bound to a
+        // non-loopback address without a token.
         let protected_routes = protected_routes.layer(
-            axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+            axum::middleware::from_fn(move |req: axum::extract::Request, _next: axum::middleware::Next| {
                 async move {
-                    // Allow GET and WebSocket upgrade requests without auth
-                    if req.method() == axum::http::Method::GET {
-                        next.run(req).await
-                    } else {
-                        // Block all mutating requests when no auth token is set
-                        axum::response::IntoResponse::into_response((
-                            axum::http::StatusCode::UNAUTHORIZED,
-                            axum::Json(serde_json::json!({
-                                "status": "error",
-                                "message": "admin auth_token not configured; mutating operations are disabled"
-                            })),
-                        ))
-                    }
+                    let path = req.uri().path().to_string();
+                    // Only allow requests that are handled by public_routes
+                    // (which are merged separately and don't pass through here).
+                    // Any request reaching this middleware is to a protected route.
+                    axum::response::IntoResponse::into_response((
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({
+                            "status": "error",
+                            "message": format!(
+                                "admin auth_token not configured; access to {} is disabled. \
+                                 Set admin.auth_token in configuration to enable.",
+                                path
+                            )
+                        })),
+                    ))
                 }
             }),
         );

@@ -213,6 +213,11 @@ where
         **self.settings.load()
     }
 
+    /// Returns a reference to the custom routing rules, if configured.
+    pub fn custom_rules(&self) -> Option<&Arc<CustomRoutingRules>> {
+        self.custom_rules.as_ref()
+    }
+
     /// Atomically replaces the effective settings, taking effect for every
     /// `route` call that starts after this returns (in-flight calls that
     /// already loaded the previous settings are unaffected -- there is no

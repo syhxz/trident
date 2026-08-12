@@ -70,6 +70,7 @@ pub enum LsnTrackingMode {
 
 /// LSN tracking settings for Trident's internal query pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineLsnConfig {
     #[serde(default = "default_internal_query_timeout_ms")]
     pub internal_query_timeout_ms: u64,
@@ -96,6 +97,7 @@ fn default_true() -> bool {
 
 /// LSN tracking settings for the PostgreSQL extension integration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtensionLsnConfig {
     #[serde(default = "default_lsn_guc_name")]
     pub guc_name: String,
@@ -116,6 +118,7 @@ fn default_lsn_guc_name() -> String {
 /// LSN tracking configuration. Every field defaults so existing YAML files
 /// that predate LSN tracking continue to deserialize unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LsnTrackingConfig {
     #[serde(default)]
     pub mode: LsnTrackingMode,
@@ -239,6 +242,7 @@ fn default_cancel_connect_timeout() -> String {
 /// `ConfigError::MissingPassword` rather than silently proceeding with an
 /// empty password.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub name: String,
     pub host: String,
@@ -261,6 +265,7 @@ pub struct NodeConfig {
 
 /// Routing-related configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     pub default_consistency: ConsistencyLevel,
     pub load_balance_strategy: LoadBalanceStrategy,
@@ -284,6 +289,7 @@ pub struct RoutingConfig {
 
 /// Connection pool configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     pub mode: PoolMode,
     pub max_pool_size: u32,
@@ -330,6 +336,7 @@ fn default_check_interval() -> String {
 
 /// Health check configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     pub check_interval: String,
     pub check_timeout: String,
@@ -372,6 +379,7 @@ pub enum LogRotation {
 ///   pruning happens continuously (checked on every rotation, not just once
 ///   at process startup).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub level: String,
     #[serde(alias = "query_log")]
