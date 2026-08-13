@@ -24,7 +24,7 @@ use super::helpers::{
     frame_is_named_parse, record_statement_routes, send_pg_error_response, send_ready_for_query,
     transaction_status_for_state, update_unnamed_parse_tracking, write_raw_frame_to,
 };
-use super::{ClientSession, ConnectionHandler, ExtendedFrame, HeldBackend, RouteFn};
+use super::{ClientSession, ConnectionHandler, ExtendedFrame, HeldBackend, OwnedConn, RouteFn};
 use crate::pool::manager::PoolManager;
 use crate::session::lsn::LsnTracker;
 
@@ -496,16 +496,54 @@ where
                 if has_execute {
                     // Full Bind+Execute: apply the SET and respond.
                     session.state.apply_consistency_set_command(&sql);
-                    let bind_complete = [b'2', 0, 0, 0, 4];
-                    let cmd_complete = crate::protocol::writer::encode_backend_message(
-                        &crate::protocol::message::BackendMessage::CommandComplete {
-                            tag: "SET".to_string(),
-                        },
-                    );
-                    client_stream.write_all(&bind_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    client_stream.write_all(&cmd_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                    // FIX: Iterate ALL frames in the batch to generate
+                    // correct responses for Describe/Close that may
+                    // accompany Bind+Execute in a cross-Sync batch.
+                    for frame in batch.iter() {
+                        match frame.tag {
+                            tag if tag == frontend_tag::BIND => {
+                                let bind_complete = [b'2', 0, 0, 0, 4];
+                                client_stream.write_all(&bind_complete).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            tag if tag == frontend_tag::DESCRIBE => {
+                                // Describe(P): NoData (SET produces no result)
+                                // Describe(S): ParameterDescription + NoData
+                                if let Some((kind, _)) = frame.kind_and_name() {
+                                    if kind == b'S' {
+                                        let param_desc = [b't', 0, 0, 0, 6, 0, 0];
+                                        client_stream.write_all(&param_desc).await
+                                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                    }
+                                }
+                                let no_data = [b'n', 0, 0, 0, 4];
+                                client_stream.write_all(&no_data).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            tag if tag == frontend_tag::EXECUTE => {
+                                let cmd_complete = crate::protocol::writer::encode_backend_message(
+                                    &crate::protocol::message::BackendMessage::CommandComplete {
+                                        tag: "SET".to_string(),
+                                    },
+                                );
+                                client_stream.write_all(&cmd_complete).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            tag if tag == frontend_tag::CLOSE => {
+                                if let Some((kind, name)) = frame.kind_and_name() {
+                                    if kind == b'S' {
+                                        session.local_set_stmts.remove(name);
+                                    } else if kind == b'P' {
+                                        session.local_set_portals.remove(name);
+                                    }
+                                }
+                                let close_complete = [b'3', 0, 0, 0, 4];
+                                client_stream.write_all(&close_complete).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            _ => {}
+                        }
+                    }
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
                 } else {
@@ -536,6 +574,9 @@ where
         // FIX (Bug 2): In multi-Parse batches on the held path, collect
         // indices of SET-related frames for filtered forwarding.
         let mut held_set_skip_indices: Vec<usize> = Vec::new();
+        // FIX (Bug 3): Collect pending SET commands to apply only after
+        // the batch succeeds (no backend error).
+        let mut pending_set_commands: Vec<String> = Vec::new();
         if session.held_backend.is_some() {
             // Collect ALL SET consistency Parse frames (not just the first).
             let set_parse_frames: Vec<_> = batch.iter()
@@ -589,21 +630,55 @@ where
                     if has_matching_bind && has_matching_execute {
                         // Full Parse+Bind+Execute for the SET: apply and respond.
                         session.state.apply_consistency_set_command(first_sql);
-                        use crate::protocol::writer::encode_backend_message;
-                        use crate::protocol::message::BackendMessage;
-                        let parse_complete = [b'1', 0, 0, 0, 4];
-                        let bind_complete = [b'2', 0, 0, 0, 4];
-                        let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                            tag: "SET".to_string(),
-                        });
-                        client_stream.write_all(&parse_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        client_stream.write_all(&bind_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        client_stream.write_all(&cmd_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        // FIX (Bug 1): Always send RFQ — this function is only
-                        // called when a Sync message triggers the batch.
+                        // FIX: Iterate ALL frames to handle Describe/Close.
+                        for frame in batch.iter() {
+                            match frame.tag {
+                                tag if tag == frontend_tag::PARSE => {
+                                    let parse_complete = [b'1', 0, 0, 0, 4];
+                                    client_stream.write_all(&parse_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::BIND => {
+                                    let bind_complete = [b'2', 0, 0, 0, 4];
+                                    client_stream.write_all(&bind_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::DESCRIBE => {
+                                    if let Some((kind, _)) = frame.kind_and_name() {
+                                        if kind == b'S' {
+                                            let param_desc = [b't', 0, 0, 0, 6, 0, 0];
+                                            client_stream.write_all(&param_desc).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                    let no_data = [b'n', 0, 0, 0, 4];
+                                    client_stream.write_all(&no_data).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::EXECUTE => {
+                                    use crate::protocol::writer::encode_backend_message;
+                                    use crate::protocol::message::BackendMessage;
+                                    let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                                        tag: "SET".to_string(),
+                                    });
+                                    client_stream.write_all(&cmd_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::CLOSE => {
+                                    if let Some((kind, name)) = frame.kind_and_name() {
+                                        if kind == b'S' {
+                                            session.local_set_stmts.remove(name);
+                                        } else if kind == b'P' {
+                                            session.local_set_portals.remove(name);
+                                        }
+                                    }
+                                    let close_complete = [b'3', 0, 0, 0, 4];
+                                    client_stream.write_all(&close_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                _ => {}
+                            }
+                        }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
                     } else if !has_matching_bind {
@@ -625,8 +700,10 @@ where
                     // Bind references a DIFFERENT statement than the SET Parse →
                     // do NOT intercept, fall through to forward to backend.
                 } else {
-                    // Multi-Parse pipeline batch: apply each SET that has
-                    // a matching Bind+Execute.
+                    // Multi-Parse pipeline batch: collect SET commands to
+                    // apply AFTER the batch succeeds (FIX Bug 3). If a
+                    // preceding statement in the batch errors, we must NOT
+                    // have modified session state.
                     for &(_, sql, sname) in &set_parse_frames {
                         let has_bind = batch.iter().any(|f| {
                             f.tag == frontend_tag::BIND
@@ -641,7 +718,7 @@ where
                             })
                         });
                         if has_bind && has_exec {
-                            session.state.apply_consistency_set_command(sql);
+                            pending_set_commands.push(sql.to_string());
                         }
                     }
                     // Collect indices of ALL SET-related frames.
@@ -672,6 +749,11 @@ where
                     // FIX: If ALL frames were SET-related, handle entirely
                     // locally without forwarding to the held backend.
                     if held_set_skip_indices.len() == batch.len() {
+                        // No backend interaction — apply SET commands immediately
+                        // (no error is possible from a preceding statement).
+                        for cmd in &pending_set_commands {
+                            session.state.apply_consistency_set_command(cmd);
+                        }
                         use super::helpers::compute_synthetic_schedule;
                         let schedule = compute_synthetic_schedule(batch, &held_set_skip_indices);
                         if !schedule[0].is_empty() {
@@ -715,11 +797,11 @@ where
                         // BEGIN failed — the backend is not in a transaction.
                         // Mark session as Failed and discard the held backend.
                         session.state.tx_state = TxState::Failed;
-                        let held = session.held_backend.take().unwrap();
+                        let mut held = session.held_backend.take().unwrap();
                         if let Some(pool) =
                             self.resolve_pool_existing(&held.conn.node_id, session)
                         {
-                            let _ = pool.discard(held.conn);
+                            let _ = pool.discard(held.conn.take());
                         }
                         return Err(ProxyError::Protocol(error));
                     }
@@ -805,7 +887,7 @@ where
                         TransactionStatus::Idle,
                     ).await {
                         // ROLLBACK failed — discard the connection.
-                        let _ = reader_pool.discard(held.conn);
+                        let _ = reader_pool.discard(held.conn.take());
                         session.state.tx_state = TxState::Failed;
                         return Err(ProxyError::Protocol(error));
                     }
@@ -816,10 +898,10 @@ where
                         match reader_pool.mode() {
                             PoolMode::Transaction => {
                                 held.conn.dirty = false;
-                                reader_pool.release(&session.state.id, held.conn).await?;
+                                reader_pool.release(&session.state.id, held.conn.take()).await?;
                             }
                             PoolMode::Session => {
-                                let _ = reader_pool.discard(held.conn);
+                                let _ = reader_pool.discard(held.conn.take());
                             }
                         }
                     }
@@ -836,7 +918,7 @@ where
 
             if session.held_backend.is_some() {
                 return self
-                    .forward_extended_on_held_backend(client_stream, session, batch, &held_set_skip_indices)
+                    .forward_extended_on_held_backend(client_stream, session, batch, &held_set_skip_indices, &pending_set_commands)
                     .await;
             }
         }
@@ -924,6 +1006,27 @@ where
                         // already committed to a Writer-bound SQL.
                         route_sql = Some(sql);
                     }
+                    RouteHint::ForceAnalytics
+                        if !requires_writer(&classifier, route_sql.unwrap_or("")) =>
+                    {
+                        // FIX: Propagate ForceAnalytics hint so the Router
+                        // can pick it up. Same precedence as ForceReader.
+                        route_sql = Some(sql);
+                    }
+                    RouteHint::Consistency(level) => {
+                        // FIX: Apply consistency hint from any Parse in the
+                        // batch to the session for routing this batch. The
+                        // Router will use session.state.consistency which is
+                        // overridden per-query by the hint in the SQL passed
+                        // to route(). Setting route_sql ensures the Router
+                        // sees the hint.
+                        if route_sql.is_none()
+                            || !requires_writer(&classifier, route_sql.unwrap_or(""))
+                        {
+                            route_sql = Some(sql);
+                        }
+                        let _ = level; // Router parses the hint itself
+                    }
                     _ => {}
                 }
             }
@@ -959,6 +1062,9 @@ where
         // FIX (Bug 2): In multi-Parse batches, collect indices of SET-related
         // frames to filter them out before forwarding to backend.
         let mut set_frame_skip_indices: Vec<usize> = Vec::new();
+        // FIX (Bug 3): Collect pending SET commands to apply only after
+        // the batch succeeds (no backend error).
+        let mut pending_set_commands_nonheld: Vec<String> = Vec::new();
         // Collect ALL SET consistency Parse frames (not just the first).
         // A batch may contain multiple SET commands; we must filter all of
         // them and their corresponding Bind/Execute frames.
@@ -1018,21 +1124,59 @@ where
                         // Full Parse+Bind+Execute cycle for the SET: apply
                         // and return synthetic response.
                         session.state.apply_consistency_set_command(first_sql);
-                        use crate::protocol::writer::encode_backend_message;
-                        use crate::protocol::message::BackendMessage;
-                        let parse_complete = [b'1', 0, 0, 0, 4];
-                        let bind_complete = [b'2', 0, 0, 0, 4];
-                        let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                            tag: "SET".to_string(),
-                        });
-                        client_stream.write_all(&parse_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        client_stream.write_all(&bind_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        client_stream.write_all(&cmd_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                        // FIX (Bug 1): Always send RFQ — this function is only
-                        // called when a Sync message triggers the batch.
+                        // FIX: Iterate ALL frames in the batch to generate
+                        // correct responses for Describe/Close that may
+                        // accompany Parse+Bind+Execute.
+                        for frame in batch.iter() {
+                            match frame.tag {
+                                tag if tag == frontend_tag::PARSE => {
+                                    let parse_complete = [b'1', 0, 0, 0, 4];
+                                    client_stream.write_all(&parse_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::BIND => {
+                                    let bind_complete = [b'2', 0, 0, 0, 4];
+                                    client_stream.write_all(&bind_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::DESCRIBE => {
+                                    // Describe(S): ParameterDescription + NoData
+                                    // Describe(P): NoData (SET has no result columns)
+                                    if let Some((kind, _)) = frame.kind_and_name() {
+                                        if kind == b'S' {
+                                            let param_desc = [b't', 0, 0, 0, 6, 0, 0];
+                                            client_stream.write_all(&param_desc).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                    let no_data = [b'n', 0, 0, 0, 4];
+                                    client_stream.write_all(&no_data).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::EXECUTE => {
+                                    use crate::protocol::writer::encode_backend_message;
+                                    use crate::protocol::message::BackendMessage;
+                                    let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
+                                        tag: "SET".to_string(),
+                                    });
+                                    client_stream.write_all(&cmd_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                tag if tag == frontend_tag::CLOSE => {
+                                    if let Some((kind, name)) = frame.kind_and_name() {
+                                        if kind == b'S' {
+                                            session.local_set_stmts.remove(name);
+                                        } else if kind == b'P' {
+                                            session.local_set_portals.remove(name);
+                                        }
+                                    }
+                                    let close_complete = [b'3', 0, 0, 0, 4];
+                                    client_stream.write_all(&close_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                }
+                                _ => {}
+                            }
+                        }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
                     } else if !has_matching_bind {
@@ -1055,8 +1199,8 @@ where
                     // Bind references a DIFFERENT statement → do NOT intercept.
                     // Fall through to normal routing.
                 } else {
-                    // Multi-Parse pipeline batch: apply each SET that has a
-                    // matching Bind+Execute.
+                    // Multi-Parse pipeline batch: collect SET commands to
+                    // apply AFTER the batch succeeds (FIX Bug 3).
                     for &(_, sql, sname) in &set_parse_frames {
                         let has_bind = batch.iter().any(|f| {
                             f.tag == frontend_tag::BIND
@@ -1071,7 +1215,7 @@ where
                             })
                         });
                         if has_bind && has_exec {
-                            session.state.apply_consistency_set_command(sql);
+                            pending_set_commands_nonheld.push(sql.to_string());
                         }
                     }
                     // Collect indices of ALL SET-related frames (Parse, Bind,
@@ -1100,15 +1244,23 @@ where
                         }
                     }
                     // Find the next non-SET parse SQL for routing.
-                    route_sql = batch.iter()
-                        .filter(|f| f.tag == frontend_tag::PARSE)
-                        .filter_map(|f| f.parse_sql())
-                        .find(|s| !session.state.is_consistency_set_command(s));
-                    // Re-check sql_is_write for the new route_sql (in case
-                    // the non-SET SQL is a write, seed write_detected later).
-                    if let Some(new_sql) = route_sql {
-                        if requires_writer(&classifier, new_sql) {
-                            sql_is_write = true;
+                    // FIX (Bug 2): Only override route_sql if the initial
+                    // batch scan did NOT already determine that a Writer is
+                    // required. Otherwise a batch like [Parse(SELECT),
+                    // Parse(INSERT), Parse(SET)] would have route_sql reset
+                    // to the SELECT, causing the INSERT to be routed to a
+                    // Reader.
+                    if !force_writer {
+                        route_sql = batch.iter()
+                            .filter(|f| f.tag == frontend_tag::PARSE)
+                            .filter_map(|f| f.parse_sql())
+                            .find(|s| !session.state.is_consistency_set_command(s));
+                        // Re-check sql_is_write for the new route_sql (in case
+                        // the non-SET SQL is a write, seed write_detected later).
+                        if let Some(new_sql) = route_sql {
+                            if requires_writer(&classifier, new_sql) {
+                                sql_is_write = true;
+                            }
                         }
                     }
 
@@ -1116,6 +1268,11 @@ where
                     // remaining forwarded frames), handle entirely locally.
                     // No need to acquire a backend connection.
                     if set_frame_skip_indices.len() == batch.len() {
+                        // No backend interaction — apply SET commands immediately
+                        // (no error is possible from a preceding statement).
+                        for cmd in &pending_set_commands_nonheld {
+                            session.state.apply_consistency_set_command(cmd);
+                        }
                         use super::helpers::compute_synthetic_schedule;
                         let schedule = compute_synthetic_schedule(batch, &set_frame_skip_indices);
                         // schedule[0] contains all synthetic responses (since
@@ -1363,9 +1520,9 @@ where
             ))
         })?;
         let current_gen = self.connection_registry.map(|r| r.node_generation(&target_node_id));
-        let mut conn = if let Some(cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
+        let mut conn = if let Some(mut cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
             // Fast path: reuse the complete cached connection.
-            cached.conn
+            cached.conn.take()
         } else {
             // Release any cached connection to a different node (or stale generation).
             self.release_cached_backend(session).await;
@@ -1519,6 +1676,17 @@ where
         // A ForceWriter routing hint on a pure SELECT must NOT create a
         // fake write watermark — it only affects routing, not LSN tracking.
         let mut write_detected = sql_is_write;
+        // FIX: For cross-Sync batches (no Parse), also seed write_detected
+        // if a Bind references a named statement known to contain write
+        // function calls (setval, lo_create, etc.) whose CommandComplete
+        // would only say "SELECT 1".
+        if !write_detected {
+            write_detected = batch.iter().any(|f| {
+                f.tag == frontend_tag::BIND
+                    && f.bind_statement()
+                        .is_some_and(|stmt| session.write_function_stmts.contains(stmt))
+            });
+        }
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {
@@ -1789,10 +1957,19 @@ where
         // Update session transaction state.
         session.state.tx_state = apply_ready_for_query(tx_status);
 
+        // FIX (Bug 3): Apply deferred SET commands only if the batch
+        // succeeded. If any preceding statement errored, the SET was never
+        // truly executed, so session state must remain unchanged.
+        if !had_error {
+            for cmd in &pending_set_commands_nonheld {
+                session.state.apply_consistency_set_command(cmd);
+            }
+        }
+
         // Record named statement routes for future batches, and clean up
         // on Close. Only process if the batch succeeded (no error).
         if !had_error {
-            record_statement_routes(session, batch, &conn.node_id);
+            record_statement_routes(session, batch, &conn.node_id, &set_frame_skip_indices);
             // Track unnamed Parse: if this batch contained a Parse with an
             // empty name, record the node so subsequent Bind("") across
             // Sync boundaries can find the correct physical connection.
@@ -1834,13 +2011,13 @@ where
 
         // Return or hold the backend connection.
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
         } else if conn.dirty {
             // Dirty connections cannot be cached — release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache for reuse by the next query in this session.
-            session.cached_idle_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
+            session.cached_idle_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -1856,6 +2033,7 @@ where
         session: &mut ClientSession,
         batch: &[ExtendedFrame],
         set_skip_indices: &[usize],
+        pending_set_commands: &[String],
     ) -> Result<(), ProxyError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -1867,9 +2045,9 @@ where
                 .await
         };
         if let Err(error) = appname_result {
-            let held = session.held_backend.take().expect("checked by caller");
+            let mut held = session.held_backend.take().expect("checked by caller");
             if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                let _ = pool.discard(held.conn);
+                let _ = pool.discard(held.conn.take());
             }
             return Err(ProxyError::Protocol(error));
         }
@@ -1947,6 +2125,14 @@ where
                 }
                 false
             });
+        // FIX: Also check write_function_stmts for cross-Sync batches.
+        if !write_detected {
+            write_detected = batch.iter().any(|f| {
+                f.tag == frontend_tag::BIND
+                    && f.bind_statement()
+                        .is_some_and(|stmt| session.write_function_stmts.contains(stmt))
+            });
+        }
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {
@@ -2174,6 +2360,15 @@ where
         // Update session transaction state.
         session.state.tx_state = apply_ready_for_query(tx_status);
 
+        // FIX (Bug 3): Apply deferred SET commands only if the batch
+        // succeeded. If any preceding statement errored, the SET was never
+        // truly executed, so session state must remain unchanged.
+        if !had_error {
+            for cmd in pending_set_commands {
+                session.state.apply_consistency_set_command(cmd);
+            }
+        }
+
         // Named statements created on the held connection require the same
         // treatment as on the non-held path: pin the physical connection so
         // it outlives the transaction (the statement lives on this exact
@@ -2211,7 +2406,7 @@ where
                 .conn
                 .node_id
                 .clone();
-            record_statement_routes(session, batch, &held_node_id);
+            record_statement_routes(session, batch, &held_node_id, set_skip_indices);
             update_unnamed_parse_tracking(session, batch, &held_node_id);
         }
 
@@ -2241,7 +2436,7 @@ where
         if session.state.tx_state == TxState::Idle {
             let held = session.held_backend.as_ref().unwrap();
             if !held.conn.pinned {
-                let held = session.held_backend.take().unwrap();
+                let mut held = session.held_backend.take().unwrap();
                 // Keep unnamed_parse_node set: the unnamed statement was
                 // parsed on this connection which is now returning to the
                 // pool. A cross-Sync Bind("") must be rejected since a
@@ -2254,7 +2449,7 @@ where
                             held.conn.node_id
                         )))
                     })?;
-                pool.release(&session.state.id, held.conn).await?;
+                pool.release(&session.state.id, held.conn.take()).await?;
             }
         }
 

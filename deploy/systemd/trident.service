@@ -27,6 +27,16 @@ ExecReload=/bin/kill -HUP $MAINPID
 # switched to .pgpass / ${ENV_VAR} substitution.
 Environment=TRIDENT_CONFIG=/etc/trident/config.yaml
 Environment=RUST_LOG=info
+# If your config.yaml uses ${ENV_VAR} placeholders for passwords (the
+# recommended approach — see the root config.yaml and DEPLOYMENT.md
+# section 2), inject them here or via an EnvironmentFile:
+#   Environment=TRIDENT_PRIMARY_PASSWORD=secret
+#   Environment=TRIDENT_READER1_PASSWORD=secret
+#   Environment=TRIDENT_READER2_PASSWORD=secret
+#   Environment=TRIDENT_ANALYTICS1_PASSWORD=secret
+# Or use a restricted file (mode 0600, owned by trident:trident):
+#   EnvironmentFile=/etc/trident/env
+# The env file format is one VAR=value per line with no quoting.
 
 # Restart policy: always restart on crash or clean exit, with a short
 # backoff, but bail out if it keeps failing in a tight loop (avoids a

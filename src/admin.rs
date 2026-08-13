@@ -297,6 +297,9 @@ struct AdminState {
     set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     /// Dynamic health check interval getter.
     get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
+    /// Serializes config PUT and reload operations to prevent lost updates
+    /// from concurrent read-modify-apply sequences (FIX Bug 5a).
+    config_write_lock: tokio::sync::Mutex<()>,
 }
 
 /// Bearer token authentication middleware. Checks the `Authorization`
@@ -437,6 +440,7 @@ fn build_router(
         auth_token,
         set_check_interval_fn,
         get_check_interval_fn,
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     // Public routes: always accessible (Prometheus scraper, k8s probes, console UI)
@@ -532,13 +536,14 @@ async fn reload_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             .into_response();
     };
 
+    // FIX (Bug 5a): Serialize with config PUT operations.
+    let _config_guard = state.config_write_lock.lock().await;
+
     match reload_from_file(path, target.as_ref()).await {
         Ok(()) => {
-            // Update the admin's routing config snapshot so /api/config
-            // reflects the reloaded values, not stale startup config.
-            if let Ok(fresh_config) = crate::config::AppConfig::load_from_file(path.as_str()) {
-                state.routing_config.store(Arc::new(fresh_config.routing));
-            }
+            // Note: target.apply() (called inside reload_from_file) already
+            // updates the admin routing_config snapshot atomically under its
+            // reload_lock. No additional store is needed here.
             (StatusCode::OK, r#"{"status":"reloaded"}"#).into_response()
         }
         Err(e) => {
@@ -1006,6 +1011,11 @@ async fn config_put_handler(
             .into_response();
     };
 
+    // FIX (Bug 5a): Serialize the entire read-modify-apply sequence to
+    // prevent concurrent PUTs from building on the same stale base and
+    // losing each other's updates.
+    let _config_guard = state.config_write_lock.lock().await;
+
     let current = state.routing_config.load();
     let mut new_routing = (**current).clone();
 
@@ -1059,8 +1069,10 @@ async fn config_put_handler(
         }
     }
 
-    // Dynamically adjust health check interval if requested.
-    if let Some(ms) = body.health_check_interval_ms {
+    // FIX: Validate health_check_interval_ms early but defer application
+    // until after target.apply() succeeds, to avoid partial-commit state
+    // where interval is changed but routing config fails to apply.
+    let pending_health_interval_ms = if let Some(ms) = body.health_check_interval_ms {
         if ms < 100 {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1069,10 +1081,10 @@ async fn config_put_handler(
             )
                 .into_response();
         }
-        if let Some(ref setter) = state.set_check_interval_fn {
-            setter(Duration::from_millis(ms));
-        }
-    }
+        Some(ms)
+    } else {
+        None
+    };
 
     // Preserve the *live* custom rule set: rules may have been added or
     // removed through the admin API since startup, and `apply` replaces
@@ -1084,7 +1096,17 @@ async fn config_put_handler(
 
     match target.apply(&new_routing) {
         Ok(()) => {
-            state.routing_config.store(Arc::new(new_routing));
+            // Apply health interval only after routing config succeeds.
+            if let Some(ms) = pending_health_interval_ms {
+                if let Some(ref setter) = state.set_check_interval_fn {
+                    setter(Duration::from_millis(ms));
+                }
+            }
+            // Note: target.apply() already updates the admin routing_config
+            // snapshot inside its reload_lock, ensuring atomicity with
+            // respect to concurrent PUT/reload operations. No additional
+            // store is needed here (doing so outside the lock would race
+            // with concurrent operations — FIX Bug 5a).
             (
                 StatusCode::OK,
                 r#"{"status":"applied","note":"runtime-only change; not persisted to the config file. A file reload (SIGHUP / POST /reload) or restart reverts it."}"#

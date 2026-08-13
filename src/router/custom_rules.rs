@@ -90,14 +90,15 @@ pub enum RwMode {
 /// A shared, thread-safe registry of custom routing rules. Cheap to read
 /// concurrently from many connection tasks (`forces_writer` is a couple of
 /// lock-free `ArcSwap` loads plus a `HashMap` lookup); writes
-/// (`set_rule`/`remove_rule`/`replace_all`) are also lock-free from the
-/// caller's perspective (an atomic pointer swap), matching the same
-/// hot-reload-friendly pattern used by `Router::update_settings` and
-/// `RegexPatternMatcher::update_patterns`.
+/// (`set_rule`/`remove_rule`/`replace_all`) are serialized by a Mutex to
+/// prevent concurrent load-clone-store races from losing updates.
 #[derive(Default)]
 pub struct CustomRoutingRules {
     tables: ArcSwap<HashMap<String, RwMode>>,
     functions: ArcSwap<HashMap<String, RwMode>>,
+    /// Serializes all write operations to prevent lost updates from
+    /// concurrent load-clone-store sequences.
+    write_lock: std::sync::Mutex<()>,
 }
 
 /// One rule entry, as accepted by config file loading and the admin API.
@@ -118,6 +119,7 @@ impl CustomRoutingRules {
         CustomRoutingRules {
             tables: ArcSwap::new(std::sync::Arc::new(HashMap::new())),
             functions: ArcSwap::new(std::sync::Arc::new(HashMap::new())),
+            write_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -130,6 +132,7 @@ impl CustomRoutingRules {
 
     /// Registers (or overwrites) a single rule.
     pub fn set_rule(&self, name: &str, kind: RuleTargetKind, mode: RwMode) {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let map = self.map_for(kind);
         let mut updated = (**map.load()).clone();
         updated.insert(name.to_ascii_lowercase(), mode);
@@ -139,6 +142,7 @@ impl CustomRoutingRules {
     /// Removes a single rule, if present. A no-op if no rule with this
     /// `(name, kind)` was registered.
     pub fn remove_rule(&self, name: &str, kind: RuleTargetKind) {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let map = self.map_for(kind);
         let mut updated = (**map.load()).clone();
         updated.remove(&name.to_ascii_lowercase());
@@ -149,6 +153,7 @@ impl CustomRoutingRules {
     /// loading and hot reload, so a reload never leaves a stale rule from
     /// a previous config lingering).
     pub fn replace_all(&self, entries: &[CustomRuleEntry]) {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut tables = HashMap::new();
         let mut functions = HashMap::new();
         for entry in entries {
@@ -158,6 +163,8 @@ impl CustomRoutingRules {
             };
             target.insert(entry.name.to_ascii_lowercase(), entry.rw_mode);
         }
+        // Publish both maps together under the same lock to ensure
+        // readers never observe a cross-generation combination.
         self.tables.store(std::sync::Arc::new(tables));
         self.functions.store(std::sync::Arc::new(functions));
     }

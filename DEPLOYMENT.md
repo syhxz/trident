@@ -47,12 +47,23 @@ Startup fails if no password can be resolved for any node.
 
 Cleartext, MD5, and SCRAM-SHA-256 are supported for backend connections and health probes.
 
-### Client-Side Security
+### Client-Side Authentication
 
-Trident currently accepts client connections in **trust mode** (no client password validation). Production deployments must:
-- Restrict `proxy.listen_addr` to trusted networks
+Trident supports multiple client authentication modes via `proxy.client_auth`:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `trust` | No client password validation (default) | Local dev / fully trusted networks |
+| `passthrough` | Client credentials are forwarded to PostgreSQL for authentication | **Recommended for production** |
+| `md5` | Proxy validates against a local `auth_file` (PgBouncer-compatible `userlist.txt`) | Environments needing proxy-level auth without backend round-trip |
+| `scram-sha-256` | Proxy validates SCRAM verifier from `auth_file` | Same as md5 but stronger hash |
+
+**Passthrough mode** (recommended) preserves database-level RBAC, audit identity, and password rotation — the proxy never stores or validates client passwords itself; authentication is delegated to the backend PostgreSQL instance.
+
+Production deployments should:
+- Set `client_auth: passthrough` (or `md5`/`scram-sha-256` with an `auth_file`)
+- Restrict `proxy.listen_addr` to trusted networks or use TLS (`tls_cert`/`tls_key`)
 - Use firewall/security groups to control access
-- Place an authenticated TCP proxy in front if client identity verification is needed
 
 ### Backend SSL
 
@@ -165,10 +176,11 @@ kill -HUP <pid>
 # or
 systemctl reload trident
 # or
-curl -X POST http://127.0.0.1:9090/reload
+curl -X POST http://127.0.0.1:9090/reload \
+  -H "Authorization: Bearer <your_auth_token>"
 ```
 
-Reload is atomic: if the new config fails validation, the old config remains in effect.
+Reload is serialized: concurrent reload/PUT operations are sequenced by an internal lock to prevent interleaving. If the new config fails validation (invalid regex patterns, etc.), the old config remains in effect and an error is returned. The in-flight routing of active queries is never interrupted by a reload — changes take effect on the next routing decision.
 
 ## 6. Custom Routing Rules
 
@@ -189,15 +201,18 @@ routing:
 
 ```bash
 # List rules
-curl http://127.0.0.1:9090/custom-rules
+curl http://127.0.0.1:9090/custom-rules \
+  -H "Authorization: Bearer <your_auth_token>"
 
 # Add/update rule
 curl -X POST http://127.0.0.1:9090/custom-rules \
+  -H "Authorization: Bearer <your_auth_token>" \
   -H 'content-type: application/json' \
   -d '{"_name":"sensitive_table","_type":"t","rw_mode":"w"}'
 
 # Delete rule
 curl -X DELETE http://127.0.0.1:9090/custom-rules \
+  -H "Authorization: Bearer <your_auth_token>" \
   -H 'content-type: application/json' \
   -d '{"_name":"sensitive_table","_type":"t"}'
 ```

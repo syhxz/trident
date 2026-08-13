@@ -5,6 +5,17 @@
 # localhost:6432 and see read/write splitting working end to end without
 # any real infrastructure.
 #
+# IMPORTANT: Both "writer" and "reader" are standalone PostgreSQL primaries
+# (pg_is_in_recovery() = false on both). The Reader node will be marked
+# unhealthy by Trident's health checker (which requires Readers to report
+# is_in_recovery = true). Trident's `writer_readable: true` setting causes
+# reads to fall back to the Writer, so queries still succeed -- but true
+# read/write splitting requires a real primary+standby pair (e.g. an
+# Aurora cluster, or manually configured streaming replication).
+#
+# For a real read/write split demo, use a PostgreSQL streaming-replication
+# setup or connect to an Aurora/RDS cluster.
+#
 # This is NOT a multi-instance HA topology -- it is meant for local
 # iteration only. For real deployments see DEPLOYMENT.md and the
 # `deploy/systemd` / `deploy/k8s` directories.

@@ -99,7 +99,12 @@ impl HealthCheckResult {
             (NodeType::Writer, None) => false,
             // Reader must be in recovery
             (NodeType::Reader, Some(false)) => false,
-            // Reader/Analytics with unknown state or correct state: accept
+            // Reader/Analytics with unknown recovery state: fail-closed to
+            // prevent routing reads to a promoted former-replica that is
+            // now acting as Writer (FIX: was previously fail-open).
+            (NodeType::Reader, None) => false,
+            (NodeType::Analytics, None) => false,
+            // Correct state confirmed: accept
             _ => true,
         }
     }

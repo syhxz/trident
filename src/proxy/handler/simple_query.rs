@@ -27,7 +27,7 @@ use super::helpers::{
     query_has_write_intent, send_command_complete, send_pg_error_response, send_ready_for_query,
     transaction_status_for_state,
 };
-use super::{ClientSession, ConnectionHandler, HeldBackend, RouteFn};
+use super::{ClientSession, ConnectionHandler, HeldBackend, OwnedConn, RouteFn};
 use crate::pool::manager::PoolManager;
 use crate::session::lsn::LsnTracker;
 
@@ -126,9 +126,9 @@ where
                 .await
         };
         if let Err(error) = appname_result {
-            let held = session.held_backend.take().expect("checked by caller");
+            let mut held = session.held_backend.take().expect("checked by caller");
             if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                let _ = pool.discard(held.conn);
+                let _ = pool.discard(held.conn.take());
             }
             return Err(ProxyError::Protocol(error));
         }
@@ -189,9 +189,9 @@ where
             Ok(outcome) => outcome,
             Err(failure) => {
                 session.state.tx_state = TxState::Failed;
-                let held = session.held_backend.take().unwrap();
+                let mut held = session.held_backend.take().unwrap();
                 if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                    let _ = pool.discard(held.conn);
+                    let _ = pool.discard(held.conn.take());
                 }
                 if failure.error_response_relayed {
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
@@ -254,7 +254,7 @@ where
             if held.conn.pinned {
                 // Keep in held_backend — nothing to do.
             } else {
-                let held = session.held_backend.take().unwrap();
+                let mut held = session.held_backend.take().unwrap();
                 let pool = self
                     .resolve_pool_existing(&held.conn.node_id, session)
                     .ok_or_else(|| {
@@ -263,7 +263,7 @@ where
                             held.conn.node_id
                         )))
                     })?;
-                pool.release(&session.state.id, held.conn).await?;
+                pool.release(&session.state.id, held.conn.take()).await?;
             }
         }
 
@@ -271,9 +271,9 @@ where
         // cycle timed out or failed. The connection is in an unknown state
         // and must not be reused.
         if !relay_outcome.connection_reusable {
-            if let Some(held) = session.held_backend.take() {
+            if let Some(mut held) = session.held_backend.take() {
                 if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                    let _ = pool.discard(held.conn);
+                    let _ = pool.discard(held.conn.take());
                 }
             }
         }
@@ -357,10 +357,10 @@ where
         let pool = self.resolve_pool(&node_id, session).ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::Exhausted(node_id.clone()))
         })?;
-        let (mut conn, backend_status) = if let Some(held) = session.held_backend.take() {
+        let (mut conn, backend_status) = if let Some(mut held) = session.held_backend.take() {
             if held.conn.node_id != node_id {
                 if let Some(held_pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                    held_pool.discard(held.conn)?;
+                    held_pool.discard(held.conn.take())?;
                 }
                 session.aurora_initialized_backend_pid = None;
                 return Err(ProxyError::Pool(
@@ -370,7 +370,7 @@ where
                 ));
             }
             (
-                held.conn,
+                held.conn.take(),
                 transaction_status_for_state(session.state.tx_state),
             )
         } else {
@@ -450,7 +450,7 @@ where
         session.state.tx_state = apply_ready_for_query(outcome.tx_status);
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
         } else {
             pool.release(&session.state.id, conn).await?;
         }
@@ -497,9 +497,9 @@ where
             };
             if let Err(error) = appname_result {
                 tracing::warn!(error = %error, "cannot set application_name for held lazy LSN query");
-                if let Some(held) = session.held_backend.take() {
+                if let Some(mut held) = session.held_backend.take() {
                     if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                        let _ = pool.discard(held.conn);
+                        let _ = pool.discard(held.conn.take());
                     }
                 }
                 return false;
@@ -528,9 +528,9 @@ where
                 }
             }
 
-            if let Some(held) = session.held_backend.take() {
+            if let Some(mut held) = session.held_backend.take() {
                 if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                    let _ = pool.discard(held.conn);
+                    let _ = pool.discard(held.conn.take());
                 }
             }
             return false;
@@ -596,12 +596,12 @@ where
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let held = session.held_backend.take().ok_or_else(|| {
+        let mut held = session.held_backend.take().ok_or_else(|| {
             ProxyError::Pool(crate::pool::pool::PoolError::CleanupFailed(
                 "active split transaction has no held backend".into(),
             ))
         })?;
-        let mut conn = held.conn;
+        let mut conn = held.conn.take();
         let pool = self
             .resolve_pool_existing(&conn.node_id, session)
             .ok_or_else(|| {
@@ -693,7 +693,7 @@ where
             return Ok(());
         }
         if conn.pinned {
-            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
         } else {
             pool.release(&session.state.id, conn).await?;
         }
@@ -994,7 +994,7 @@ where
 
         let mut split_reader_rolled_back = false;
         if decision.requires_split_upgrade {
-            let held = match session.held_backend.take() {
+            let mut held = match session.held_backend.take() {
                 Some(held) => held,
                 None => {
                     session.state.tx_state = TxState::Failed;
@@ -1005,7 +1005,7 @@ where
                     ));
                 }
             };
-            let mut reader_conn = held.conn;
+            let mut reader_conn = held.conn.take();
             let reader_pool = match self.resolve_pool_existing(&reader_conn.node_id, session) {
                 Some(pool) => pool,
                 None => {
@@ -1051,12 +1051,12 @@ where
         }
 
         let current_gen = self.connection_registry.map(|r| r.node_generation(&target_node_id));
-        let mut conn = if let Some(held) = session.held_backend.take() {
+        let mut conn = if let Some(mut held) = session.held_backend.take() {
             // PostgreSQL transaction and session state is connection-local.
-            held.conn
-        } else if let Some(cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
+            held.conn.take()
+        } else if let Some(mut cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
             // Fast path: reuse the complete cached idle connection.
-            cached.conn
+            cached.conn.take()
         } else {
             self.release_cached_backend(session).await;
 
@@ -1278,13 +1278,13 @@ where
         }
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
         } else if conn.dirty {
             // Dirty connections cannot be cached; release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache the complete clean idle connection for same-node reuse.
-            session.cached_idle_backend = Some(HeldBackend { conn, source_pool: Some(Arc::clone(&pool)) });
+            session.cached_idle_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await?;

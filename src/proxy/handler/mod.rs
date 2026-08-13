@@ -153,13 +153,74 @@ pub struct ClientSession {
     /// it is recorded here so that a subsequent Execute-only batch can
     /// resolve it locally and apply the SET.
     local_set_portals: HashMap<String, String>,
+    /// Tracks named prepared statements whose SQL contains write function
+    /// calls (setval, lo_create, etc.). Used for cross-Sync Execute-only
+    /// batches to correctly seed write_detected even when CommandComplete
+    /// only says "SELECT 1".
+    write_function_stmts: std::collections::HashSet<String>,
+}
+
+/// Wrapper that owns a `BackendConnection` and automatically discards it
+/// (freeing the pool slot) if dropped without an explicit `take()`. This
+/// prevents pool capacity leaks when a handler panics or a task is aborted
+/// while holding a checked-out connection.
+///
+/// Normal-path code accesses the connection transparently via `Deref`/
+/// `DerefMut` (e.g. `held.conn.node_id` works unchanged). Move-out
+/// paths (`pool.release(...)`, `pool.discard(...)`) call `take()` to
+/// extract the connection, which disarms the Drop guard.
+struct OwnedConn {
+    inner: Option<BackendConnection>,
+    /// The pool to discard to on Drop. Cloned from `HeldBackend::source_pool`.
+    pool: Option<Arc<dyn ConnectionPool>>,
+}
+
+impl OwnedConn {
+    fn new(conn: BackendConnection, pool: Option<Arc<dyn ConnectionPool>>) -> Self {
+        OwnedConn { inner: Some(conn), pool }
+    }
+
+    /// Extracts the connection, disarming the Drop guard. The caller is
+    /// responsible for returning/discarding the connection to the pool.
+    fn take(&mut self) -> BackendConnection {
+        self.inner.take().expect("OwnedConn::take called on empty slot")
+    }
+}
+
+impl std::ops::Deref for OwnedConn {
+    type Target = BackendConnection;
+    fn deref(&self) -> &BackendConnection {
+        self.inner.as_ref().expect("OwnedConn deref on empty slot")
+    }
+}
+
+impl std::ops::DerefMut for OwnedConn {
+    fn deref_mut(&mut self) -> &mut BackendConnection {
+        self.inner.as_mut().expect("OwnedConn deref_mut on empty slot")
+    }
+}
+
+impl Drop for OwnedConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.inner.take() {
+            if let Some(ref pool) = self.pool {
+                tracing::warn!(
+                    node_id = %conn.node_id,
+                    backend_pid = conn.backend_pid,
+                    "panic/abort: discarding leaked backend connection to free pool slot"
+                );
+                let _ = pool.discard(conn);
+            }
+            // If pool is None the socket simply closes; no slot to free.
+        }
+    }
 }
 
 /// A complete backend connection checked out exclusively by this client.
 /// It is retained across statements while PostgreSQL reports an open/failed
 /// transaction, or after a session-state operation triggers pinning.
 struct HeldBackend {
-    conn: BackendConnection,
+    conn: OwnedConn,
     /// The pool this connection was originally acquired from. Used to
     /// return/discard the connection to the correct pool even after a
     /// node has been removed and re-added (which creates a new pool
@@ -288,6 +349,7 @@ impl ClientSession {
             failed_state_portals: HashMap::new(),
             local_set_stmts: HashMap::new(),
             local_set_portals: HashMap::new(),
+            write_function_stmts: std::collections::HashSet::new(),
         }
     }
 
@@ -579,7 +641,7 @@ where
     /// query routes to a different node, when an explicit transaction begins,
     /// or when the session closes.
     async fn release_cached_backend(&self, session: &mut ClientSession) {
-        if let Some(held) = session.cached_idle_backend.take() {
+        if let Some(mut held) = session.cached_idle_backend.take() {
             // If the connection is from a stale generation (node was
             // removed and re-added), discard it through its source pool
             // so that active_connections / known_connections accounting
@@ -596,12 +658,12 @@ where
 
             if stale {
                 if let Some(pool) = pool {
-                    let _ = pool.discard(held.conn);
+                    let _ = pool.discard(held.conn.take());
                 }
                 return;
             }
             if let Some(pool) = pool {
-                let _ = pool.release(&session.state.id, held.conn).await;
+                let _ = pool.release(&session.state.id, held.conn.take()).await;
             }
             // If pool not found (node removed entirely), connection is
             // simply dropped — socket closes, no slot to return.
@@ -632,12 +694,12 @@ where
         session: &mut ClientSession,
     ) {
         self.cancel_registry.clear_active(&session.state.id);
-        if let Some(held) = session.held_backend.take() {
+        if let Some(mut held) = session.held_backend.take() {
             let pool = held
                 .source_pool
                 .or_else(|| self.resolve_pool_existing(&held.conn.node_id, session));
             if let Some(pool) = pool {
-                let _ = pool.discard(held.conn);
+                let _ = pool.discard(held.conn.take());
             }
         }
     }
@@ -961,19 +1023,19 @@ where
         // find nothing if the session never acquired a connection.
         // A checked-out transaction/pinned connection is owned directly by
         // the session. Discard it so both the socket and pool slot are released.
-        if let Some(held) = session.held_backend.take() {
+        if let Some(mut held) = session.held_backend.take() {
             let pool = held
                 .source_pool
                 .or_else(|| self.resolve_pool_existing(&held.conn.node_id, &session));
             if let Some(pool) = pool {
-                if let Err(error) = pool.discard(held.conn) {
+                if let Err(error) = pool.discard(held.conn.take()) {
                     tracing::warn!(error = %error, "failed to discard held backend connection");
                 }
             }
         }
 
         // Release a cached clean idle backend.
-        if let Some(held) = session.cached_idle_backend.take() {
+        if let Some(mut held) = session.cached_idle_backend.take() {
             let stale = self
                 .connection_registry
                 .is_some_and(|r| held.conn.generation < r.node_generation(&held.conn.node_id));
@@ -983,11 +1045,11 @@ where
             if stale {
                 // Stale: discard through source pool to fix accounting.
                 if let Some(pool) = pool {
-                    let _ = pool.discard(held.conn);
+                    let _ = pool.discard(held.conn.take());
                 }
             } else {
                 if let Some(pool) = pool {
-                    let _ = pool.release(&session.state.id, held.conn).await;
+                    let _ = pool.release(&session.state.id, held.conn.take()).await;
                 }
             }
         }
@@ -1305,9 +1367,9 @@ where
         }
 
         self.cancel_registry.clear_active(&session.state.id);
-        if let Some(held) = session.held_backend.take() {
+        if let Some(mut held) = session.held_backend.take() {
             if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session) {
-                if let Err(error) = pool.discard(held.conn) {
+                if let Err(error) = pool.discard(held.conn.take()) {
                     tracing::warn!(error = %error, "failed to discard aborted transaction connection");
                 }
             } else {

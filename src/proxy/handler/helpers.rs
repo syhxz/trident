@@ -147,18 +147,38 @@ pub(super) fn assemble_extended_outbound_filtered(batch: &[ExtendedFrame], skip:
 }
 
 /// Records named-statement routes and forgets closed ones.
+/// `skip_indices` are frames that were handled locally (e.g. local SET)
+/// and never forwarded to the backend — recording routes for these would
+/// create phantom statement references on nodes that never received Parse.
 pub(super) fn record_statement_routes(
     session: &mut ClientSession,
     batch: &[ExtendedFrame],
     node_id: &str,
+    skip_indices: &[usize],
 ) {
-    for frame in batch {
+    use crate::parser::classifier::{Classifier, KeywordClassifier};
+    let classifier = KeywordClassifier;
+    for (i, frame) in batch.iter().enumerate() {
+        if skip_indices.contains(&i) {
+            continue;
+        }
         match frame.tag {
             frontend_tag::PARSE => match frame.parse_name() {
                 Some(name) if !name.is_empty() => {
                     session
                         .extended_route_tracker
                         .record_parse_route(name, node_id);
+                    // FIX: Track whether this statement's SQL contains
+                    // write function calls (setval, lo_create, etc.) so
+                    // cross-Sync Execute-only batches can correctly seed
+                    // write_detected even when CommandComplete is "SELECT".
+                    if let Some(sql) = frame.parse_sql() {
+                        if classifier.has_write_function_call(sql) {
+                            session.write_function_stmts.insert(name.to_string());
+                        } else {
+                            session.write_function_stmts.remove(name);
+                        }
+                    }
                 }
                 Some(_) => {
                     session.extended_route_tracker.forget_statement("");
@@ -175,6 +195,7 @@ pub(super) fn record_statement_routes(
                                 // caches when a statement is explicitly closed.
                                 session.state.prepared_stmts.remove(name);
                                 session.local_set_stmts.remove(name);
+                                session.write_function_stmts.remove(name);
                             } else {
                                 session.unnamed_parse_node = None;
                             }

@@ -441,12 +441,35 @@ where
                 0.0
             });
             if cost > settings.cost_threshold {
-                let node_id = self.select_all_candidates(analytics_nodes);
-                return Ok(RouteDecision::selected(
-                    NodeType::Analytics,
-                    node_id,
-                    "cost-based routing: exceeds cost_threshold",
-                ));
+                // FIX: Verify that at least one Analytics node satisfies
+                // the session's consistency requirement before routing
+                // there. Otherwise a strong-consistency session could
+                // read stale data from a lagging Analytics replica.
+                let eligible_analytics = self.consistency_passes(
+                    ctx.consistency,
+                    ctx.session_write_lsn,
+                    ctx.global_write_lsn,
+                    analytics_nodes,
+                );
+                if !eligible_analytics.is_empty() {
+                    let candidates: Vec<_> = eligible_analytics
+                        .iter()
+                        .filter_map(|id| analytics_nodes.iter().find(|n| n.node_id == *id))
+                        .map(|n| NodeCandidate {
+                            node_id: n.node_id.clone(),
+                            weight: n.weight,
+                            active_connections: n.active_connections,
+                        })
+                        .collect();
+                    let node_id = self.load_balancer.select(&candidates);
+                    return Ok(RouteDecision::selected(
+                        NodeType::Analytics,
+                        node_id,
+                        "cost-based routing: exceeds cost_threshold",
+                    ));
+                }
+                // No Analytics node satisfies consistency — fall through
+                // to the normal Reader consistency path below.
             }
         }
 

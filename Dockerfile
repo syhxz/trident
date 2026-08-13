@@ -9,8 +9,9 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /app
 
-# Copy the full source. Trident has no native/system dependencies (no
-# OpenSSL, no rustls) so no extra apt packages are needed to build it.
+# Copy the full source. Trident has no native/system dependencies beyond
+# glibc (TLS is handled via rustls, statically linked) so no extra apt
+# packages are needed to build it.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY console ./console
@@ -42,6 +43,15 @@ COPY --from=builder /app/trident /app/trident
 COPY config.yaml /app/config.yaml
 
 ENV TRIDENT_CONFIG=/app/config.yaml
+# Required by the fallback config.yaml which uses ${ENV_VAR} placeholders
+# for node passwords. Override at `docker run -e` / compose / k8s level.
+# These are ONLY used for health-check probes (passthrough mode uses
+# client credentials for queries). Set all four, or mount a custom
+# config.yaml that uses plaintext passwords or .pgpass.
+ENV TRIDENT_PRIMARY_PASSWORD=changeme
+ENV TRIDENT_READER1_PASSWORD=changeme
+ENV TRIDENT_READER2_PASSWORD=changeme
+ENV TRIDENT_ANALYTICS1_PASSWORD=changeme
 # Matches the default `proxy.listen_addr` in config.yaml; override the
 # port mapping at `docker run -p` / compose / k8s level if you change it.
 EXPOSE 6432

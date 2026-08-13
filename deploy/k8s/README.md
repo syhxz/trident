@@ -21,6 +21,18 @@ kubectl create secret generic trident-config \
   --from-file=config.yaml=./config.yaml \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# If your config.yaml uses ${ENV_VAR} placeholders for passwords (recommended),
+# create a separate Secret for the password environment variables:
+kubectl create secret generic trident-passwords \
+  --namespace trident \
+  --from-literal=TRIDENT_PRIMARY_PASSWORD=your_primary_pw \
+  --from-literal=TRIDENT_READER1_PASSWORD=your_reader1_pw \
+  --from-literal=TRIDENT_READER2_PASSWORD=your_reader2_pw \
+  --from-literal=TRIDENT_ANALYTICS1_PASSWORD=your_analytics1_pw \
+  --dry-run=client -o yaml | kubectl apply -f -
+# Then reference it in 20-deployment.yaml via envFrom or individual env entries.
+# If your config uses plaintext passwords, this step is not needed.
+
 kubectl apply -f deploy/k8s/20-deployment.yaml
 kubectl apply -f deploy/k8s/30-service.yaml
 

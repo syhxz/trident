@@ -37,6 +37,22 @@ spec:
               value: /etc/trident/config.yaml
             - name: RUST_LOG
               value: info
+            # If your config.yaml uses ${ENV_VAR} placeholders for node
+            # passwords (recommended), inject them from a separate Secret:
+            # - name: TRIDENT_PRIMARY_PASSWORD
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: trident-passwords
+            #       key: TRIDENT_PRIMARY_PASSWORD
+            # - name: TRIDENT_READER1_PASSWORD
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: trident-passwords
+            #       key: TRIDENT_READER1_PASSWORD
+            # Or use envFrom to load all keys from the Secret at once:
+            # envFrom:
+            #   - secretRef:
+            #       name: trident-passwords
           volumeMounts:
             - name: config
               mountPath: /etc/trident
