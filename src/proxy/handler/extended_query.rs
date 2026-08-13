@@ -214,24 +214,79 @@ where
                     session.state.tx_split = None;
                     session.tx_has_writes = false;
                     session.failed_state_portals.clear();
-                    // Synthetic ParseComplete + BindComplete + CommandComplete + RFQ(I)
-                    let parse_complete = [b'1', 0, 0, 0, 4];
-                    let bind_complete = [b'2', 0, 0, 0, 4];
-                    let cmd = crate::protocol::writer::encode_backend_message(
-                        &crate::protocol::message::BackendMessage::CommandComplete {
-                            tag: effective_tag.to_string(),
-                        },
-                    );
-                    // Only emit ParseComplete if there was a Parse in this batch.
-                    let has_parse_in_batch = batch.iter().any(|f| f.tag == frontend_tag::PARSE);
-                    if has_parse_in_batch {
-                        client_stream.write_all(&parse_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+
+                    // FIX: Process ALL frames in the batch to produce the
+                    // correct response sequence. In Failed state, non-txn-end
+                    // frames get 25P02 ErrorResponse; the txn-end Parse/Bind/
+                    // Execute get ParseComplete/BindComplete/CommandComplete.
+                    let txn_stmt = txn_parse_stmt_name.unwrap_or("");
+                    let txn_portal = txn_portal_name.unwrap_or("");
+                    for frame in batch.iter() {
+                        match frame.tag {
+                            tag_byte if tag_byte == frontend_tag::PARSE => {
+                                let is_txn_parse = frame.parse_name().unwrap_or("") == txn_stmt
+                                    && frame.parse_sql().and_then(crate::session::transaction::transaction_end_tag).is_some();
+                                if is_txn_parse {
+                                    let pc = [b'1', 0, 0, 0, 4];
+                                    client_stream.write_all(&pc).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                } else {
+                                    // Non-txn Parse in Failed state: 25P02.
+                                    let error = PgError::simple(
+                                        "ERROR", "25P02",
+                                        "current transaction is aborted, commands ignored until end of transaction block",
+                                    );
+                                    send_pg_error_response(client_stream, error).await?;
+                                }
+                            }
+                            tag_byte if tag_byte == frontend_tag::BIND => {
+                                let is_txn_bind = frame.bind_statement() == Some(txn_stmt);
+                                if is_txn_bind {
+                                    let bc = [b'2', 0, 0, 0, 4];
+                                    client_stream.write_all(&bc).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                } else {
+                                    let error = PgError::simple(
+                                        "ERROR", "25P02",
+                                        "current transaction is aborted, commands ignored until end of transaction block",
+                                    );
+                                    send_pg_error_response(client_stream, error).await?;
+                                }
+                            }
+                            tag_byte if tag_byte == frontend_tag::EXECUTE => {
+                                let is_txn_exec = frame.execute_portal() == Some(txn_portal);
+                                if is_txn_exec {
+                                    let cmd = crate::protocol::writer::encode_backend_message(
+                                        &crate::protocol::message::BackendMessage::CommandComplete {
+                                            tag: effective_tag.to_string(),
+                                        },
+                                    );
+                                    client_stream.write_all(&cmd).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                } else {
+                                    let error = PgError::simple(
+                                        "ERROR", "25P02",
+                                        "current transaction is aborted, commands ignored until end of transaction block",
+                                    );
+                                    send_pg_error_response(client_stream, error).await?;
+                                }
+                            }
+                            tag_byte if tag_byte == frontend_tag::DESCRIBE => {
+                                let error = PgError::simple(
+                                    "ERROR", "25P02",
+                                    "current transaction is aborted, commands ignored until end of transaction block",
+                                );
+                                send_pg_error_response(client_stream, error).await?;
+                            }
+                            tag_byte if tag_byte == frontend_tag::CLOSE => {
+                                // PostgreSQL processes Close even in Failed state.
+                                let cc = [b'3', 0, 0, 0, 4];
+                                client_stream.write_all(&cc).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            _ => {}
+                        }
                     }
-                    client_stream.write_all(&bind_complete).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    client_stream.write_all(&cmd).await
-                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     send_ready_for_query(client_stream, TxState::Idle).await?;
                     return Ok(());
                 } else if has_matching_bind && !has_matching_execute {
@@ -287,7 +342,120 @@ where
         // locally without forwarding to the backend.
         // Only intercept if ALL Bind frames in this batch reference local
         // set stmts — if mixed, fall through to normal processing.
+        //
+        // Also handle:
+        // - Describe('S', name) for local SET statements → synthetic response
+        // - Execute-only referencing a previously bound local SET portal
         if !batch.iter().any(|f| f.tag == frontend_tag::PARSE) {
+            // Check for Execute-only batch referencing a local SET portal
+            // (from a prior Bind-only batch).
+            if !batch.iter().any(|f| f.tag == frontend_tag::BIND) {
+                let local_exec = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::EXECUTE)
+                    .find_map(|f| {
+                        f.execute_portal().and_then(|p| {
+                            session.local_set_portals.get(p).cloned().map(|sql| (p.to_string(), sql))
+                        })
+                    });
+                if let Some((portal_name, sql)) = local_exec {
+                    // Apply the SET and respond to all frames in batch.
+                    session.state.apply_consistency_set_command(&sql);
+                    for frame in batch.iter() {
+                        match frame.tag {
+                            tag if tag == frontend_tag::EXECUTE => {
+                                let is_local = frame.execute_portal()
+                                    .is_some_and(|p| p == portal_name);
+                                if is_local {
+                                    let cmd_complete = crate::protocol::writer::encode_backend_message(
+                                        &crate::protocol::message::BackendMessage::CommandComplete {
+                                            tag: "SET".to_string(),
+                                        },
+                                    );
+                                    client_stream.write_all(&cmd_complete).await
+                                        .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                } else {
+                                    // Non-local Execute in same batch: error
+                                    // (should not happen in well-formed usage).
+                                    let error = PgError::simple(
+                                        "ERROR",
+                                        "34000",
+                                        "portal does not exist",
+                                    );
+                                    send_pg_error_response(client_stream, error).await?;
+                                }
+                            }
+                            tag if tag == frontend_tag::DESCRIBE => {
+                                // Describe('P', portal) for the local SET portal.
+                                // SET produces no rows: NoData.
+                                let no_data = [b'n', 0, 0, 0, 4];
+                                client_stream.write_all(&no_data).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            tag if tag == frontend_tag::CLOSE => {
+                                // Close the virtual portal.
+                                if let Some((kind, name)) = frame.kind_and_name() {
+                                    if kind == b'P' {
+                                        session.local_set_portals.remove(name);
+                                    }
+                                }
+                                let close_complete = [b'3', 0, 0, 0, 4];
+                                client_stream.write_all(&close_complete).await
+                                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    send_ready_for_query(client_stream, session.state.tx_state).await?;
+                    return Ok(());
+                }
+            }
+
+            // Handle Describe('S', stmt_name) for local SET statements.
+            // Must come before the Bind check since a batch could be
+            // Describe-only.
+            let describe_local = batch.iter()
+                .filter(|f| f.tag == frontend_tag::DESCRIBE)
+                .all(|f| {
+                    f.kind_and_name()
+                        .is_some_and(|(kind, name)| kind == b'S' && session.local_set_stmts.contains_key(name))
+                });
+            let has_only_describe_and_close = describe_local
+                && !batch.iter().any(|f| f.tag == frontend_tag::BIND)
+                && !batch.iter().any(|f| f.tag == frontend_tag::EXECUTE)
+                && batch.iter().any(|f| f.tag == frontend_tag::DESCRIBE);
+            if has_only_describe_and_close {
+                // Respond to each frame in the batch.
+                for frame in batch.iter() {
+                    match frame.tag {
+                        tag if tag == frontend_tag::DESCRIBE => {
+                            // SET has no parameters and no result columns.
+                            // ParameterDescription (0 params) + NoData.
+                            let param_desc = [b't', 0, 0, 0, 6, 0, 0]; // tag + len(6) + 0 params
+                            let no_data = [b'n', 0, 0, 0, 4];
+                            client_stream.write_all(&param_desc).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                            client_stream.write_all(&no_data).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        }
+                        tag if tag == frontend_tag::CLOSE => {
+                            if let Some((kind, name)) = frame.kind_and_name() {
+                                if kind == b'S' {
+                                    session.local_set_stmts.remove(name);
+                                } else if kind == b'P' {
+                                    session.local_set_portals.remove(name);
+                                }
+                            }
+                            let close_complete = [b'3', 0, 0, 0, 4];
+                            client_stream.write_all(&close_complete).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        }
+                        _ => {}
+                    }
+                }
+                send_ready_for_query(client_stream, session.state.tx_state).await?;
+                return Ok(());
+            }
+
             let all_binds_are_local = batch.iter()
                 .filter(|f| f.tag == frontend_tag::BIND)
                 .all(|f| {
@@ -342,6 +510,14 @@ where
                     return Ok(());
                 } else {
                     // Bind-only (no Execute): respond with BindComplete.
+                    // FIX (Bug 4): Record the portal so a later Execute-only
+                    // batch can resolve it locally.
+                    if let Some(portal) = bind_portal {
+                        session.local_set_portals.insert(
+                            portal.to_string(),
+                            sql.clone(),
+                        );
+                    }
                     let bind_complete = [b'2', 0, 0, 0, 4];
                     client_stream.write_all(&bind_complete).await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
@@ -361,31 +537,45 @@ where
         // indices of SET-related frames for filtered forwarding.
         let mut held_set_skip_indices: Vec<usize> = Vec::new();
         if session.held_backend.is_some() {
-            // Find the SET consistency Parse frame (if any).
-            let set_parse = batch.iter()
-                .filter(|f| f.tag == frontend_tag::PARSE)
-                .find(|f| {
+            // Collect ALL SET consistency Parse frames (not just the first).
+            let set_parse_frames: Vec<_> = batch.iter()
+                .enumerate()
+                .filter(|(_, f)| f.tag == frontend_tag::PARSE)
+                .filter(|(_, f)| {
                     f.parse_sql()
                         .map(|s| session.state.is_consistency_set_command(s))
                         .unwrap_or(false)
-                });
+                })
+                .map(|(i, f)| (i, f.parse_sql().unwrap(), f.parse_name().unwrap_or("")))
+                .collect();
 
-            if let Some(set_frame) = set_parse {
-                let sql = set_frame.parse_sql().unwrap(); // safe: filter above
-                let set_stmt_name = set_frame.parse_name().unwrap_or("");
+            if !set_parse_frames.is_empty() {
+                let set_stmt_names: Vec<&str> = set_parse_frames.iter()
+                    .map(|(_, _, name)| *name)
+                    .collect();
+                let first_sql = set_parse_frames[0].1;
+                let first_stmt_name = set_parse_frames[0].2;
 
-                // FIX (Bug 1): Verify Bind references THIS Parse's statement name.
+                // Find all portals bound to SET statements.
+                let set_portal_names: Vec<&str> = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND)
+                    .filter(|f| {
+                        f.bind_statement()
+                            .map(|s| set_stmt_names.contains(&s))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|f| f.bind_portal())
+                    .collect();
+
                 let has_matching_bind = batch.iter().any(|f| {
                     f.tag == frontend_tag::BIND
-                        && f.bind_statement() == Some(set_stmt_name)
+                        && f.bind_statement() == Some(first_stmt_name)
                 });
 
-                // Find the portal created by the matching Bind.
                 let set_portal_name = batch.iter()
-                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(set_stmt_name))
+                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name))
                     .find_map(|f| f.bind_portal());
 
-                // Verify Execute references the correct portal.
                 let has_matching_execute = set_portal_name.is_some_and(|portal| {
                     batch.iter().any(|f| {
                         f.tag == frontend_tag::EXECUTE
@@ -398,7 +588,7 @@ where
                 if parse_count <= 1 {
                     if has_matching_bind && has_matching_execute {
                         // Full Parse+Bind+Execute for the SET: apply and respond.
-                        session.state.apply_consistency_set_command(sql);
+                        session.state.apply_consistency_set_command(first_sql);
                         use crate::protocol::writer::encode_backend_message;
                         use crate::protocol::message::BackendMessage;
                         let parse_complete = [b'1', 0, 0, 0, 4];
@@ -420,10 +610,10 @@ where
                         // Parse-only: don't apply yet. Return ParseComplete.
                         // FIX (Bug 1/3): Always send RFQ. Also record virtual
                         // prepared statement for cross-Sync support.
-                        if !set_stmt_name.is_empty() {
+                        if !first_stmt_name.is_empty() {
                             session.local_set_stmts.insert(
-                                set_stmt_name.to_string(),
-                                sql.to_string(),
+                                first_stmt_name.to_string(),
+                                first_sql.to_string(),
                             );
                         }
                         let parse_complete = [b'1', 0, 0, 0, 4];
@@ -435,13 +625,26 @@ where
                     // Bind references a DIFFERENT statement than the SET Parse →
                     // do NOT intercept, fall through to forward to backend.
                 } else {
-                    // Multi-Parse pipeline batch: apply SET only if there is
-                    // a matching Bind+Execute for the SET's statement.
-                    if has_matching_bind && has_matching_execute {
-                        session.state.apply_consistency_set_command(sql);
+                    // Multi-Parse pipeline batch: apply each SET that has
+                    // a matching Bind+Execute.
+                    for &(_, sql, sname) in &set_parse_frames {
+                        let has_bind = batch.iter().any(|f| {
+                            f.tag == frontend_tag::BIND
+                                && f.bind_statement() == Some(sname)
+                        });
+                        let portal = batch.iter()
+                            .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname))
+                            .find_map(|f| f.bind_portal());
+                        let has_exec = portal.is_some_and(|p| {
+                            batch.iter().any(|f| {
+                                f.tag == frontend_tag::EXECUTE && f.execute_portal() == Some(p)
+                            })
+                        });
+                        if has_bind && has_exec {
+                            session.state.apply_consistency_set_command(sql);
+                        }
                     }
-                    // FIX (Bug 2): Collect indices of SET-related frames so
-                    // they can be filtered out before forwarding to backend.
+                    // Collect indices of ALL SET-related frames.
                     for (i, frame) in batch.iter().enumerate() {
                         let should_skip = match frame.tag {
                             tag if tag == frontend_tag::PARSE => {
@@ -450,18 +653,33 @@ where
                                     .unwrap_or(false)
                             }
                             tag if tag == frontend_tag::BIND => {
-                                frame.bind_statement() == Some(set_stmt_name)
+                                frame.bind_statement()
+                                    .map(|s| set_stmt_names.contains(&s))
+                                    .unwrap_or(false)
                             }
                             tag if tag == frontend_tag::EXECUTE => {
-                                set_portal_name.is_some_and(|p| {
-                                    frame.execute_portal() == Some(p)
-                                })
+                                frame.execute_portal()
+                                    .map(|p| set_portal_names.contains(&p))
+                                    .unwrap_or(false)
                             }
                             _ => false,
                         };
                         if should_skip {
                             held_set_skip_indices.push(i);
                         }
+                    }
+
+                    // FIX: If ALL frames were SET-related, handle entirely
+                    // locally without forwarding to the held backend.
+                    if held_set_skip_indices.len() == batch.len() {
+                        use super::helpers::compute_synthetic_schedule;
+                        let schedule = compute_synthetic_schedule(batch, &held_set_skip_indices);
+                        if !schedule[0].is_empty() {
+                            client_stream.write_all(&schedule[0]).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        }
+                        send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        return Ok(());
                     }
                     // Fall through to forward remaining batch to held backend.
                 }
@@ -671,7 +889,18 @@ where
                 if requires_writer(&classifier, sql) || !kind.readable() {
                     route_sql = Some(sql);
                     force_writer = true;
-                    sql_is_write = true;
+                    // FIX (Bug 5): Only seed sql_is_write when this Parse
+                    // has a matching Bind in the batch (i.e. it will actually
+                    // execute). Parse-only (preparation without execution)
+                    // should not create a write watermark.
+                    let stmt_name = frame.parse_name().unwrap_or("");
+                    let has_bind = batch.iter().any(|f| {
+                        f.tag == frontend_tag::BIND
+                            && f.bind_statement() == Some(stmt_name)
+                    });
+                    if has_bind {
+                        sql_is_write = true;
+                    }
                 }
             }
             // Check routing hints — ForceWriter wins over ForceReader.
@@ -730,31 +959,51 @@ where
         // FIX (Bug 2): In multi-Parse batches, collect indices of SET-related
         // frames to filter them out before forwarding to backend.
         let mut set_frame_skip_indices: Vec<usize> = Vec::new();
-        let set_parse_frame = batch.iter()
-            .filter(|f| f.tag == frontend_tag::PARSE)
-            .find(|f| {
+        // Collect ALL SET consistency Parse frames (not just the first).
+        // A batch may contain multiple SET commands; we must filter all of
+        // them and their corresponding Bind/Execute frames.
+        let set_parse_frames: Vec<_> = batch.iter()
+            .enumerate()
+            .filter(|(_, f)| f.tag == frontend_tag::PARSE)
+            .filter(|(_, f)| {
                 f.parse_sql()
                     .map(|s| session.state.is_consistency_set_command(s))
                     .unwrap_or(false)
-            });
+            })
+            .map(|(i, f)| (i, f.parse_sql().unwrap(), f.parse_name().unwrap_or("")))
+            .collect();
 
-        if let Some(set_frame) = set_parse_frame {
-            let sql = set_frame.parse_sql().unwrap(); // safe: filter above
+        if !set_parse_frames.is_empty() {
+            // Collect all SET statement names for Bind matching.
+            let set_stmt_names: Vec<&str> = set_parse_frames.iter()
+                .map(|(_, _, name)| *name)
+                .collect();
+
+            // For the single-SET, single-Parse path we still need the
+            // first SET's info for backward-compatible behavior.
+            let first_sql = set_parse_frames[0].1;
+            let first_stmt_name = set_parse_frames[0].2;
+
             if session.state.tx_state != TxState::Failed {
-                let set_stmt_name = set_frame.parse_name().unwrap_or("");
+                // Find all portals bound to SET statements.
+                let set_portal_names: Vec<&str> = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND)
+                    .filter(|f| {
+                        f.bind_statement()
+                            .map(|s| set_stmt_names.contains(&s))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|f| f.bind_portal())
+                    .collect();
 
-                // FIX (Bug 1): Verify Bind references THIS Parse's statement name.
+                // Check if there's at least one matching Bind+Execute for the first SET.
                 let has_matching_bind = batch.iter().any(|f| {
                     f.tag == frontend_tag::BIND
-                        && f.bind_statement() == Some(set_stmt_name)
+                        && f.bind_statement() == Some(first_stmt_name)
                 });
-
-                // Find the portal created by the matching Bind.
                 let set_portal_name = batch.iter()
-                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(set_stmt_name))
+                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name))
                     .find_map(|f| f.bind_portal());
-
-                // Verify Execute references the correct portal.
                 let has_matching_execute = set_portal_name.is_some_and(|portal| {
                     batch.iter().any(|f| {
                         f.tag == frontend_tag::EXECUTE
@@ -768,7 +1017,7 @@ where
                     if has_matching_bind && has_matching_execute {
                         // Full Parse+Bind+Execute cycle for the SET: apply
                         // and return synthetic response.
-                        session.state.apply_consistency_set_command(sql);
+                        session.state.apply_consistency_set_command(first_sql);
                         use crate::protocol::writer::encode_backend_message;
                         use crate::protocol::message::BackendMessage;
                         let parse_complete = [b'1', 0, 0, 0, 4];
@@ -791,10 +1040,10 @@ where
                         // preparing the statement. Return ParseComplete only.
                         // FIX (Bug 1/3): Always send RFQ. Also record virtual
                         // prepared statement for cross-Sync support.
-                        if !set_stmt_name.is_empty() {
+                        if !first_stmt_name.is_empty() {
                             session.local_set_stmts.insert(
-                                set_stmt_name.to_string(),
-                                sql.to_string(),
+                                first_stmt_name.to_string(),
+                                first_sql.to_string(),
                             );
                         }
                         let parse_complete = [b'1', 0, 0, 0, 4];
@@ -806,14 +1055,27 @@ where
                     // Bind references a DIFFERENT statement → do NOT intercept.
                     // Fall through to normal routing.
                 } else {
-                    // Multi-Parse pipeline batch: apply SET only if there's
-                    // a matching Bind+Execute for the SET statement.
-                    if has_matching_bind && has_matching_execute {
-                        session.state.apply_consistency_set_command(sql);
+                    // Multi-Parse pipeline batch: apply each SET that has a
+                    // matching Bind+Execute.
+                    for &(_, sql, sname) in &set_parse_frames {
+                        let has_bind = batch.iter().any(|f| {
+                            f.tag == frontend_tag::BIND
+                                && f.bind_statement() == Some(sname)
+                        });
+                        let portal = batch.iter()
+                            .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname))
+                            .find_map(|f| f.bind_portal());
+                        let has_exec = portal.is_some_and(|p| {
+                            batch.iter().any(|f| {
+                                f.tag == frontend_tag::EXECUTE && f.execute_portal() == Some(p)
+                            })
+                        });
+                        if has_bind && has_exec {
+                            session.state.apply_consistency_set_command(sql);
+                        }
                     }
-                    // FIX (Bug 2): Collect indices of SET-related frames so
-                    // they can be filtered out before forwarding to backend.
-                    // The backend does not recognize this GUC and would error.
+                    // Collect indices of ALL SET-related frames (Parse, Bind,
+                    // Execute) so they can be filtered out before forwarding.
                     for (i, frame) in batch.iter().enumerate() {
                         let should_skip = match frame.tag {
                             tag if tag == frontend_tag::PARSE => {
@@ -822,12 +1084,14 @@ where
                                     .unwrap_or(false)
                             }
                             tag if tag == frontend_tag::BIND => {
-                                frame.bind_statement() == Some(set_stmt_name)
+                                frame.bind_statement()
+                                    .map(|s| set_stmt_names.contains(&s))
+                                    .unwrap_or(false)
                             }
                             tag if tag == frontend_tag::EXECUTE => {
-                                set_portal_name.is_some_and(|p| {
-                                    frame.execute_portal() == Some(p)
-                                })
+                                frame.execute_portal()
+                                    .map(|p| set_portal_names.contains(&p))
+                                    .unwrap_or(false)
                             }
                             _ => false,
                         };
@@ -846,6 +1110,22 @@ where
                         if requires_writer(&classifier, new_sql) {
                             sql_is_write = true;
                         }
+                    }
+
+                    // FIX: If ALL frames in the batch were SET-related (no
+                    // remaining forwarded frames), handle entirely locally.
+                    // No need to acquire a backend connection.
+                    if set_frame_skip_indices.len() == batch.len() {
+                        use super::helpers::compute_synthetic_schedule;
+                        let schedule = compute_synthetic_schedule(batch, &set_frame_skip_indices);
+                        // schedule[0] contains all synthetic responses (since
+                        // forwarded_count=0, there's only one slot).
+                        if !schedule[0].is_empty() {
+                            client_stream.write_all(&schedule[0]).await
+                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                        }
+                        send_ready_for_query(client_stream, session.state.tx_state).await?;
+                        return Ok(());
                     }
                 }
             }
@@ -1192,37 +1472,15 @@ where
         // Send all buffered raw frames + Sync to the backend in one write.
         // No re-encoding: the bytes the client sent are forwarded verbatim.
         //
-        // FIX (Bug 2): If multi-Parse batch had SET frames, send synthetic
-        // responses for the SET frames BEFORE forwarding the rest, and use
-        // filtered assembly to exclude them from the backend payload.
-        if !set_frame_skip_indices.is_empty() {
-            // Send synthetic responses for each skipped frame in order.
-            for &idx in &set_frame_skip_indices {
-                let frame = &batch[idx];
-                match frame.tag {
-                    tag if tag == frontend_tag::PARSE => {
-                        let parse_complete = [b'1', 0, 0, 0, 4];
-                        client_stream.write_all(&parse_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    }
-                    tag if tag == frontend_tag::BIND => {
-                        let bind_complete = [b'2', 0, 0, 0, 4];
-                        client_stream.write_all(&bind_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    }
-                    tag if tag == frontend_tag::EXECUTE => {
-                        let cmd_complete = crate::protocol::writer::encode_backend_message(
-                            &crate::protocol::message::BackendMessage::CommandComplete {
-                                tag: "SET".to_string(),
-                            },
-                        );
-                        client_stream.write_all(&cmd_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // FIX: If multi-Parse batch had SET frames, compute an interleaving
+        // schedule so synthetic responses are emitted at the correct position
+        // relative to backend responses (preserving protocol ordering).
+        let synthetic_schedule = if !set_frame_skip_indices.is_empty() {
+            use super::helpers::compute_synthetic_schedule;
+            Some(compute_synthetic_schedule(batch, &set_frame_skip_indices))
+        } else {
+            None
+        };
         let outbound = if set_frame_skip_indices.is_empty() {
             assemble_extended_outbound(batch)
         } else {
@@ -1236,6 +1494,14 @@ where
             conn.backend_pid,
             conn.secret_key,
         );
+
+        // Emit any synthetic responses that precede all forwarded frames.
+        if let Some(ref schedule) = synthetic_schedule {
+            if !schedule[0].is_empty() {
+                client_stream.write_all(&schedule[0]).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+            }
+        }
 
         if let Err(e) = conn.stream.write_all(&outbound).await {
             self.discard_backend(&pool, conn, &session.state.id)?;
@@ -1261,6 +1527,32 @@ where
             }
             _ => None,
         };
+
+        // Build the expected response-boundary sequence for forwarded frames
+        // so we can inject synthetics at the correct positions.
+        // Each forwarded frame type has a "terminating" response message:
+        //   Parse('P')    → ParseComplete('1')
+        //   Bind('B')     → BindComplete('2')
+        //   Execute('E')  → CommandComplete('C') | EmptyQueryResponse('I') | PortalSuspended('s')
+        //   Describe('D') → RowDescription('T') | NoData('n') | ParameterDescription('t' followed by 'T'/'n')
+        //   Close('C')    → CloseComplete('3')
+        // After an ErrorResponse, the backend skips remaining frames until
+        // Sync, so we stop tracking boundaries on error.
+        let forwarded_frame_tags: Vec<u8> = if synthetic_schedule.is_some() {
+            batch.iter().enumerate()
+                .filter(|(i, _)| !set_frame_skip_indices.contains(i))
+                .map(|(_, f)| f.tag)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Track which forwarded frame's response we're currently receiving.
+        // Incremented when we see the boundary message for the current frame.
+        let mut forwarded_response_idx: usize = 0;
+        // For Describe frames, ParameterDescription is followed by
+        // RowDescription or NoData — we need to wait for the second message.
+        let mut _describe_awaiting_row_desc = false;
+
         let tx_status = loop {
             let (tag, body) = match read_tagged_frame(&mut conn.stream).await {
                 Ok(frame) => frame,
@@ -1314,13 +1606,36 @@ where
                         self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
                     }
+                    // CommandComplete is a boundary for Execute frames.
+                    if !had_error {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            if cur_tag == frontend_tag::EXECUTE {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 b'E' => {
-                    // ErrorResponse.
+                    // ErrorResponse: after this, backend skips remaining
+                    // frames until Sync. Stop boundary tracking.
                     had_error = true;
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
                         self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
+                    }
+                    // On error, all remaining synthetics (if any) are
+                    // effectively cancelled — the client will see RFQ('E')
+                    // next and knows the batch failed. Move idx to end.
+                    if synthetic_schedule.is_some() {
+                        forwarded_response_idx = forwarded_frame_tags.len();
                     }
                 }
                 b'G' => {
@@ -1372,6 +1687,50 @@ where
                         return Err(e);
                     }
                 }
+                b'I' => {
+                    // EmptyQueryResponse: boundary for Execute (empty query string).
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.discard_backend(&pool, conn, &session.state.id)?;
+                        return Err(e);
+                    }
+                    if !had_error {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            if cur_tag == frontend_tag::EXECUTE {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                b's' => {
+                    // PortalSuspended: boundary for Execute (max rows reached).
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.discard_backend(&pool, conn, &session.state.id)?;
+                        return Err(e);
+                    }
+                    if !had_error {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            if cur_tag == frontend_tag::EXECUTE {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {
                     // Everything else (ParseComplete, BindComplete, DataRow,
                     // RowDescription, NoData, ParameterDescription,
@@ -1379,6 +1738,48 @@ where
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
                         self.discard_backend(&pool, conn, &session.state.id)?;
                         return Err(e);
+                    }
+                    // Check boundary conditions for non-Execute frames.
+                    if !had_error && synthetic_schedule.is_some() {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            let is_boundary = match tag {
+                                b'1' => cur_tag == frontend_tag::PARSE,        // ParseComplete
+                                b'2' => cur_tag == frontend_tag::BIND,         // BindComplete
+                                b'3' => cur_tag == frontend_tag::CLOSE,        // CloseComplete
+                                b'T' => {
+                                    // RowDescription: boundary for Describe
+                                    // (either Statement or Portal). Also
+                                    // concludes ParameterDescription sequence.
+                                    _describe_awaiting_row_desc = false;
+                                    cur_tag == frontend_tag::DESCRIBE
+                                }
+                                b'n' => {
+                                    // NoData: boundary for Describe when the
+                                    // statement has no result columns.
+                                    _describe_awaiting_row_desc = false;
+                                    cur_tag == frontend_tag::DESCRIBE
+                                }
+                                b't' => {
+                                    // ParameterDescription: for Describe('S'),
+                                    // this precedes RowDescription/NoData.
+                                    // NOT a boundary by itself.
+                                    _describe_awaiting_row_desc = true;
+                                    false
+                                }
+                                _ => false,
+                            };
+                            if is_boundary {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1478,36 +1879,15 @@ where
         // Send all buffered raw frames + Sync to the backend in one write.
         // No re-encoding: the bytes the client sent are forwarded verbatim.
         //
-        // FIX (Bug 2): If multi-Parse batch had SET frames, send synthetic
-        // responses for the SET frames BEFORE forwarding the rest, and use
-        // filtered assembly to exclude them from the backend payload.
-        if !set_skip_indices.is_empty() {
-            for &idx in set_skip_indices {
-                let frame = &batch[idx];
-                match frame.tag {
-                    tag if tag == frontend_tag::PARSE => {
-                        let parse_complete = [b'1', 0, 0, 0, 4];
-                        client_stream.write_all(&parse_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    }
-                    tag if tag == frontend_tag::BIND => {
-                        let bind_complete = [b'2', 0, 0, 0, 4];
-                        client_stream.write_all(&bind_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    }
-                    tag if tag == frontend_tag::EXECUTE => {
-                        let cmd_complete = crate::protocol::writer::encode_backend_message(
-                            &crate::protocol::message::BackendMessage::CommandComplete {
-                                tag: "SET".to_string(),
-                            },
-                        );
-                        client_stream.write_all(&cmd_complete).await
-                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // FIX: If multi-Parse batch had SET frames, compute an interleaving
+        // schedule so synthetic responses are emitted at the correct position
+        // relative to backend responses (preserving protocol ordering).
+        let synthetic_schedule = if !set_skip_indices.is_empty() {
+            use super::helpers::compute_synthetic_schedule;
+            Some(compute_synthetic_schedule(batch, set_skip_indices))
+        } else {
+            None
+        };
         let outbound = if set_skip_indices.is_empty() {
             assemble_extended_outbound(batch)
         } else {
@@ -1521,6 +1901,14 @@ where
             held.conn.backend_pid,
             held.conn.secret_key,
         );
+
+        // Emit any synthetic responses that precede all forwarded frames.
+        if let Some(ref schedule) = synthetic_schedule {
+            if !schedule[0].is_empty() {
+                client_stream.write_all(&schedule[0]).await
+                    .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+            }
+        }
 
         if let Err(e) = held.conn.stream.write_all(&outbound).await {
             self.discard_held_backend(session);
@@ -1537,14 +1925,28 @@ where
         // so pending_write is correctly recorded even when CommandComplete
         // just says "SELECT 1". Mirrors the non-held path's force_writer
         // initialization.
-        let mut write_detected = batch.iter().any(|frame| {
-            if frame.tag == frontend_tag::PARSE {
-                if let Some(sql) = frame.parse_sql() {
-                    return requires_writer(&KeywordClassifier, sql);
+        // FIX (Bug 5): Only count Parse frames that have a matching
+        // Bind+Execute in this batch — Parse-only (preparation without
+        // execution) should not seed write_detected.
+        let mut write_detected = batch.iter().enumerate()
+            .filter(|(i, _)| !set_skip_indices.contains(i))
+            .any(|(_, frame)| {
+                if frame.tag == frontend_tag::PARSE {
+                    if let Some(sql) = frame.parse_sql() {
+                        if !requires_writer(&KeywordClassifier, sql) {
+                            return false;
+                        }
+                        // Check if there's a matching Bind+Execute for this Parse.
+                        let stmt_name = frame.parse_name().unwrap_or("");
+                        let has_bind = batch.iter().any(|f| {
+                            f.tag == frontend_tag::BIND
+                                && f.bind_statement() == Some(stmt_name)
+                        });
+                        return has_bind;
+                    }
                 }
-            }
-            false
-        });
+                false
+            });
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {
@@ -1553,6 +1955,19 @@ where
             }
             _ => None,
         };
+
+        // Build expected response-boundary sequence for forwarded frames.
+        let forwarded_frame_tags: Vec<u8> = if synthetic_schedule.is_some() {
+            batch.iter().enumerate()
+                .filter(|(i, _)| !set_skip_indices.contains(i))
+                .map(|(_, f)| f.tag)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut forwarded_response_idx: usize = 0;
+        let mut _describe_awaiting_row_desc = false;
+
         let tx_status = loop {
             let (tag, body) = match read_tagged_frame(&mut held.conn.stream).await {
                 Ok(frame) => frame,
@@ -1599,12 +2014,31 @@ where
                         self.discard_held_backend(session);
                         return Err(e);
                     }
+                    // CommandComplete is a boundary for Execute frames.
+                    if !had_error {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            if cur_tag == frontend_tag::EXECUTE {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 b'E' => {
                     had_error = true;
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
                         self.discard_held_backend(session);
                         return Err(e);
+                    }
+                    if synthetic_schedule.is_some() {
+                        forwarded_response_idx = forwarded_frame_tags.len();
                     }
                 }
                 b'G' => {
@@ -1649,10 +2083,88 @@ where
                         return Err(e);
                     }
                 }
+                b'I' => {
+                    // EmptyQueryResponse: boundary for Execute.
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.discard_held_backend(session);
+                        return Err(e);
+                    }
+                    if !had_error {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            if cur_tag == frontend_tag::EXECUTE {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                b's' => {
+                    // PortalSuspended: boundary for Execute.
+                    if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
+                        self.discard_held_backend(session);
+                        return Err(e);
+                    }
+                    if !had_error {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            if cur_tag == frontend_tag::EXECUTE {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {
                     if let Err(e) = write_raw_frame_to(client_stream, tag, &body).await {
                         self.discard_held_backend(session);
                         return Err(e);
+                    }
+                    // Check boundary conditions for non-Execute frames.
+                    if !had_error && synthetic_schedule.is_some() {
+                        if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
+                            let is_boundary = match tag {
+                                b'1' => cur_tag == frontend_tag::PARSE,
+                                b'2' => cur_tag == frontend_tag::BIND,
+                                b'3' => cur_tag == frontend_tag::CLOSE,
+                                b'T' => {
+                                    _describe_awaiting_row_desc = false;
+                                    cur_tag == frontend_tag::DESCRIBE
+                                }
+                                b'n' => {
+                                    _describe_awaiting_row_desc = false;
+                                    cur_tag == frontend_tag::DESCRIBE
+                                }
+                                b't' => {
+                                    _describe_awaiting_row_desc = true;
+                                    false
+                                }
+                                _ => false,
+                            };
+                            if is_boundary {
+                                forwarded_response_idx += 1;
+                                if let Some(ref schedule) = synthetic_schedule {
+                                    if let Some(syn) = schedule.get(forwarded_response_idx) {
+                                        if !syn.is_empty() {
+                                            client_stream.write_all(syn).await
+                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

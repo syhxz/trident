@@ -60,6 +60,11 @@ pub struct HealthCheckResult {
     pub replication_lag_ms: Option<u64>,
     /// Whether this check is treated as a failure due to timing out
     pub timed_out: bool,
+    /// The Writer's timeline ID from `pg_control_checkpoint()`. Used to
+    /// detect genuine failover/timeline switches. A change in timeline_id
+    /// indicates the Writer has been promoted from a different timeline
+    /// and its LSN space is incomparable to the previous Writer's.
+    pub writer_timeline_id: Option<u32>,
 }
 
 impl HealthCheckResult {
@@ -265,8 +270,17 @@ impl HealthProbe for WireProtocolHealthProbe {
                 if let Ok(Some(lsn)) = query_aurora_durable_lsn(&mut stream).await {
                     result.current_wal_lsn = Some(lsn);
                 }
-            } else if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
-                result.current_wal_lsn = Some(lsn);
+                // Aurora manages failover internally; timeline_id is not
+                // meaningful. We leave writer_timeline_id as None — the
+                // epoch logic will never trigger a reset for Aurora.
+            } else {
+                if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
+                    result.current_wal_lsn = Some(lsn);
+                }
+                // Query timeline_id for failover detection on standard PG.
+                if let Ok(tl) = query_timeline_id(&mut stream).await {
+                    result.writer_timeline_id = tl;
+                }
             }
         } else if node_type == NodeType::Reader {
             if self.aurora_native {
@@ -491,6 +505,22 @@ async fn query_replication_lag_ms<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(value.and_then(|v| v.parse::<f64>().ok()).map(|ms| ms.max(0.0) as u64))
 }
 
+/// Queries the Writer's current timeline ID from `pg_control_checkpoint()`.
+/// Returns `None` if the query fails (e.g., insufficient privileges — requires
+/// `pg_read_all_settings` or superuser on PG < 15, unrestricted on PG >= 15).
+/// The timeline_id is the key signal for detecting genuine failover events:
+/// after a standby promotion, the new primary continues on a new timeline.
+async fn query_timeline_id<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+) -> Result<Option<u32>, ()> {
+    let value = run_simple_query_first_column(
+        stream,
+        "SELECT timeline_id FROM pg_control_checkpoint()",
+    )
+    .await?;
+    Ok(value.and_then(|v| v.trim().parse::<u32>().ok()))
+}
+
 /// Queries the Writer's durable LSN from Aurora's `aurora_replica_status()`
 /// system function. The Writer row is identified by `session_id = 'MASTER_SESSION_ID'`.
 /// Returns the LSN in the same `u64` format used throughout the codebase
@@ -579,6 +609,10 @@ struct TrackedNode {
     /// a node with this ID is added. Allows rejecting stale probe results
     /// from a previous incarnation after remove/re-add.
     generation: u64,
+    /// Writer: last observed timeline_id from `pg_control_checkpoint()`.
+    /// Used to detect genuine failover (timeline changes). `None` means
+    /// timeline has never been observed for this node.
+    last_timeline_id: Option<u32>,
 }
 
 /// Health checker: manages the health state and LSN/lag snapshots of a
@@ -641,6 +675,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                     last_current_wal_lsn: 0,
                     last_replication_lag_ms: None,
                     generation: 1,
+                    last_timeline_id: None,
                 },
             );
         }
@@ -760,32 +795,48 @@ impl<P: HealthProbe> HealthChecker<P> {
                 // health checker periodically brings the global watermark
                 // up to the Writer's true position.
                 //
-                // FIX: Only advance when the probe is successful AND
-                // confirmed as a Writer (role-aware check passed). A failed
-                // probe or role-mismatched node should not influence the
-                // global watermark.
-                //
-                // FIX (timeline isolation): If the Writer's LSN is lower
-                // than the current global LSN, this indicates a timeline
-                // switch (failover to a new primary with lower LSN). Reset
-                // the global watermark to the new Writer's position to
-                // prevent Global consistency reads from blocking forever.
+                // Only advance when the probe is successful AND confirmed
+                // as a Writer (role-aware check passed). A failed probe or
+                // role-mismatched node should not influence the watermark.
                 if success && node.node_type == NodeType::Writer {
                     if let Some(ref tracker) = self.lsn_tracker {
-                        let current_global = tracker.global_write_lsn();
-                        if lsn < current_global {
+                        // Timeline switch detection: if the Writer's
+                        // timeline_id changed, a genuine failover occurred.
+                        // The new Writer's LSN space is incomparable to the
+                        // old one — we must reset global LSN and invalidate
+                        // all session LSNs.
+                        let timeline_changed = match (result.writer_timeline_id, node.last_timeline_id) {
+                            (Some(new_tl), Some(old_tl)) => new_tl != old_tl,
+                            // First observation or query failed — not a change.
+                            _ => false,
+                        };
+
+                        if timeline_changed {
+                            let old_tl = node.last_timeline_id.unwrap_or(0);
+                            let new_tl = result.writer_timeline_id.unwrap_or(0);
                             tracing::warn!(
                                 node_id,
+                                old_timeline_id = old_tl,
+                                new_timeline_id = new_tl,
                                 writer_lsn = lsn,
-                                global_lsn = current_global,
-                                "Writer LSN is below global watermark — timeline switch detected, resetting global LSN"
+                                "Timeline switch confirmed — resetting global LSN \
+                                 and invalidating all session LSNs"
                             );
                             tracker.reset_global_lsn(lsn);
+                            tracker.invalidate_all_sessions();
                         } else {
+                            // Normal case: advance monotonically. If the probe
+                            // LSN is below current global (stale probe due to
+                            // concurrency), advance_global_lsn is a safe no-op
+                            // because it only moves forward.
                             tracker.advance_global_lsn(lsn);
                         }
                     }
                 }
+            }
+            // Update tracked timeline_id for future comparisons.
+            if let Some(tl) = result.writer_timeline_id {
+                node.last_timeline_id = Some(tl);
             }
             node.last_replication_lag_ms = result.replication_lag_ms;
         }
@@ -1018,6 +1069,7 @@ impl<P: HealthProbe> HealthChecker<P> {
                 last_current_wal_lsn: 0,
                 last_replication_lag_ms: None,
                 generation: gen,
+                last_timeline_id: None,
             },
         );
         probes.insert(node_id.clone(), Arc::new(probe));
@@ -1219,6 +1271,7 @@ mod tests {
             current_wal_lsn: None,
             replication_lag_ms: Some(50),
             timed_out: false,
+            writer_timeline_id: None,
         };
         let checker = HealthChecker::new(
             vec![(
@@ -1253,6 +1306,7 @@ mod tests {
             current_wal_lsn: None,
             replication_lag_ms: Some(5000),
             timed_out: false,
+            writer_timeline_id: None,
         };
         let checker = HealthChecker::new(
             vec![(
@@ -1385,6 +1439,7 @@ mod tests {
             replay_lsn: None,
             replication_lag_ms: None,
             timed_out: false,
+            writer_timeline_id: None,
         };
 
         let mut checker = HealthChecker::new(
@@ -1421,8 +1476,158 @@ mod tests {
             replay_lsn: None,
             replication_lag_ms: None,
             timed_out: false,
+            writer_timeline_id: None,
         });
         assert_eq!(tracker.global_write_lsn(), higher_lsn);
+    }
+
+    /// Timeline switch: a stale probe (lower LSN, same timeline) must NOT
+    /// regress global LSN. Only a confirmed timeline change resets it.
+    #[tokio::test]
+    async fn stale_probe_does_not_regress_global_lsn() {
+        use crate::session::lsn::{InMemoryLsnTracker, LsnTracker};
+
+        let tracker = Arc::new(InMemoryLsnTracker::new());
+        let writer_lsn = 200u64;
+
+        let probe_result = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(writer_lsn),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+            writer_timeline_id: Some(1),
+        };
+
+        let mut checker = HealthChecker::new(
+            vec![("writer".into(), NodeType::Writer, 1, MockProbe { result: probe_result })],
+            1000,
+            Duration::from_secs(1),
+        );
+        checker.set_lsn_tracker(tracker.clone());
+
+        // First probe establishes global at 200, timeline=1
+        checker.check_and_update("writer").await;
+        assert_eq!(tracker.global_write_lsn(), 200);
+
+        // Concurrent write pushes global to 500
+        tracker.advance_global_lsn(500);
+        assert_eq!(tracker.global_write_lsn(), 500);
+
+        // A stale probe returns LSN=90, same timeline=1.
+        // This must NOT reset global back to 90.
+        checker.apply_result("writer", 1, HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(90),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+            writer_timeline_id: Some(1),
+        });
+        assert_eq!(tracker.global_write_lsn(), 500, "stale probe must not regress global LSN");
+    }
+
+    /// Timeline switch: a genuine failover (timeline_id changes) resets
+    /// global LSN and invalidates all session LSNs.
+    #[tokio::test]
+    async fn timeline_switch_resets_global_and_invalidates_sessions() {
+        use crate::session::lsn::{InMemoryLsnTracker, LsnTracker};
+
+        let tracker = Arc::new(InMemoryLsnTracker::new());
+
+        let probe_result = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(1000),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+            writer_timeline_id: Some(1),
+        };
+
+        let mut checker = HealthChecker::new(
+            vec![("writer".into(), NodeType::Writer, 1, MockProbe { result: probe_result })],
+            1000,
+            Duration::from_secs(1),
+        );
+        checker.set_lsn_tracker(tracker.clone());
+
+        // Establish timeline=1 with global at 1000
+        checker.check_and_update("writer").await;
+        assert_eq!(tracker.global_write_lsn(), 1000);
+
+        // Record a session write
+        tracker.record_write("session-a", 800);
+        assert_eq!(tracker.session_write_lsn("session-a"), 800);
+
+        // Failover: new Writer on timeline=2 with lower LSN=300
+        checker.apply_result("writer", 1, HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(300),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+            writer_timeline_id: Some(2),
+        });
+
+        // Global must be reset to the new Writer's position
+        assert_eq!(tracker.global_write_lsn(), 300, "timeline switch must reset global LSN");
+        // Sessions must be invalidated
+        assert_eq!(tracker.session_write_lsn("session-a"), 0, "sessions must be invalidated on timeline switch");
+    }
+
+    /// Timeline switch: if timeline_id is not available (query failed or
+    /// Aurora mode), a lower LSN is simply ignored (safe, not reset).
+    #[tokio::test]
+    async fn unknown_timeline_does_not_trigger_reset() {
+        use crate::session::lsn::{InMemoryLsnTracker, LsnTracker};
+
+        let tracker = Arc::new(InMemoryLsnTracker::new());
+
+        let probe_result = HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(500),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+            writer_timeline_id: None, // Aurora or query failed
+        };
+
+        let mut checker = HealthChecker::new(
+            vec![("writer".into(), NodeType::Writer, 1, MockProbe { result: probe_result })],
+            1000,
+            Duration::from_secs(1),
+        );
+        checker.set_lsn_tracker(tracker.clone());
+
+        // Establish global at 500 (no timeline info)
+        checker.check_and_update("writer").await;
+        assert_eq!(tracker.global_write_lsn(), 500);
+
+        // Advance global further
+        tracker.advance_global_lsn(800);
+
+        // Probe returns lower LSN without timeline info — must NOT reset
+        checker.apply_result("writer", 1, HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(200),
+            replay_lsn: None,
+            replication_lag_ms: None,
+            timed_out: false,
+            writer_timeline_id: None,
+        });
+        assert_eq!(tracker.global_write_lsn(), 800, "unknown timeline must not trigger reset");
     }
 
     /// Health generation ABA fix: verify that add_node after remove_node
@@ -1438,6 +1643,7 @@ mod tests {
             replay_lsn: None,
             replication_lag_ms: None,
             timed_out: false,
+            writer_timeline_id: None,
         };
         let checker = HealthChecker::new(
             vec![
@@ -1478,6 +1684,7 @@ mod tests {
             replay_lsn: None,
             replication_lag_ms: None,
             timed_out: false,
+            writer_timeline_id: None,
         };
         let checker = HealthChecker::new(
             vec![
@@ -1518,6 +1725,7 @@ mod tests {
             replay_lsn: None,
             replication_lag_ms: None,
             timed_out: false,
+            writer_timeline_id: None,
         };
         let checker = HealthChecker::new(
             vec![

@@ -148,6 +148,11 @@ pub struct ClientSession {
     /// subsequent cross-Sync Bind can resolve it locally without
     /// forwarding to a backend that never received the Parse.
     local_set_stmts: HashMap<String, String>,
+    /// Virtual portals for proxy-local SET commands. When a Bind-only
+    /// batch (no Execute) creates a portal for a local SET statement,
+    /// it is recorded here so that a subsequent Execute-only batch can
+    /// resolve it locally and apply the SET.
+    local_set_portals: HashMap<String, String>,
 }
 
 /// A complete backend connection checked out exclusively by this client.
@@ -282,6 +287,7 @@ impl ClientSession {
             application_name: String::new(),
             failed_state_portals: HashMap::new(),
             local_set_stmts: HashMap::new(),
+            local_set_portals: HashMap::new(),
         }
     }
 

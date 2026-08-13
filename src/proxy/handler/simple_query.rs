@@ -300,7 +300,13 @@ where
         // executing statements that should have been rejected with 25P02.
         if session.state.tx_state == TxState::Failed && session.held_backend.is_none() {
             if transaction_end_tag(sql).is_some() {
+                session.state.tx_split = None;
                 session.state.tx_state = TxState::Idle;
+                session.tx_has_writes = false;
+                // FIX: Clear virtual portal/statement caches accumulated
+                // during Failed state — they are no longer valid after
+                // the transaction is rolled back.
+                session.failed_state_portals.clear();
                 send_command_complete(client_stream, "ROLLBACK").await?;
                 send_ready_for_query(client_stream, TxState::Idle).await?;
             } else {
@@ -726,6 +732,11 @@ where
             if transaction_end_tag(sql).is_some() {
                 session.state.tx_split = None;
                 session.state.tx_state = TxState::Idle;
+                session.tx_has_writes = false;
+                // FIX: Clear virtual portal/statement caches accumulated
+                // during Failed state — they are no longer valid after
+                // the transaction is rolled back.
+                session.failed_state_portals.clear();
                 send_command_complete(client_stream, "ROLLBACK").await?;
                 send_ready_for_query(client_stream, TxState::Idle).await?;
             } else {

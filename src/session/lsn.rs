@@ -45,10 +45,22 @@ pub trait LsnTracker: Send + Sync {
 
     /// Resets the global write LSN to `lsn`, even if it is lower than the
     /// current value. Used when a Writer failover or timeline switch is
-    /// detected — the new Writer may have a lower LSN than the old one.
-    /// Without this, Global consistency reads would block forever waiting
-    /// for the new Writer to reach the old watermark.
+    /// positively confirmed (timeline_id changed). The new Writer may have
+    /// a lower LSN than the old one; without this, Global consistency reads
+    /// would block forever waiting for the new Writer to reach the old
+    /// watermark.
+    ///
+    /// Safety: This MUST only be called when a timeline change is confirmed
+    /// (not merely when a probe returns a lower LSN — that can happen due
+    /// to normal concurrency). Callers must verify the timeline changed
+    /// before invoking.
     fn reset_global_lsn(&self, lsn: u64);
+
+    /// Invalidates all session LSNs, resetting them to zero. Called on
+    /// confirmed timeline switch because session LSNs from the old timeline
+    /// are meaningless on the new timeline — they refer to WAL positions
+    /// that may not exist or may correspond to different data.
+    fn invalidate_all_sessions(&self);
 }
 
 /// Default `LsnTracker` implementation based on an in-memory `HashMap` plus
@@ -129,6 +141,10 @@ impl LsnTracker for InMemoryLsnTracker {
 
     fn reset_global_lsn(&self, lsn: u64) {
         self.global_lsn.store(lsn, Ordering::SeqCst);
+    }
+
+    fn invalidate_all_sessions(&self) {
+        self.session_lsn.lock().clear();
     }
 }
 
@@ -230,5 +246,37 @@ mod tests {
         // advance_global_lsn below current is a no-op
         tracker.advance_global_lsn(300);
         assert_eq!(tracker.global_write_lsn(), 700);
+    }
+
+    #[test]
+    fn invalidate_all_sessions_clears_session_lsns() {
+        let tracker = InMemoryLsnTracker::new();
+        tracker.record_write("session-a", 100);
+        tracker.record_write("session-b", 200);
+        tracker.record_write("session-c", 300);
+        assert_eq!(tracker.session_write_lsn("session-a"), 100);
+        assert_eq!(tracker.session_write_lsn("session-b"), 200);
+        assert_eq!(tracker.session_write_lsn("session-c"), 300);
+
+        tracker.invalidate_all_sessions();
+
+        // All sessions reset to 0 (unknown)
+        assert_eq!(tracker.session_write_lsn("session-a"), 0);
+        assert_eq!(tracker.session_write_lsn("session-b"), 0);
+        assert_eq!(tracker.session_write_lsn("session-c"), 0);
+
+        // Global LSN is NOT affected by invalidate_all_sessions
+        assert_eq!(tracker.global_write_lsn(), 300);
+    }
+
+    #[test]
+    fn reset_global_lsn_allows_regression() {
+        let tracker = InMemoryLsnTracker::new();
+        tracker.advance_global_lsn(1000);
+        assert_eq!(tracker.global_write_lsn(), 1000);
+
+        // reset_global_lsn can move it backwards (for timeline switch)
+        tracker.reset_global_lsn(200);
+        assert_eq!(tracker.global_write_lsn(), 200);
     }
 }

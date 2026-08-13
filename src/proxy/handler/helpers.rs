@@ -72,6 +72,59 @@ pub(super) fn assemble_extended_outbound(batch: &[ExtendedFrame]) -> Vec<u8> {
     outbound
 }
 
+/// Computes the response interleaving schedule for mixed batches where some
+/// frames are handled locally (skipped) and some are forwarded to the backend.
+///
+/// Returns a `Vec` indexed by "forwarded frame position" (0-based). Each
+/// entry contains the synthetic response bytes that must be emitted *before*
+/// relaying the response for that forwarded frame. An additional trailing
+/// element holds synthetics that come after ALL forwarded frames.
+///
+/// The length of the returned Vec is `forwarded_count + 1`.
+pub(super) fn compute_synthetic_schedule(batch: &[ExtendedFrame], skip: &[usize]) -> Vec<Vec<u8>> {
+    // Count forwarded frames.
+    let forwarded_count = batch.len() - skip.len();
+    // We need forwarded_count + 1 slots: slot[k] = "emit before k-th forwarded
+    // frame's response", slot[forwarded_count] = "emit after all forwarded".
+    let mut schedule: Vec<Vec<u8>> = vec![Vec::new(); forwarded_count + 1];
+
+    // Walk original batch in order, tracking which forwarded position we're at.
+    let mut forwarded_pos: usize = 0;
+    for (i, frame) in batch.iter().enumerate() {
+        if skip.contains(&i) {
+            // This frame is skipped → generate synthetic response bytes and
+            // place them in the current forwarded_pos slot (i.e. "before the
+            // next forwarded frame's response").
+            let synthetic = match frame.tag {
+                tag if tag == frontend_tag::PARSE => {
+                    // ParseComplete
+                    vec![b'1', 0, 0, 0, 4]
+                }
+                tag if tag == frontend_tag::BIND => {
+                    // BindComplete
+                    vec![b'2', 0, 0, 0, 4]
+                }
+                tag if tag == frontend_tag::EXECUTE => {
+                    // CommandComplete "SET"
+                    crate::protocol::writer::encode_backend_message(
+                        &crate::protocol::message::BackendMessage::CommandComplete {
+                            tag: "SET".to_string(),
+                        },
+                    )
+                }
+                _ => Vec::new(),
+            };
+            if !synthetic.is_empty() {
+                schedule[forwarded_pos].extend_from_slice(&synthetic);
+            }
+        } else {
+            forwarded_pos += 1;
+        }
+    }
+
+    schedule
+}
+
 /// Like `assemble_extended_outbound` but skips frames at the specified indices.
 pub(super) fn assemble_extended_outbound_filtered(batch: &[ExtendedFrame], skip: &[usize]) -> Vec<u8> {
     const SYNC_FRAME: [u8; 5] = [b'S', 0, 0, 0, 4];
@@ -113,15 +166,24 @@ pub(super) fn record_statement_routes(
                 None => {}
             },
             frontend_tag::CLOSE => {
-                if let Some((b'S', name)) = frame.kind_and_name() {
-                    if !name.is_empty() {
-                        session.extended_route_tracker.forget_statement(name);
-                        // FIX (Bug 4): Clean up virtual prepared statement
-                        // caches when a statement is explicitly closed.
-                        session.state.prepared_stmts.remove(name);
-                        session.local_set_stmts.remove(name);
-                    } else {
-                        session.unnamed_parse_node = None;
+                if let Some((kind, name)) = frame.kind_and_name() {
+                    match kind {
+                        b'S' => {
+                            if !name.is_empty() {
+                                session.extended_route_tracker.forget_statement(name);
+                                // FIX (Bug 4): Clean up virtual prepared statement
+                                // caches when a statement is explicitly closed.
+                                session.state.prepared_stmts.remove(name);
+                                session.local_set_stmts.remove(name);
+                            } else {
+                                session.unnamed_parse_node = None;
+                            }
+                        }
+                        b'P' => {
+                            // Clean up virtual portal cache for local SET portals.
+                            session.local_set_portals.remove(name);
+                        }
+                        _ => {}
                     }
                 }
             }
