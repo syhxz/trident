@@ -109,9 +109,16 @@ impl PooledConnection {
 /// The buffer size used for wrapping backend sockets in `BufReader`.
 pub const BACKEND_READ_BUF_SIZE: usize = 8 * 1024;
 
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
 /// A complete backend connection: metadata + live socket. This is the unit
 /// that flows through the pool: `acquire()` returns one, `release()` takes
 /// one back. No external registry lookup needed on the hot path.
+///
+/// If the connection is dropped without being returned via `release()` or
+/// `discard()`, the `slot_guard` automatically decrements the pool's
+/// `active_connections` counter, preventing permanent slot leaks from
+/// cancellation or panics.
 #[derive(Debug)]
 pub struct BackendConnection {
     pub meta: PooledConnection,
@@ -123,6 +130,38 @@ pub struct BackendConnection {
     /// next checkout's required appname matches this, the pipelined SET
     /// can be skipped entirely.
     pub current_application_name: Option<String>,
+    /// RAII guard that decrements the pool's active_connections on Drop
+    /// if the connection is abandoned (task cancel / panic). Defused by
+    /// `release()` / `discard()` which manage the counter themselves.
+    pub(crate) slot_guard: Option<AcquireSlotGuard>,
+}
+
+/// RAII guard for a checked-out connection's pool slot. On Drop, decrements
+/// `active_connections` and notifies waiters, preventing slot leaks when
+/// a future holding a connection is cancelled.
+#[derive(Debug)]
+pub(crate) struct AcquireSlotGuard {
+    active_connections: Arc<AtomicU32>,
+    release_notify: Arc<tokio::sync::Notify>,
+}
+
+impl AcquireSlotGuard {
+    pub(crate) fn new(active_connections: Arc<AtomicU32>, release_notify: Arc<tokio::sync::Notify>) -> Self {
+        AcquireSlotGuard { active_connections, release_notify }
+    }
+
+    /// Disarm the guard — the pool code is taking ownership of slot management.
+    pub(crate) fn defuse(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for AcquireSlotGuard {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, AtomicOrdering::SeqCst);
+        self.release_notify.notify_one();
+        tracing::warn!("connection slot released via AcquireSlotGuard drop (possible cancellation leak)");
+    }
 }
 
 impl BackendConnection {
@@ -133,6 +172,7 @@ impl BackendConnection {
             stream: BufReader::with_capacity(BACKEND_READ_BUF_SIZE, stream),
             generation,
             current_application_name: None,
+            slot_guard: None,
         }
     }
 

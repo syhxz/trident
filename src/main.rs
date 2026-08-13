@@ -235,6 +235,8 @@ impl admin::NodeManager for LiveNodeManager {
         // Atomically check last-writer protection and remove under the
         // health checker's internal lock — prevents concurrent removes
         // from both passing the writer count check.
+        // After this, the Router will no longer route NEW queries to this
+        // node (it disappears from the snapshot).
         self.health_checker
             .remove_node_checked(node_id, true)
             .map_err(|e| e.to_string())?;
@@ -243,17 +245,19 @@ impl admin::NodeManager for LiveNodeManager {
         // as Arc references are dropped by in-flight handlers)
         self.pool_manager.remove_pool(node_id);
 
-        // Remove from cancel-routing address table
+        // Invalidate factories from the removed node incarnation. Draining
+        // pools discard in-flight connections when they are released.
+        self.connection_registry.remove_by_node(node_id);
+
+        // Remove from cancel-routing address table LAST. This ensures
+        // in-flight queries on this node can still have their CancelRequest
+        // forwarded until the pool/registry are cleaned up.
         let node_id_owned = node_id.to_string();
         self.node_addresses.rcu(|current| {
             let mut new_map = (**current).clone();
             new_map.remove(&node_id_owned);
             Arc::new(new_map)
         });
-
-        // Invalidate factories from the removed node incarnation. Draining
-        // pools discard in-flight connections when they are released.
-        self.connection_registry.remove_by_node(node_id);
 
         tracing::info!(node = %node_id, "dynamically removed backend node");
         Ok(())
@@ -418,9 +422,9 @@ async fn run(
             tracing::warn!(
                 addr = %addr,
                 "⚠️  SECURITY: admin console bound to non-loopback address without auth_token. \
-                 Read-only endpoints (SQL logs, client IPs, node status, WebSocket logs) are \
-                 accessible to any network-reachable client. Configure admin.auth_token or \
-                 bind to 127.0.0.1 for production deployments."
+                 Protected endpoints (config, reload, SQL logs, node management) are disabled. \
+                 Only /metrics and /healthz are accessible. Configure admin.auth_token to \
+                 enable full admin API access."
             );
         }
 
@@ -858,9 +862,13 @@ async fn run(
         admin_routing_config: Some(routing_config_snapshot.clone()),
         reload_lock: std::sync::Mutex::new(()),
     });
+    // FIX (reload race): Create a shared config_write_lock used by both
+    // SIGHUP handler and admin API to serialize config mutations.
+    let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(trident::reload::watch_sighup(
         config_path.clone(),
         reload_target.clone(),
+        Some(config_write_lock.clone()),
     ));
 
     // --- Admin/observability server: /metrics + /healthz + /reload
@@ -901,6 +909,7 @@ async fn run(
         let pool_max_lifetime_admin = config.pool.max_lifetime.clone();
         let hc_for_interval = health_checker.clone();
         let hc_for_interval_get = health_checker.clone();
+        let config_write_lock_for_admin = config_write_lock.clone();
         tokio::spawn(async move {
             if let Err(e) = admin::run(
                 admin_listener,
@@ -923,6 +932,7 @@ async fn run(
                 config.admin.auth_token.clone(),
                 Some(Box::new(move |d| hc_for_interval.set_check_interval(d))),
                 Some(Box::new(move || hc_for_interval_get.check_interval())),
+                config_write_lock_for_admin,
             )
             .await
             {

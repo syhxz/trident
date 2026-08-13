@@ -350,13 +350,27 @@ where
             // Check for Execute-only batch referencing a local SET portal
             // (from a prior Bind-only batch).
             if !batch.iter().any(|f| f.tag == frontend_tag::BIND) {
-                let local_exec = batch.iter()
+                // FIX (P1 swallow): Only intercept if ALL Execute frames
+                // reference local SET portals. If any Execute targets a
+                // non-local portal (bound on the backend in a prior Sync),
+                // we must fall through so it reaches the backend.
+                let all_execs_local = batch.iter()
                     .filter(|f| f.tag == frontend_tag::EXECUTE)
-                    .find_map(|f| {
-                        f.execute_portal().and_then(|p| {
-                            session.local_set_portals.get(p).cloned().map(|sql| (p.to_string(), sql))
-                        })
+                    .all(|f| {
+                        f.execute_portal()
+                            .is_some_and(|p| session.local_set_portals.contains_key(p))
                     });
+                let local_exec = if all_execs_local {
+                    batch.iter()
+                        .filter(|f| f.tag == frontend_tag::EXECUTE)
+                        .find_map(|f| {
+                            f.execute_portal().and_then(|p| {
+                                session.local_set_portals.get(p).cloned().map(|sql| (p.to_string(), sql))
+                            })
+                        })
+                } else {
+                    None
+                };
                 if let Some((portal_name, sql)) = local_exec {
                     // Apply the SET and respond to all frames in batch.
                     session.state.apply_consistency_set_command(&sql);
@@ -486,6 +500,19 @@ where
                             }
                         })
                     });
+                // Collect all local SET portal names for Execute matching.
+                let local_portal_names: Vec<&str> = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND)
+                    .filter_map(|f| {
+                        f.bind_statement().and_then(|stmt_name| {
+                            if session.local_set_stmts.contains_key(stmt_name) {
+                                f.bind_portal()
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
                 // Check if Execute references the portal.
                 let has_execute = bind_portal.is_some_and(|portal| {
                     batch.iter().any(|f| {
@@ -493,7 +520,19 @@ where
                             && f.execute_portal() == Some(portal)
                     })
                 });
-                if has_execute {
+                // FIX (P1 swallow): Verify ALL Execute frames reference
+                // local SET portals. Cross-Sync Execute for a non-local
+                // portal must not be swallowed.
+                let all_executes_are_local = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::EXECUTE)
+                    .all(|f| {
+                        f.execute_portal()
+                            .is_some_and(|p| {
+                                local_portal_names.contains(&p)
+                                    || session.local_set_portals.contains_key(p)
+                            })
+                    });
+                if has_execute && all_executes_are_local {
                     // Full Bind+Execute: apply the SET and respond.
                     session.state.apply_consistency_set_command(&sql);
                     // FIX: Iterate ALL frames in the batch to generate
@@ -546,7 +585,7 @@ where
                     }
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
-                } else {
+                } else if !has_execute {
                     // Bind-only (no Execute): respond with BindComplete.
                     // FIX (Bug 4): Record the portal so a later Execute-only
                     // batch can resolve it locally.
@@ -562,6 +601,8 @@ where
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
                 }
+                // else: has_execute && !all_executes_are_local — mixed batch
+                // with non-local Execute. Fall through to normal processing.
             }
         }
 
@@ -578,6 +619,19 @@ where
         // the batch succeeds (no backend error).
         let mut pending_set_commands: Vec<String> = Vec::new();
         if session.held_backend.is_some() {
+            // FIX (P1 stmts invalidation): Invalidate local_set_stmts entries
+            // when a non-SET Parse in this batch reuses the same statement name.
+            for frame in batch.iter().filter(|f| f.tag == frontend_tag::PARSE) {
+                if let Some(sql) = frame.parse_sql() {
+                    if !session.state.is_consistency_set_command(sql) {
+                        if let Some(name) = frame.parse_name() {
+                            if !name.is_empty() {
+                                session.local_set_stmts.remove(name);
+                            }
+                        }
+                    }
+                }
+            }
             // Collect ALL SET consistency Parse frames (not just the first).
             let set_parse_frames: Vec<_> = batch.iter()
                 .enumerate()
@@ -626,9 +680,32 @@ where
 
                 let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
 
+                // FIX (P1 swallow): Before taking the pure-local fast path,
+                // verify that ALL Bind/Execute/Describe frames in the batch
+                // belong to the SET statement. If there are non-SET frames
+                // (e.g. Bind/Execute referencing a previously prepared real
+                // query via cross-Sync portal reuse), we must NOT return
+                // early — those frames need to reach the backend.
+                let all_binds_are_set = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND)
+                    .all(|f| {
+                        f.bind_statement()
+                            .map(|s| set_stmt_names.contains(&s))
+                            .unwrap_or(false)
+                    });
+                let all_executes_are_set = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::EXECUTE)
+                    .all(|f| {
+                        f.execute_portal()
+                            .map(|p| set_portal_names.contains(&p))
+                            .unwrap_or(false)
+                    });
+                let batch_is_pure_set = all_binds_are_set && all_executes_are_set;
+
                 if parse_count <= 1 {
-                    if has_matching_bind && has_matching_execute {
-                        // Full Parse+Bind+Execute for the SET: apply and respond.
+                    if has_matching_bind && has_matching_execute && batch_is_pure_set {
+                        // Full Parse+Bind+Execute for the SET and NO other
+                        // operations in the batch: apply and respond locally.
                         session.state.apply_consistency_set_command(first_sql);
                         // FIX: Iterate ALL frames to handle Describe/Close.
                         for frame in batch.iter() {
@@ -681,6 +758,50 @@ where
                         }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
+                    } else if has_matching_bind && has_matching_execute && !batch_is_pure_set {
+                        // SET has full Parse+Bind+Execute but the batch also
+                        // contains non-SET operations (cross-Sync portal
+                        // reuse). Fall through to multi-Parse filtering path
+                        // to filter SET frames and forward the rest.
+                        pending_set_commands.push(first_sql.to_string());
+                        for (i, frame) in batch.iter().enumerate() {
+                            let should_skip = match frame.tag {
+                                tag if tag == frontend_tag::PARSE => {
+                                    frame.parse_sql()
+                                        .map(|s| session.state.is_consistency_set_command(s))
+                                        .unwrap_or(false)
+                                }
+                                tag if tag == frontend_tag::BIND => {
+                                    frame.bind_statement()
+                                        .map(|s| set_stmt_names.contains(&s))
+                                        .unwrap_or(false)
+                                }
+                                tag if tag == frontend_tag::EXECUTE => {
+                                    frame.execute_portal()
+                                        .map(|p| set_portal_names.contains(&p))
+                                        .unwrap_or(false)
+                                }
+                                tag if tag == frontend_tag::DESCRIBE => {
+                                    frame.kind_and_name()
+                                        .is_some_and(|(kind, name)| {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        })
+                                }
+                                tag if tag == frontend_tag::CLOSE => {
+                                    frame.kind_and_name()
+                                        .is_some_and(|(kind, name)| {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        })
+                                }
+                                _ => false,
+                            };
+                            if should_skip {
+                                held_set_skip_indices.push(i);
+                            }
+                        }
+                        // Fall through to forward remaining batch to held backend.
                     } else if !has_matching_bind {
                         // Parse-only: don't apply yet. Return ParseComplete.
                         // FIX (Bug 1/3): Always send RFQ. Also record virtual
@@ -722,22 +843,68 @@ where
                         }
                     }
                     // Collect indices of ALL SET-related frames.
+                    // FIX: Position-aware matching for unnamed statements.
+                    let mut held_current_unnamed_is_set = false;
+                    let mut held_current_unnamed_portal_is_set = false;
                     for (i, frame) in batch.iter().enumerate() {
                         let should_skip = match frame.tag {
                             tag if tag == frontend_tag::PARSE => {
-                                frame.parse_sql()
+                                let is_set = frame.parse_sql()
                                     .map(|s| session.state.is_consistency_set_command(s))
-                                    .unwrap_or(false)
+                                    .unwrap_or(false);
+                                let name = frame.parse_name().unwrap_or("");
+                                if name.is_empty() {
+                                    held_current_unnamed_is_set = is_set;
+                                }
+                                is_set
                             }
                             tag if tag == frontend_tag::BIND => {
-                                frame.bind_statement()
-                                    .map(|s| set_stmt_names.contains(&s))
-                                    .unwrap_or(false)
+                                let stmt = frame.bind_statement().unwrap_or("");
+                                let is_set_bind = if stmt.is_empty() {
+                                    held_current_unnamed_is_set
+                                } else {
+                                    set_stmt_names.contains(&stmt)
+                                };
+                                let portal = frame.bind_portal().unwrap_or("");
+                                if portal.is_empty() {
+                                    held_current_unnamed_portal_is_set = is_set_bind;
+                                }
+                                is_set_bind
                             }
                             tag if tag == frontend_tag::EXECUTE => {
-                                frame.execute_portal()
-                                    .map(|p| set_portal_names.contains(&p))
-                                    .unwrap_or(false)
+                                let portal = frame.execute_portal().unwrap_or("");
+                                if portal.is_empty() {
+                                    held_current_unnamed_portal_is_set
+                                } else {
+                                    set_portal_names.contains(&portal)
+                                }
+                            }
+                            // FIX (P1 Describe/Close): Also filter Describe and
+                            // Close that reference virtual SET objects so they
+                            // don't reach the backend (which doesn't know them).
+                            tag if tag == frontend_tag::DESCRIBE => {
+                                frame.kind_and_name()
+                                    .is_some_and(|(kind, name)| {
+                                        if name.is_empty() {
+                                            (kind == b'S' && held_current_unnamed_is_set)
+                                                || (kind == b'P' && held_current_unnamed_portal_is_set)
+                                        } else {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        }
+                                    })
+                            }
+                            tag if tag == frontend_tag::CLOSE => {
+                                frame.kind_and_name()
+                                    .is_some_and(|(kind, name)| {
+                                        if name.is_empty() {
+                                            (kind == b'S' && held_current_unnamed_is_set)
+                                                || (kind == b'P' && held_current_unnamed_portal_is_set)
+                                        } else {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        }
+                                    })
                             }
                             _ => false,
                         };
@@ -959,6 +1126,16 @@ where
             if session.state.is_consistency_set_command(sql) {
                 continue;
             }
+            // FIX (P1 stmts invalidation): If a non-SET Parse reuses a
+            // statement name that was previously recorded as a virtual local
+            // SET statement, invalidate it. Otherwise the stale virtual entry
+            // could hijack a later Bind/Execute referencing the same name,
+            // causing real operations to be swallowed.
+            if let Some(stmt_name) = frame.parse_name() {
+                if !stmt_name.is_empty() {
+                    session.local_set_stmts.remove(stmt_name);
+                }
+            }
             if route_sql.is_none() {
                 route_sql = Some(sql);
             }
@@ -1119,10 +1296,30 @@ where
 
                 let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
 
+                // FIX (P1 swallow): Before taking the pure-local fast path,
+                // verify that ALL Bind/Execute frames in the batch belong to
+                // SET statements. Cross-Sync portal reuse can place non-SET
+                // Bind/Execute in the same batch as a SET Parse.
+                let all_binds_are_set_nonheld = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::BIND)
+                    .all(|f| {
+                        f.bind_statement()
+                            .map(|s| set_stmt_names.contains(&s))
+                            .unwrap_or(false)
+                    });
+                let all_executes_are_set_nonheld = batch.iter()
+                    .filter(|f| f.tag == frontend_tag::EXECUTE)
+                    .all(|f| {
+                        f.execute_portal()
+                            .map(|p| set_portal_names.contains(&p))
+                            .unwrap_or(false)
+                    });
+                let batch_is_pure_set_nonheld = all_binds_are_set_nonheld && all_executes_are_set_nonheld;
+
                 if parse_count <= 1 {
-                    if has_matching_bind && has_matching_execute {
-                        // Full Parse+Bind+Execute cycle for the SET: apply
-                        // and return synthetic response.
+                    if has_matching_bind && has_matching_execute && batch_is_pure_set_nonheld {
+                        // Full Parse+Bind+Execute cycle for the SET and NO
+                        // other operations: apply and return synthetic response.
                         session.state.apply_consistency_set_command(first_sql);
                         // FIX: Iterate ALL frames in the batch to generate
                         // correct responses for Describe/Close that may
@@ -1179,6 +1376,49 @@ where
                         }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
+                    } else if has_matching_bind && has_matching_execute && !batch_is_pure_set_nonheld {
+                        // SET has full Parse+Bind+Execute but the batch also
+                        // contains non-SET operations (cross-Sync portal
+                        // reuse). Fall through to multi-Parse filtering path.
+                        pending_set_commands_nonheld.push(first_sql.to_string());
+                        for (i, frame) in batch.iter().enumerate() {
+                            let should_skip = match frame.tag {
+                                tag if tag == frontend_tag::PARSE => {
+                                    frame.parse_sql()
+                                        .map(|s| session.state.is_consistency_set_command(s))
+                                        .unwrap_or(false)
+                                }
+                                tag if tag == frontend_tag::BIND => {
+                                    frame.bind_statement()
+                                        .map(|s| set_stmt_names.contains(&s))
+                                        .unwrap_or(false)
+                                }
+                                tag if tag == frontend_tag::EXECUTE => {
+                                    frame.execute_portal()
+                                        .map(|p| set_portal_names.contains(&p))
+                                        .unwrap_or(false)
+                                }
+                                tag if tag == frontend_tag::DESCRIBE => {
+                                    frame.kind_and_name()
+                                        .is_some_and(|(kind, name)| {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        })
+                                }
+                                tag if tag == frontend_tag::CLOSE => {
+                                    frame.kind_and_name()
+                                        .is_some_and(|(kind, name)| {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        })
+                                }
+                                _ => false,
+                            };
+                            if should_skip {
+                                set_frame_skip_indices.push(i);
+                            }
+                        }
+                        // Fall through to normal routing with filtered batch.
                     } else if !has_matching_bind {
                         // Parse-only (no matching Bind): client is only
                         // preparing the statement. Return ParseComplete only.
@@ -1219,23 +1459,83 @@ where
                         }
                     }
                     // Collect indices of ALL SET-related frames (Parse, Bind,
-                    // Execute) so they can be filtered out before forwarding.
+                    // Execute, Describe, Close) so they can be filtered out
+                    // before forwarding.
+                    // FIX: Use position-aware matching for unnamed statements.
+                    // When multiple Parse frames share the unnamed statement
+                    // name "", a Bind("") belongs to the most recent Parse("")
+                    // that precedes it, not to all Parse("") frames.
+                    let set_parse_indices: std::collections::HashSet<usize> =
+                        set_parse_frames.iter().map(|(i, _, _)| *i).collect();
+                    // Track the "current" Parse at each position: as we scan
+                    // forward, record whether the active unnamed stmt is SET.
+                    let mut current_unnamed_is_set = false;
+                    // Track unnamed portal: inherits SET-ness from the Bind
+                    // that created it.
+                    let mut current_unnamed_portal_is_set = false;
                     for (i, frame) in batch.iter().enumerate() {
                         let should_skip = match frame.tag {
                             tag if tag == frontend_tag::PARSE => {
-                                frame.parse_sql()
+                                let is_set = frame.parse_sql()
                                     .map(|s| session.state.is_consistency_set_command(s))
-                                    .unwrap_or(false)
+                                    .unwrap_or(false);
+                                // Update tracking for unnamed stmt.
+                                let name = frame.parse_name().unwrap_or("");
+                                if name.is_empty() {
+                                    current_unnamed_is_set = is_set;
+                                }
+                                is_set
                             }
                             tag if tag == frontend_tag::BIND => {
-                                frame.bind_statement()
-                                    .map(|s| set_stmt_names.contains(&s))
-                                    .unwrap_or(false)
+                                let stmt = frame.bind_statement().unwrap_or("");
+                                let is_set_bind = if stmt.is_empty() {
+                                    // Unnamed: belongs to SET only if the
+                                    // most recent unnamed Parse was SET.
+                                    current_unnamed_is_set
+                                } else {
+                                    set_stmt_names.contains(&stmt)
+                                };
+                                // Track unnamed portal state.
+                                let portal = frame.bind_portal().unwrap_or("");
+                                if portal.is_empty() {
+                                    current_unnamed_portal_is_set = is_set_bind;
+                                }
+                                is_set_bind
                             }
                             tag if tag == frontend_tag::EXECUTE => {
-                                frame.execute_portal()
-                                    .map(|p| set_portal_names.contains(&p))
-                                    .unwrap_or(false)
+                                let portal = frame.execute_portal().unwrap_or("");
+                                if portal.is_empty() {
+                                    current_unnamed_portal_is_set
+                                } else {
+                                    set_portal_names.contains(&portal)
+                                }
+                            }
+                            // FIX (P1 Describe/Close): Also filter Describe and
+                            // Close that reference virtual SET objects so they
+                            // don't reach the backend (which doesn't know them).
+                            tag if tag == frontend_tag::DESCRIBE => {
+                                frame.kind_and_name()
+                                    .is_some_and(|(kind, name)| {
+                                        if name.is_empty() {
+                                            (kind == b'S' && current_unnamed_is_set)
+                                                || (kind == b'P' && current_unnamed_portal_is_set)
+                                        } else {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        }
+                                    })
+                            }
+                            tag if tag == frontend_tag::CLOSE => {
+                                frame.kind_and_name()
+                                    .is_some_and(|(kind, name)| {
+                                        if name.is_empty() {
+                                            (kind == b'S' && current_unnamed_is_set)
+                                                || (kind == b'P' && current_unnamed_portal_is_set)
+                                        } else {
+                                            (kind == b'S' && set_stmt_names.contains(&name))
+                                                || (kind == b'P' && set_portal_names.contains(&name))
+                                        }
+                                    })
                             }
                             _ => false,
                         };
@@ -1687,6 +1987,16 @@ where
                         .is_some_and(|stmt| session.write_function_stmts.contains(stmt))
             });
         }
+        // FIX: For Execute-only batches (no Parse, no Bind), seed
+        // write_detected if an Execute references a portal previously
+        // bound to a write-function statement.
+        if !write_detected {
+            write_detected = batch.iter().any(|f| {
+                f.tag == frontend_tag::EXECUTE
+                    && f.execute_portal()
+                        .is_some_and(|p| session.write_function_portals.contains(p))
+            });
+        }
         let mut commit_tag_seen = false;
         let mut reported_lsn: Option<u64> = None;
         let extension_guc_name = match self.lsn_tracking.mode {
@@ -2131,6 +2441,14 @@ where
                 f.tag == frontend_tag::BIND
                     && f.bind_statement()
                         .is_some_and(|stmt| session.write_function_stmts.contains(stmt))
+            });
+        }
+        // FIX: For Execute-only batches, check write_function_portals.
+        if !write_detected {
+            write_detected = batch.iter().any(|f| {
+                f.tag == frontend_tag::EXECUTE
+                    && f.execute_portal()
+                        .is_some_and(|p| session.write_function_portals.contains(p))
             });
         }
         let mut commit_tag_seen = false;

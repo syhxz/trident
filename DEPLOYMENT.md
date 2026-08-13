@@ -60,6 +60,8 @@ Trident supports multiple client authentication modes via `proxy.client_auth`:
 
 **Passthrough mode** (recommended) preserves database-level RBAC, audit identity, and password rotation — the proxy never stores or validates client passwords itself; authentication is delegated to the backend PostgreSQL instance.
 
+> **⚠️ Password rotation caveat:** After a backend `ALTER ROLE ... PASSWORD` change, idle pooled connections that were authenticated with the old password remain valid until they reach `max_lifetime` (default 30 minutes). During this window, a client presenting the old password may still be admitted because (1) the password hash matches the cached pool entry, and (2) the pre-verification step may reuse an existing idle connection rather than opening a new one that would fail authentication. To minimize this window, reduce `pool.max_lifetime` to an acceptable value (e.g. `5m`) or restart/reload the proxy after rotating credentials.
+
 Production deployments should:
 - Set `client_auth: passthrough` (or `md5`/`scram-sha-256` with an `auth_file`)
 - Restrict `proxy.listen_addr` to trusted networks or use TLS (`tls_cert`/`tls_key`)
@@ -153,6 +155,8 @@ Best practices:
 - Bind to a private/loopback address
 - Restrict network access via firewall/security groups
 - Never expose to the public internet
+- **TLS**: The admin endpoint does not provide native TLS. If the admin console must be accessible over an untrusted network, place a reverse proxy (nginx, Envoy, ALB) in front that terminates TLS. Ensure the proxy does **not** log query strings (the WebSocket `?token=` parameter contains the auth token).
+- **Console token storage**: The embedded web console stores the token in `localStorage`. Treat browser access to the console as equivalent to having the token itself.
 
 ## 5. Hot Reload
 

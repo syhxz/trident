@@ -16,6 +16,13 @@ sudo install -m 0755 target/release/trident /usr/local/bin/trident
 
 # 4. Prepare config directory and file with restricted permissions
 #    (config may contain plaintext passwords; see DEPLOYMENT.md section 4)
+#
+#    IMPORTANT: The default config.yaml uses ${ENV_VAR} placeholders for
+#    node passwords (e.g. ${TRIDENT_PRIMARY_PASSWORD}). You must EITHER:
+#      a) Edit the config to use plaintext passwords or .pgpass references, OR
+#      b) Define the environment variables in the service unit file's
+#         Environment= / EnvironmentFile= directives (see trident.service).
+#    Also update the node host/port entries to match your PostgreSQL cluster.
 sudo mkdir -p /etc/trident
 sudo cp config.yaml /etc/trident/config.yaml
 sudo chown trident:trident /etc/trident/config.yaml

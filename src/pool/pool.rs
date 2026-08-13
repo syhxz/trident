@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -288,7 +289,12 @@ pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
     cleaner: C,
 
     idle: Mutex<VecDeque<BackendConnection>>,
-    active_connections: AtomicU32,
+    /// Active connection count. Wrapped in Arc so the AcquireSlotGuard
+    /// can hold a reference without borrowing &self.
+    active_connections: Arc<AtomicU32>,
+    /// Notifies waiting acquirers when a connection is released back to
+    /// the idle queue. Arc-wrapped so AcquireSlotGuard can notify on Drop.
+    release_notify: Arc<tokio::sync::Notify>,
     /// Composite identity (backend_pid, secret_key) of connections currently
     /// owned by this pool. Using both fields prevents PID-reuse collisions
     /// from incorrectly affecting another connection's slot accounting.
@@ -304,9 +310,6 @@ pub struct NodePool<F: ConnFactory, C: ConnCleaner> {
     /// Transaction mode: session ID -> the set of connections that
     /// session has pinned and not yet released.
     pinned_by_session: Mutex<HashMap<String, Vec<BackendConnection>>>,
-    /// Notifies waiting acquirers when a connection is released back to
-    /// the idle queue (wait queue support).
-    release_notify: tokio::sync::Notify,
     /// Tracks checkout timestamps for leak detection. Only populated when
     /// `settings.leak_detection_threshold > 0`.
     checkout_times: Mutex<HashMap<(i32, i32), Instant>>,
@@ -348,12 +351,12 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             factory,
             cleaner,
             idle: Mutex::new(VecDeque::new()),
-            active_connections: AtomicU32::new(0),
+            active_connections: Arc::new(AtomicU32::new(0)),
             known_connections: Mutex::new(HashSet::new()),
             session_bindings: Mutex::new(HashMap::new()),
             session_checkouts: Mutex::new(HashSet::new()),
             pinned_by_session: Mutex::new(HashMap::new()),
-            release_notify: tokio::sync::Notify::new(),
+            release_notify: Arc::new(tokio::sync::Notify::new()),
             checkout_times: Mutex::new(HashMap::new()),
             draining: std::sync::atomic::AtomicBool::new(false),
         }
@@ -923,13 +926,24 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
     }
 
     async fn acquire(&self, session_id: &str) -> Result<BackendConnection, PoolError> {
-        match self.mode {
-            PoolMode::Session => self.acquire_session_mode(session_id).await,
-            PoolMode::Transaction => self.acquire_transaction_mode(session_id).await,
-        }
+        let mut conn = match self.mode {
+            PoolMode::Session => self.acquire_session_mode(session_id).await?,
+            PoolMode::Transaction => self.acquire_transaction_mode(session_id).await?,
+        };
+        // Attach RAII slot guard: if this connection is dropped without
+        // being returned via release()/discard(), the slot is auto-freed.
+        conn.slot_guard = Some(crate::pool::conn::AcquireSlotGuard::new(
+            Arc::clone(&self.active_connections),
+            Arc::clone(&self.release_notify),
+        ));
+        Ok(conn)
     }
 
-    async fn release(&self, session_id: &str, conn: BackendConnection) -> Result<(), PoolError> {
+    async fn release(&self, session_id: &str, mut conn: BackendConnection) -> Result<(), PoolError> {
+        // Defuse the acquire slot guard — we're taking over slot management.
+        if let Some(guard) = conn.slot_guard.take() {
+            guard.defuse();
+        }
         match self.mode {
             PoolMode::Session => {
                 if conn.node_id != self.node_id {
@@ -956,7 +970,11 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
         conn.pinned = true;
     }
 
-    fn discard(&self, conn: BackendConnection) -> Result<(), PoolError> {
+    fn discard(&self, mut conn: BackendConnection) -> Result<(), PoolError> {
+        // Defuse the acquire slot guard — we're taking over slot management.
+        if let Some(guard) = conn.slot_guard.take() {
+            guard.defuse();
+        }
         if conn.node_id != self.node_id {
             return Err(PoolError::NodeMismatch);
         }
@@ -970,7 +988,7 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
     }
 
     fn release_session(&self, session_id: &str) -> Vec<BackendConnection> {
-        let connections = match self.mode {
+        let mut connections = match self.mode {
             PoolMode::Session => {
                 let mut bindings = self.session_bindings.lock();
                 bindings.remove(session_id).into_iter().collect()
@@ -980,7 +998,11 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
                 pinned.remove(session_id).unwrap_or_default()
             }
         };
-        for connection in &connections {
+        for connection in &mut connections {
+            // Defuse slot guards — we handle slot cleanup below.
+            if let Some(guard) = connection.slot_guard.take() {
+                guard.defuse();
+            }
             self.release_known_slot(connection);
         }
         if !connections.is_empty() {

@@ -322,6 +322,8 @@ Add a `/*+ ... */` comment at the beginning of your SQL to override the default 
 
 **Priority**: Hints > Custom Rules > Analytics Patterns > Cost-based routing > Default read/write classification.
 
+> **⚠️ Security note:** `ROUTE_TO_READER` and `ROUTE_TO_ANALYTICS` hints explicitly override consistency guarantees and custom writer-only routing rules. A query with a `ForceReader` hint will bypass `default_consistency: global` and custom rules that would normally route it to the Writer. This is by design — hints represent an explicit developer override — but operators should be aware that any client able to issue SQL can use hints to bypass routing policies. If this is unacceptable, disable hint routing (`enable_hint_routing: false`).
+
 ## Admin Interface
 
 Enable with `admin.enabled: true` (default listen: `127.0.0.1:9090`):

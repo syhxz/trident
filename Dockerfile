@@ -36,9 +36,11 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 WORKDIR /app
 
 COPY --from=builder /app/trident /app/trident
-# Baked-in fallback config, purely so `docker run` works out of the box for
-# a quick local smoke test. Production deployments should always mount a
-# real config over this path (see README examples in DEPLOYMENT.md) or
+# Baked-in fallback config, purely as a template demonstrating all
+# available settings. It will NOT work out of the box because it
+# references backend hosts (10.0.1.*) that don't exist in a default
+# Docker network. Production deployments should always mount a real
+# config over this path (see README examples in DEPLOYMENT.md) or
 # point TRIDENT_CONFIG elsewhere.
 COPY config.yaml /app/config.yaml
 

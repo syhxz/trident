@@ -112,6 +112,25 @@ pub(super) fn compute_synthetic_schedule(batch: &[ExtendedFrame], skip: &[usize]
                         },
                     )
                 }
+                tag if tag == frontend_tag::DESCRIBE => {
+                    // Describe for a virtual SET object:
+                    // Describe(S): ParameterDescription (0 params) + NoData
+                    // Describe(P): NoData
+                    let mut bytes = Vec::new();
+                    if let Some((kind, _)) = frame.kind_and_name() {
+                        if kind == b'S' {
+                            // ParameterDescription: tag 't', len 6, 0 params
+                            bytes.extend_from_slice(&[b't', 0, 0, 0, 6, 0, 0]);
+                        }
+                    }
+                    // NoData
+                    bytes.extend_from_slice(&[b'n', 0, 0, 0, 4]);
+                    bytes
+                }
+                tag if tag == frontend_tag::CLOSE => {
+                    // CloseComplete
+                    vec![b'3', 0, 0, 0, 4]
+                }
                 _ => Vec::new(),
             };
             if !synthetic.is_empty() {
@@ -203,8 +222,23 @@ pub(super) fn record_statement_routes(
                         b'P' => {
                             // Clean up virtual portal cache for local SET portals.
                             session.local_set_portals.remove(name);
+                            session.write_function_portals.remove(name);
                         }
                         _ => {}
+                    }
+                }
+            }
+            frontend_tag::BIND => {
+                // Track portals bound to write-function statements so
+                // Execute-only batches can seed write_detected correctly.
+                if let Some(stmt_name) = frame.bind_statement() {
+                    if let Some(portal_name) = frame.bind_portal() {
+                        if session.write_function_stmts.contains(stmt_name) {
+                            session.write_function_portals.insert(portal_name.to_string());
+                        } else {
+                            // Rebinding a portal to a non-write stmt clears it.
+                            session.write_function_portals.remove(portal_name);
+                        }
                     }
                 }
             }

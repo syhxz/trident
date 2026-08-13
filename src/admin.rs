@@ -291,7 +291,9 @@ struct AdminState {
     pool_max_lifetime: String,
     /// Dynamic node management (add/remove at runtime).
     node_manager: Option<Arc<dyn NodeManager>>,
-    /// Bearer token for admin API authentication. `None` = no auth required.
+    /// Bearer token for admin API authentication. `None` = protected
+    /// endpoints are disabled (only /metrics, /healthz, and static console
+    /// assets remain accessible).
     auth_token: Option<String>,
     /// Dynamic health check interval setter. `None` if not wired up.
     set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
@@ -299,7 +301,9 @@ struct AdminState {
     get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     /// Serializes config PUT and reload operations to prevent lost updates
     /// from concurrent read-modify-apply sequences (FIX Bug 5a).
-    config_write_lock: tokio::sync::Mutex<()>,
+    /// Shared with `watch_sighup` so SIGHUP reloads also serialize against
+    /// Admin PUT operations.
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Bearer token authentication middleware. Checks the `Authorization`
@@ -419,6 +423,7 @@ fn build_router(
     auth_token: Option<String>,
     set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Router {
     let state = Arc::new(AdminState {
         prometheus_handle,
@@ -440,7 +445,7 @@ fn build_router(
         auth_token,
         set_check_interval_fn,
         get_check_interval_fn,
-        config_write_lock: tokio::sync::Mutex::new(()),
+        config_write_lock,
     });
 
     // Public routes: always accessible (Prometheus scraper, k8s probes, console UI)
@@ -608,6 +613,9 @@ async fn set_custom_rule_handler(
         )
             .into_response();
     }
+    // FIX (reload race): Serialize with config PUT/reload to prevent
+    // concurrent replace_all from overwriting this individual rule change.
+    let _config_guard = state.config_write_lock.lock().await;
     rules.set_rule(&body.name, body.rule_type, body.rw_mode);
     (
         StatusCode::OK,
@@ -623,6 +631,8 @@ async fn delete_custom_rule_handler(
     let Some(rules) = &state.custom_rules else {
         return custom_rules_not_configured().into_response();
     };
+    // FIX (reload race): Serialize with config PUT/reload.
+    let _config_guard = state.config_write_lock.lock().await;
     rules.remove_rule(&body.name, body.rule_type);
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
@@ -1233,6 +1243,7 @@ pub async fn run(
     auth_token: Option<String>,
     check_interval_setter: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     check_interval_getter: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), AdminError> {
     let app = build_router(
         prometheus_handle,
@@ -1254,6 +1265,7 @@ pub async fn run(
         auth_token,
         check_interval_setter,
         check_interval_getter,
+        config_write_lock,
     );
 
     let local_addr = listener.local_addr().map_err(|source| AdminError::Bind {
@@ -1384,6 +1396,7 @@ mod tests {
             Some("test-token".to_string()), // auth_token
             None, // check_interval_setter
             None, // check_interval_getter
+            Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
         )
     }
 
@@ -1492,6 +1505,7 @@ mod tests {
             Some("test-token".to_string()), // auth_token
             None, // check_interval_setter
             None, // check_interval_getter
+            Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
         );
 
         let response = app
@@ -1536,6 +1550,7 @@ mod tests {
             Some("test-token".to_string()), // auth_token
             None, // check_interval_setter
             None, // check_interval_getter
+            Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
         );
 
         let response = app
@@ -1582,6 +1597,7 @@ mod tests {
             Some("test-token".to_string()), // auth_token
             None, // check_interval_setter
             None, // check_interval_getter
+            Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
         )
     }
 
@@ -1717,6 +1733,7 @@ mod tests {
             Some("test-token".to_string()), // auth_token
             None, // check_interval_setter
             None, // check_interval_getter
+            Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
         )
     }
 

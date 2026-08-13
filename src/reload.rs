@@ -94,8 +94,16 @@ pub async fn reload_from_file(
 /// No-op (logs a warning once and returns) on platforms without Unix
 /// signals; `SIGHUP` is a Unix-specific mechanism, matching the `systemctl
 /// reload` convention documented in `deploy/systemd/README.md`.
+///
+/// `config_write_lock`: if provided, serializes SIGHUP reloads against
+/// Admin PUT/POST config operations so concurrent updates don't lose each
+/// other's changes.
 #[cfg(unix)]
-pub async fn watch_sighup(path: String, target: Arc<dyn RoutingReloadTarget>) {
+pub async fn watch_sighup(
+    path: String,
+    target: Arc<dyn RoutingReloadTarget>,
+    config_write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+) {
     let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
         Ok(s) => s,
         Err(e) => {
@@ -107,6 +115,13 @@ pub async fn watch_sighup(path: String, target: Arc<dyn RoutingReloadTarget>) {
     loop {
         signal.recv().await;
         tracing::info!(path = %path, "received SIGHUP, reloading routing configuration");
+        // FIX (reload race): Hold config_write_lock during SIGHUP reload
+        // to prevent interleaving with Admin PUT operations.
+        let _guard = if let Some(ref lock) = config_write_lock {
+            Some(lock.lock().await)
+        } else {
+            None
+        };
         match reload_from_file(&path, target.as_ref()).await {
             Ok(()) => tracing::info!("routing configuration reloaded successfully"),
             Err(e) => tracing::warn!(error = %e, "routing configuration reload failed; keeping previous configuration"),
@@ -115,7 +130,11 @@ pub async fn watch_sighup(path: String, target: Arc<dyn RoutingReloadTarget>) {
 }
 
 #[cfg(not(unix))]
-pub async fn watch_sighup(_path: String, _target: Arc<dyn RoutingReloadTarget>) {
+pub async fn watch_sighup(
+    _path: String,
+    _target: Arc<dyn RoutingReloadTarget>,
+    _config_write_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+) {
     tracing::warn!("SIGHUP-based hot reload is only supported on Unix; use the admin POST /reload endpoint instead");
 }
 

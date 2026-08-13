@@ -42,7 +42,7 @@ kubectl -n trident logs -f deploy/trident
 
 ## Known Limitations (read first)
 
-1. **`replicas > 1` is the multi-instance scenario discussed in DEPLOYMENT.md section 8**:
+1. **`replicas > 1` is the multi-instance scenario discussed in DEPLOYMENT.md section 7**:
    `ConsistencyLevel::Global` is not correct across pods. When running multiple replicas,
    set `routing.default_consistency` to `session` or `eventual`.
 2. **Probes**: `readinessProbe` is configured as `httpGet /healthz` (requires
@@ -55,7 +55,7 @@ kubectl -n trident logs -f deploy/trident
 3. **CANCEL request session stickiness**: `30-service.yaml` configures
    `sessionAffinity: ClientIP` to reduce (but not eliminate) the probability of CANCEL
    requests being routed to a different pod and silently failing in multi-replica setups.
-   See DEPLOYMENT.md section 8.3.
+   See DEPLOYMENT.md section 7.3.
 4. **Password storage**: `NodeConfig.password` now supports `${ENV_VAR}` placeholders or
    omission with `.pgpass` lookup (see DEPLOYMENT.md section 2). You can split
    `10-config-secret.yaml` into a ConfigMap (non-sensitive `proxy`/`routing`/`pool`/

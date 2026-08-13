@@ -158,6 +158,10 @@ pub struct ClientSession {
     /// batches to correctly seed write_detected even when CommandComplete
     /// only says "SELECT 1".
     write_function_stmts: std::collections::HashSet<String>,
+    /// Tracks portals bound to write-function statements. Populated when
+    /// Bind creates a portal referencing a `write_function_stmts` entry.
+    /// Used for Execute-only batches (no Bind) to seed write_detected.
+    write_function_portals: std::collections::HashSet<String>,
 }
 
 /// Wrapper that owns a `BackendConnection` and automatically discards it
@@ -350,6 +354,7 @@ impl ClientSession {
             local_set_stmts: HashMap::new(),
             local_set_portals: HashMap::new(),
             write_function_stmts: std::collections::HashSet::new(),
+            write_function_portals: std::collections::HashSet::new(),
         }
     }
 
