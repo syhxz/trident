@@ -260,6 +260,140 @@ Requires an **L4/TCP load balancer** (LVS, HAProxy TCP mode, NLB). L7/HTTP LBs c
 - Size backend `max_connections` for total pool capacity across all instances
 - Trigger reload independently on each instance (not broadcast)
 
+### Load Balancer Options
+
+#### Option A: AWS NLB (Recommended for AWS Deployments)
+
+The simplest approach on AWS. Network Load Balancer operates at L4 (TCP), provides cross-AZ redundancy with no operational overhead, and is cheaper than self-managed alternatives for most workloads.
+
+**Cost**: ~$16/month base + $0.006/GB processed.
+
+```
+         ┌──────────────┐
+ App ──▶ │   AWS NLB    │ ──▶ Trident-1 (AZ-a)
+ App ──▶ │  (managed)   │ ──▶ Trident-2 (AZ-b)
+         └──────────────┘
+```
+
+**Setup** (Target Group):
+- Protocol: TCP, Port: 6432
+- Health check: TCP on port 6432 (or HTTP on admin port 9090 `/healthz`)
+- Stickiness: Enable source-IP stickiness (5-tuple) for CANCEL request support
+- Cross-zone: Enable for even distribution
+
+#### Option B: HAProxy (Recommended for Bare-Metal / Private Cloud)
+
+The most mature open-source TCP load balancer. Production-proven, high performance, supports health checks and hot reload.
+
+**Single HAProxy** (acceptable if systemd auto-restart provides sufficient SLA):
+
+```conf
+# /etc/haproxy/haproxy.cfg
+global
+    maxconn 10000
+
+defaults
+    mode tcp
+    timeout connect 5s
+    timeout client  30m      # PostgreSQL long-lived connections
+    timeout server  30m
+
+frontend pg_proxy
+    bind *:5432
+    default_backend trident_nodes
+
+backend trident_nodes
+    balance leastconn
+    option tcp-check
+    server trident1 10.0.1.10:6432 check inter 2s fall 3 rise 2
+    server trident2 10.0.1.11:6432 check inter 2s fall 3 rise 2
+```
+
+**HA HAProxy** (dual + Keepalived VIP):
+
+```
+              VIP (浮动 IP)
+                  │
+          ┌───────┴───────┐
+          │               │
+    HAProxy-1 (主)   HAProxy-2 (备)
+    Keepalived        Keepalived
+          │               │
+          └───────┬───────┘
+                  │
+      ┌───────────┼───────────┐
+   Trident-1   Trident-2   Trident-N
+```
+
+Keepalived configuration (`/etc/keepalived/keepalived.conf`):
+
+```conf
+# Master node
+vrrp_instance VI_PG {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass changeme
+    }
+    virtual_ipaddress {
+        10.0.1.100/24
+    }
+}
+
+# Backup node: same config with state BACKUP, priority 90
+```
+
+> **⚠️ AWS caveat**: VIP floating via VRRP does not work natively in VPC. On AWS, use NLB (Option A) or Elastic IP remapping via Lambda/CloudWatch instead of Keepalived.
+
+#### Option C: Client-Side Multi-Host (Zero Extra Infrastructure)
+
+If no LB budget is available, leverage libpq/JDBC native multi-host support for automatic failover between Trident instances. No additional infrastructure required.
+
+**libpq / psql**:
+```
+postgresql://user:pass@trident1:6432,trident2:6432/mydb?target_session_attrs=any
+```
+
+**JDBC**:
+```
+jdbc:postgresql://trident1:6432,trident2:6432/mydb?targetServerType=any&loadBalanceHosts=true
+```
+
+**Python (psycopg2)**:
+```python
+conn = psycopg2.connect(
+    host="trident1,trident2",
+    port="6432,6432",
+    dbname="mydb",
+    user="app_user",
+    target_session_attrs="any"
+)
+```
+
+| Behavior | Description |
+|----------|-------------|
+| Failover | Client tries hosts in order; skips unreachable ones |
+| `loadBalanceHosts=true` (JDBC) | Randomizes host order for basic load distribution |
+| Reconnect | Application must handle connection-lost and retry |
+| Limitation | No health-check awareness — relies on TCP timeout to detect failure |
+
+**Trade-offs**:
+
+| | AWS NLB | HAProxy × 2 | Client Multi-Host |
+|--|---------|-------------|-------------------|
+| Extra infra | 0 (managed) | 2 VMs | 0 |
+| Monthly cost | ~$16 + traffic | ~$30 (t3.small × 2) | $0 |
+| Failover speed | Instant (<10s) | VIP drift ~2s | TCP timeout (5-30s) |
+| Load balancing | ✓ (cross-AZ) | ✓ (leastconn) | Limited (random) |
+| Ops complexity | Zero | Medium (Keepalived, cert renewal) | Low (client config only) |
+| CANCEL support | ✓ (with stickiness) | ✓ (source-IP hash) | ✓ (same connection) |
+
+**Recommendation**: Use AWS NLB for AWS deployments, HAProxy HA for on-premise, and client-side multi-host as a cost-free starting point that can be upgraded later.
+
 ## 8. Transaction Splitting & Connection Pool
 
 ### Transaction Split Behavior
