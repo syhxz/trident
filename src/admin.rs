@@ -72,6 +72,10 @@ use crate::proxy::client_stats::ClientStats;
 use crate::reload::{reload_from_file, RoutingReloadTarget};
 use crate::router::custom_rules::{CustomRoutingRules, RuleTargetKind};
 
+/// Type alias for the drain-user callback to satisfy clippy::type_complexity.
+/// Takes a username and returns the number of pools drained.
+pub type DrainUserFn = Box<dyn Fn(&str) -> usize + Send + Sync>;
+
 /// Trait for dynamically adding/removing backend nodes at runtime.
 /// Implemented by the wiring layer in `main.rs` that coordinates the
 /// HealthChecker, PoolManager, and node_addresses map.
@@ -306,7 +310,7 @@ struct AdminState {
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Drains all per-user pools for a given username. Used for credential
     /// revocation (P1). `None` if passthrough mode is not configured.
-    drain_user_fn: Option<Box<dyn Fn(&str) -> usize + Send + Sync>>,
+    drain_user_fn: Option<DrainUserFn>,
 }
 
 /// Bearer token authentication middleware. Checks the `Authorization`
@@ -425,7 +429,7 @@ fn build_router(
     set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
-    drain_user_fn: Option<Box<dyn Fn(&str) -> usize + Send + Sync>>,
+    drain_user_fn: Option<DrainUserFn>,
 ) -> Router {
     let state = Arc::new(AdminState {
         prometheus_handle,
@@ -1339,7 +1343,7 @@ pub async fn run(
     check_interval_setter: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     check_interval_getter: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
-    drain_user_fn: Option<Box<dyn Fn(&str) -> usize + Send + Sync>>,
+    drain_user_fn: Option<DrainUserFn>,
 ) -> Result<(), AdminError> {
     let app = build_router(
         prometheus_handle,

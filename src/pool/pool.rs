@@ -603,15 +603,19 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     }
 
     fn forget_metadata(&self, conn: &BackendConnection) {
+        // Use (backend_pid, secret_key) as the identity to avoid false
+        // matches when PostgreSQL reuses a PID after a connection is
+        // destroyed and recreated.
+        let key = (conn.backend_pid, conn.secret_key);
         self.idle
             .lock()
-            .retain(|candidate| candidate.backend_pid != conn.backend_pid);
+            .retain(|candidate| (candidate.backend_pid, candidate.secret_key) != key);
         self.session_bindings
             .lock()
-            .retain(|_, candidate| candidate.backend_pid != conn.backend_pid);
+            .retain(|_, candidate| (candidate.backend_pid, candidate.secret_key) != key);
         let mut pinned = self.pinned_by_session.lock();
         pinned.retain(|_, connections| {
-            connections.retain(|candidate| candidate.backend_pid != conn.backend_pid);
+            connections.retain(|candidate| (candidate.backend_pid, candidate.secret_key) != key);
             !connections.is_empty()
         });
     }

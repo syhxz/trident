@@ -599,9 +599,10 @@ where
                         .filter(|f| f.tag == frontend_tag::BIND)
                         .filter_map(|f| {
                             f.bind_statement().and_then(|stmt_name| {
-                                session.local_set_stmts.get(stmt_name).map(|sql| {
-                                    (f.bind_portal().unwrap_or(""), sql.clone())
-                                })
+                                session
+                                    .local_set_stmts
+                                    .get(stmt_name)
+                                    .map(|sql| (f.bind_portal().unwrap_or(""), sql.clone()))
                             })
                         })
                         .collect();
@@ -639,7 +640,9 @@ where
                                 // portal (in order) so multiple SETs take
                                 // effect sequentially.
                                 if let Some(portal) = frame.execute_portal() {
-                                    if let Some((_, set_sql)) = portal_to_sql.iter().find(|(p, _)| *p == portal) {
+                                    if let Some((_, set_sql)) =
+                                        portal_to_sql.iter().find(|(p, _)| *p == portal)
+                                    {
                                         session.state.apply_consistency_set_command(set_sql);
                                     }
                                 }

@@ -197,13 +197,14 @@ impl HealthStateMachine {
 /// candidate set due to replication lag exceeding the threshold.
 ///
 /// See Property 36: excluded if and only if `lag_ms > max_replication_lag_ms`.
-/// When `lag_ms = None` (no lag data collected), conservatively does not
-/// exclude (returns `false`); the caller combines this with the healthy
-/// state for the overall decision.
+/// When `lag_ms = None` (no lag data collected), conservatively excludes
+/// the node (returns `true`): unknown lag is treated as potentially
+/// exceeding the threshold. This avoids routing reads to a replica whose
+/// replication status cannot be determined.
 pub fn is_excluded_by_replication_lag(lag_ms: Option<u64>, max_replication_lag_ms: u64) -> bool {
     match lag_ms {
         Some(lag) => lag > max_replication_lag_ms,
-        None => false,
+        None => true,
     }
 }
 
@@ -1242,8 +1243,10 @@ mod tests {
         }
 
         #[test]
-        fn property_36_missing_lag_never_excludes(threshold in 0u64..100_000) {
-            prop_assert!(!is_excluded_by_replication_lag(None, threshold));
+        fn property_36_missing_lag_always_excludes(threshold in 0u64..100_000) {
+            // When replication lag is unknown (None), conservatively exclude
+            // the node to prevent routing reads to a potentially stale replica.
+            prop_assert!(is_excluded_by_replication_lag(None, threshold));
         }
     }
 

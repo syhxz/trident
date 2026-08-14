@@ -333,11 +333,7 @@ impl InMemoryPoolManager {
         // Key format is "node_id\0username\0database\0params_key"
         let keys_to_drain: Vec<String> = pools
             .keys()
-            .filter(|key| {
-                key.split('\0')
-                    .nth(1)
-                    .is_some_and(|u| u == username)
-            })
+            .filter(|key| key.split('\0').nth(1).is_some_and(|u| u == username))
             .cloned()
             .collect();
         let count = keys_to_drain.len();
@@ -716,17 +712,22 @@ impl PoolManager for InMemoryPoolManager {
         (self.health_snapshots)()
             .into_iter()
             .map(|mut snap| {
-                // Base pool connections (service-account, used for health checks)
+                // Report checked-out (in-use) connections, not total owned.
+                // For load balancing (least-connections), idle connections
+                // should not inflate the load metric — only connections
+                // actively serving client requests matter.
                 if let Some(pool) = pools.get(&snap.node_id) {
-                    snap.active_connections = pool.active_connections();
+                    snap.active_connections = pool.active_connections() - pool.idle_connections();
                 }
-                // Add per-user pool connections for this node
+                // Add per-user pool checked-out connections for this node
                 if self.user_pool_factory.is_some() {
                     let prefix = format!("{}\0", snap.node_id);
                     let user_active: i64 = user_pools
                         .iter()
                         .filter(|(k, _)| k.starts_with(&prefix))
-                        .map(|(_, entry)| entry.pool.active_connections())
+                        .map(|(_, entry)| {
+                            entry.pool.active_connections() - entry.pool.idle_connections()
+                        })
                         .sum();
                     snap.active_connections += user_active;
                 }

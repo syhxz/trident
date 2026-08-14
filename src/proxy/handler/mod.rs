@@ -3348,7 +3348,10 @@ mod tests {
         );
         let split = session.state.tx_split.as_ref().unwrap();
         assert!(!split.on_reader, "after upgrade, must be on Writer");
-        assert!(!split.need_upgrade, "need_upgrade must be cleared after successful upgrade");
+        assert!(
+            !split.need_upgrade,
+            "need_upgrade must be cleared after successful upgrade"
+        );
 
         // Step 4: Another write — must succeed via forward_on_held_backend
         // (this was the failing case before the fix)
