@@ -21,9 +21,9 @@
 //! require eagerly resolving every write's LSN, defeating the purpose of
 //! `lazy_fallback`.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
 
 pub trait LsnTracker: Send + Sync {
     /// Called after a Writer write operation completes, to update the
@@ -94,12 +94,10 @@ impl LsnTracker for InMemoryLsnTracker {
         // loop, safe under concurrent writes).
         let mut current = self.global_lsn.load(Ordering::SeqCst);
         while lsn > current {
-            match self.global_lsn.compare_exchange(
-                current,
-                lsn,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .global_lsn
+                .compare_exchange(current, lsn, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(actual) => current = actual,
             }
@@ -107,9 +105,7 @@ impl LsnTracker for InMemoryLsnTracker {
     }
 
     fn remove_session(&self, session_id: &str) {
-        self.session_lsn
-            .lock()
-            .remove(session_id);
+        self.session_lsn.lock().remove(session_id);
     }
 
     fn session_write_lsn(&self, session_id: &str) -> u64 {
@@ -127,12 +123,10 @@ impl LsnTracker for InMemoryLsnTracker {
     fn advance_global_lsn(&self, lsn: u64) {
         let mut current = self.global_lsn.load(Ordering::SeqCst);
         while lsn > current {
-            match self.global_lsn.compare_exchange(
-                current,
-                lsn,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .global_lsn
+                .compare_exchange(current, lsn, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(actual) => current = actual,
             }

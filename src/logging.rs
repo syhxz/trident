@@ -164,7 +164,10 @@ mod tests {
     use std::io::Write;
 
     fn temp_dir(suffix: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("trident-logroller-test-{}-{suffix}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "trident-logroller-test-{}-{suffix}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -190,7 +193,11 @@ mod tests {
         // comfortably larger than the 50-byte threshold on its own, so
         // this should trigger a handful of rotations.
         for i in 0..20 {
-            writeln!(roller, "log line number {i} with some padding to exceed the size threshold").unwrap();
+            writeln!(
+                roller,
+                "log line number {i} with some padding to exceed the size threshold"
+            )
+            .unwrap();
         }
         roller.flush().unwrap();
 

@@ -85,7 +85,12 @@ struct PgContainerHandle {
     port: u16,
 }
 
-fn start_postgres_container(docker: &Cli) -> (testcontainers::Container<'_, GenericImage>, PgContainerHandle) {
+fn start_postgres_container(
+    docker: &Cli,
+) -> (
+    testcontainers::Container<'_, GenericImage>,
+    PgContainerHandle,
+) {
     let image = GenericImage::new("postgres", "16-alpine")
         .with_env_var("POSTGRES_PASSWORD", TEST_DB_PASSWORD)
         .with_wait_for(WaitFor::message_on_stderr(
@@ -110,7 +115,10 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         password: Some(TEST_DB_PASSWORD.to_string()),
         ssl_mode: trident::config::SslMode::Disable,
     };
-    let probe = WireProtocolHealthProbe { target: target.clone(), aurora_native: false };
+    let probe = WireProtocolHealthProbe {
+        target: target.clone(),
+        aurora_native: false,
+    };
     let health_checker = Arc::new(HealthChecker::new(
         vec![("primary".to_string(), NodeType::Writer, 1, probe)],
         1000,
@@ -140,7 +148,8 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
         generation: 0,
     };
     let cleaner = DiscardAllCleaner::new();
-    let mut pools: std::collections::HashMap<String, Box<dyn ConnectionPool>> = std::collections::HashMap::new();
+    let mut pools: std::collections::HashMap<String, Box<dyn ConnectionPool>> =
+        std::collections::HashMap::new();
     pools.insert(
         "primary".to_string(),
         Box::new(trident::pool::pool::NodePool::new(
@@ -177,7 +186,9 @@ async fn start_proxy_stack(proxy_addr: SocketAddr, writer_port: u16) {
     let server = ProxyServer::new(proxy_addr, 100);
     let next_pid = Arc::new(AtomicI32::new(1));
     let cancel_registry = Arc::new(CancelRegistry::new());
-    let node_addresses = Arc::new(arc_swap::ArcSwap::new(Arc::new(std::collections::HashMap::new())));
+    let node_addresses = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+        std::collections::HashMap::new(),
+    )));
 
     let deps = ProxyDeps {
         router,
@@ -257,8 +268,9 @@ async fn end_to_end_simple_query_through_proxy() {
     // (proxy::forwarder::forward_simple_query), the proxy now forwards the
     // real RowDescription/DataRow/CommandComplete from the backend PostgreSQL
     // instance to the client, so we can assert on the actual returned value.
-    let query_bytes =
-        trident::protocol::writer::encode_frontend_message(&FrontendMessage::Query("SELECT 1".to_string()));
+    let query_bytes = trident::protocol::writer::encode_frontend_message(&FrontendMessage::Query(
+        "SELECT 1".to_string(),
+    ));
     client.write_all(&query_bytes).await.unwrap();
 
     let row_description = trident::protocol::reader::read_backend_message(&mut client)
@@ -340,8 +352,9 @@ async fn write_then_read_reflects_updated_session_lsn() {
         "CREATE TABLE IF NOT EXISTS lsn_probe (id int)",
         "INSERT INTO lsn_probe (id) VALUES (1)",
     ] {
-        let query_bytes =
-            trident::protocol::writer::encode_frontend_message(&FrontendMessage::Query(sql.to_string()));
+        let query_bytes = trident::protocol::writer::encode_frontend_message(
+            &FrontendMessage::Query(sql.to_string()),
+        );
         client.write_all(&query_bytes).await.unwrap();
 
         loop {
@@ -435,7 +448,9 @@ async fn explicit_transaction_commit_and_rollback_preserve_backend_state() {
     let begin = query(&mut client, "BEGIN").await;
     assert!(matches!(
         begin.last(),
-        Some(BackendMessage::ReadyForQuery(TransactionStatus::InTransaction))
+        Some(BackendMessage::ReadyForQuery(
+            TransactionStatus::InTransaction
+        ))
     ));
     query(&mut client, "INSERT INTO transaction_probe VALUES (42)").await;
     let rollback = query(&mut client, "ROLLBACK").await;
@@ -479,7 +494,10 @@ async fn failed_node_is_excluded_and_recovers() {
         password: Some(TEST_DB_PASSWORD.to_string()),
         ssl_mode: trident::config::SslMode::Disable,
     };
-    let probe = WireProtocolHealthProbe { target, aurora_native: false };
+    let probe = WireProtocolHealthProbe {
+        target,
+        aurora_native: false,
+    };
     let checker = HealthChecker::new(
         vec![("writer".to_string(), NodeType::Writer, 1, probe)],
         1000,

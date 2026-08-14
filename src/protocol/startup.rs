@@ -175,7 +175,9 @@ pub trait StartupHandler {
 
     /// Auth with stream access for challenge-response protocols.
     /// Default: delegates to handle_startup (no challenge-response).
-    fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    fn handle_startup_with_stream<
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    >(
         &mut self,
         msg: StartupMessage,
         _stream: &mut S,
@@ -232,7 +234,9 @@ impl StartupHandler for Md5PasswordStartupHandler {
         ))
     }
 
-    async fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    async fn handle_startup_with_stream<
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    >(
         &mut self,
         msg: StartupMessage,
         stream: &mut S,
@@ -241,18 +245,12 @@ impl StartupHandler for Md5PasswordStartupHandler {
         use sha2::Digest; // for Md5::new() / update / finalize (md5 re-exports digest trait)
         use tokio::io::AsyncWriteExt;
 
-        let username = msg
-            .params
-            .get("user")
-            .cloned()
-            .unwrap_or_default();
+        let username = msg.params.get("user").cloned().unwrap_or_default();
 
         let expected_password = self
             .credentials
             .get(&username)
-            .ok_or_else(|| {
-                ProtocolError::Malformed(format!("unknown user: {}", username))
-            })?
+            .ok_or_else(|| ProtocolError::Malformed(format!("unknown user: {}", username)))?
             .clone();
 
         // Send AuthenticationMD5Password with a random 4-byte salt
@@ -273,7 +271,11 @@ impl StartupHandler for Md5PasswordStartupHandler {
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Read PasswordMessage ('p')
-        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(
+            stream,
+            crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN,
+        )
+        .await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
                 "expected PasswordMessage ('p'), got '{}'",
@@ -387,7 +389,12 @@ impl ScramVerifier {
         stored_key.copy_from_slice(&stored_key_bytes);
         server_key.copy_from_slice(&server_key_bytes);
 
-        Some(ScramVerifier { iterations, salt, stored_key, server_key })
+        Some(ScramVerifier {
+            iterations,
+            salt,
+            stored_key,
+            server_key,
+        })
     }
 
     /// Derive a verifier from a plaintext password.
@@ -415,7 +422,12 @@ impl ScramVerifier {
         let stored_key: [u8; 32] = Sha256::digest(client_key).into();
         let server_key = Self::hmac(&salted_password, b"Server Key");
 
-        ScramVerifier { iterations, salt, stored_key, server_key }
+        ScramVerifier {
+            iterations,
+            salt,
+            stored_key,
+            server_key,
+        }
     }
 
     fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -434,7 +446,9 @@ impl StartupHandler for ScramStartupHandler {
         ))
     }
 
-    async fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    async fn handle_startup_with_stream<
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    >(
         &mut self,
         msg: StartupMessage,
         stream: &mut S,
@@ -446,9 +460,11 @@ impl StartupHandler for ScramStartupHandler {
 
         let username = msg.params.get("user").cloned().unwrap_or_default();
 
-        let credential = self.credentials.get(&username).ok_or_else(|| {
-            ProtocolError::Malformed(format!("unknown user: {}", username))
-        })?.clone();
+        let credential = self
+            .credentials
+            .get(&username)
+            .ok_or_else(|| ProtocolError::Malformed(format!("unknown user: {}", username)))?
+            .clone();
 
         // Parse or derive the SCRAM verifier. When deriving from a plaintext
         // password, PBKDF2 is CPU-intensive and must not block the Tokio
@@ -474,14 +490,22 @@ impl StartupHandler for ScramStartupHandler {
         auth_sasl.extend_from_slice(mechanism);
         auth_sasl.push(0); // mechanism list terminator
 
-        stream.write_all(&auth_sasl).await.map_err(ProtocolError::Io)?;
+        stream
+            .write_all(&auth_sasl)
+            .await
+            .map_err(ProtocolError::Io)?;
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Step 2: Receive SASLInitialResponse (client-first-message)
-        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(
+            stream,
+            crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN,
+        )
+        .await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
-                "expected SASLInitialResponse ('p'), got '{}'", tag as char
+                "expected SASLInitialResponse ('p'), got '{}'",
+                tag as char
             )));
         }
 
@@ -501,7 +525,9 @@ impl StartupHandler for ScramStartupHandler {
         }
         let rest = &body[mech_end + 1..];
         if rest.len() < 4 {
-            return Err(ProtocolError::Malformed("SASLInitialResponse too short".into()));
+            return Err(ProtocolError::Malformed(
+                "SASLInitialResponse too short".into(),
+            ));
         }
         let data_len_i32 = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
         if data_len_i32 < 0 {
@@ -514,16 +540,17 @@ impl StartupHandler for ScramStartupHandler {
             ProtocolError::Malformed("SASLInitialResponse data length overflow".into())
         })?;
         if rest.len() < total_len {
-            return Err(ProtocolError::Malformed("SASLInitialResponse data truncated".into()));
+            return Err(ProtocolError::Malformed(
+                "SASLInitialResponse data truncated".into(),
+            ));
         }
         if rest.len() != total_len {
             return Err(ProtocolError::Malformed(
                 "SASLInitialResponse has trailing data after SASL payload".into(),
             ));
         }
-        let client_first = std::str::from_utf8(&rest[4..4 + data_len]).map_err(|_| {
-            ProtocolError::Malformed("client-first-message is not UTF-8".into())
-        })?;
+        let client_first = std::str::from_utf8(&rest[4..4 + data_len])
+            .map_err(|_| ProtocolError::Malformed("client-first-message is not UTF-8".into()))?;
 
         // Parse "n,,<client_first_bare>" where client_first_bare = "n=,r=<nonce>"
         let client_first_bare = client_first.strip_prefix("n,,").ok_or_else(|| {
@@ -557,19 +584,26 @@ impl StartupHandler for ScramStartupHandler {
         sasl_continue.extend_from_slice(&11i32.to_be_bytes()); // AuthSASLContinue = 11
         sasl_continue.extend_from_slice(server_first.as_bytes());
 
-        stream.write_all(&sasl_continue).await.map_err(ProtocolError::Io)?;
+        stream
+            .write_all(&sasl_continue)
+            .await
+            .map_err(ProtocolError::Io)?;
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Step 4: Receive SASLResponse (client-final-message)
-        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(
+            stream,
+            crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN,
+        )
+        .await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
-                "expected SASLResponse ('p'), got '{}'", tag as char
+                "expected SASLResponse ('p'), got '{}'",
+                tag as char
             )));
         }
-        let client_final = std::str::from_utf8(&body).map_err(|_| {
-            ProtocolError::Malformed("client-final-message is not UTF-8".into())
-        })?;
+        let client_final = std::str::from_utf8(&body)
+            .map_err(|_| ProtocolError::Malformed("client-final-message is not UTF-8".into()))?;
         let client_final = client_final.trim_end_matches('\0');
 
         // Validate channel binding: must be "c=biws" (base64 of "n,,")
@@ -604,12 +638,10 @@ impl StartupHandler for ScramStartupHandler {
         let proof_b64 = client_final
             .split(',')
             .find_map(|part| part.strip_prefix("p="))
-            .ok_or_else(|| {
-                ProtocolError::Malformed("client-final-message missing proof".into())
-            })?;
-        let client_proof = B64.decode(proof_b64).map_err(|_| {
-            ProtocolError::Malformed("invalid base64 proof".into())
-        })?;
+            .ok_or_else(|| ProtocolError::Malformed("client-final-message missing proof".into()))?;
+        let client_proof = B64
+            .decode(proof_b64)
+            .map_err(|_| ProtocolError::Malformed("invalid base64 proof".into()))?;
         if client_proof.len() != 32 {
             return Err(ProtocolError::Malformed("proof must be 32 bytes".into()));
         }
@@ -618,9 +650,7 @@ impl StartupHandler for ScramStartupHandler {
         let client_final_without_proof = client_final
             .rsplit_once(",p=")
             .map(|(prefix, _)| prefix)
-            .ok_or_else(|| {
-                ProtocolError::Malformed("cannot split client-final at proof".into())
-            })?;
+            .ok_or_else(|| ProtocolError::Malformed("cannot split client-final at proof".into()))?;
 
         let auth_message = format!(
             "{},{},{}",
@@ -639,10 +669,9 @@ impl StartupHandler for ScramStartupHandler {
         // H(recovered_client_key) must equal StoredKey
         let recovered_stored_key: [u8; 32] = Sha256::digest(recovered_client_key).into();
 
-        let keys_match: bool = subtle::ConstantTimeEq::ct_eq(
-            &recovered_stored_key[..],
-            &verifier.stored_key[..],
-        ).into();
+        let keys_match: bool =
+            subtle::ConstantTimeEq::ct_eq(&recovered_stored_key[..], &verifier.stored_key[..])
+                .into();
 
         if !keys_match {
             return Err(ProtocolError::Malformed(
@@ -661,7 +690,10 @@ impl StartupHandler for ScramStartupHandler {
         sasl_final.extend_from_slice(&12i32.to_be_bytes()); // AuthSASLFinal = 12
         sasl_final.extend_from_slice(server_final_msg.as_bytes());
 
-        stream.write_all(&sasl_final).await.map_err(ProtocolError::Io)?;
+        stream
+            .write_all(&sasl_final)
+            .await
+            .map_err(ProtocolError::Io)?;
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         Ok(AuthOutcome {
@@ -696,18 +728,16 @@ impl StartupHandler for PassthroughStartupHandler {
         ))
     }
 
-    async fn handle_startup_with_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    async fn handle_startup_with_stream<
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    >(
         &mut self,
         msg: StartupMessage,
         stream: &mut S,
     ) -> Result<AuthOutcome, ProtocolError> {
         use tokio::io::AsyncWriteExt;
 
-        let username = msg
-            .params
-            .get("user")
-            .cloned()
-            .unwrap_or_default();
+        let username = msg.params.get("user").cloned().unwrap_or_default();
 
         if username.is_empty() {
             return Err(ProtocolError::Malformed(
@@ -730,7 +760,11 @@ impl StartupHandler for PassthroughStartupHandler {
         stream.flush().await.map_err(ProtocolError::Io)?;
 
         // Read PasswordMessage ('p')
-        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(stream, crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN).await?;
+        let (tag, body) = crate::protocol::reader::read_tagged_frame_bounded(
+            stream,
+            crate::protocol::reader::MAX_AUTH_MESSAGE_BODY_LEN,
+        )
+        .await?;
         if tag != b'p' {
             return Err(ProtocolError::Malformed(format!(
                 "expected PasswordMessage ('p'), got '{}'",
@@ -757,7 +791,9 @@ impl StartupHandler for PassthroughStartupHandler {
                 username: username.clone(),
                 password,
                 database: msg.params.get("database").cloned(),
-                extra_params: msg.params.into_iter()
+                extra_params: msg
+                    .params
+                    .into_iter()
                     .filter(|(k, _)| k != "user" && k != "database")
                     .collect(),
             }),

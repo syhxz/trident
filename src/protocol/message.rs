@@ -149,8 +149,12 @@ impl TransactionStatus {
 pub enum BackendMessage {
     AuthenticationOk,
     AuthenticationCleartextPassword,
-    AuthenticationMd5Password { salt: [u8; 4] },
-    AuthenticationSasl { mechanisms: Vec<String> },
+    AuthenticationMd5Password {
+        salt: [u8; 4],
+    },
+    AuthenticationSasl {
+        mechanisms: Vec<String>,
+    },
     AuthenticationSaslContinue(Vec<u8>),
     AuthenticationSaslFinal(Vec<u8>),
     ParameterStatus {

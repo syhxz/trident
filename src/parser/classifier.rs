@@ -83,17 +83,20 @@ mod once_cell_lite {
     }
 }
 
-static FOR_UPDATE_OR_SHARE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?is)\bFOR\s+(NO\s+KEY\s+UPDATE|KEY\s+SHARE|UPDATE|SHARE)\b").unwrap());
+static FOR_UPDATE_OR_SHARE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)\bFOR\s+(NO\s+KEY\s+UPDATE|KEY\s+SHARE|UPDATE|SHARE)\b").unwrap()
+});
 
-static SELECT_INTO: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?is)\bINTO\s+(TEMP\w*\s+|TEMPORARY\s+|UNLOGGED\s+)?(TABLE\s+)?\w+").unwrap());
+static SELECT_INTO: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)\bINTO\s+(TEMP\w*\s+|TEMPORARY\s+|UNLOGGED\s+)?(TABLE\s+)?\w+").unwrap()
+});
 
 static SET_LOCAL: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)^SET\s+LOCAL\b").unwrap());
 
 static COPY_FROM: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)^COPY\b.*\bFROM\b").unwrap());
 
-static EXPLAIN_ANALYZE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)^EXPLAIN\b.*\bANALYZE\b").unwrap());
+static EXPLAIN_ANALYZE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)^EXPLAIN\b.*\bANALYZE\b").unwrap());
 
 static WRITE_FUNCTION_CALL: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)\b(nextval|setval|pg_advisory_lock\w*|lo_[a-z_]+)\s*\(").unwrap()
@@ -199,10 +202,7 @@ pub fn contains_multiple_statements(sql: &str) -> bool {
                 index += 2;
                 let mut comment_depth = 1u32;
                 while index < bytes.len() && comment_depth > 0 {
-                    if index + 1 < bytes.len()
-                        && bytes[index] == b'/'
-                        && bytes[index + 1] == b'*'
-                    {
+                    if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
                         comment_depth += 1;
                         index += 2;
                     } else if index + 1 < bytes.len()
@@ -341,10 +341,7 @@ pub fn split_statements(sql: &str) -> Option<Vec<&str>> {
                 index += 2;
                 let mut comment_depth = 1u32;
                 while index < bytes.len() && comment_depth > 0 {
-                    if index + 1 < bytes.len()
-                        && bytes[index] == b'/'
-                        && bytes[index + 1] == b'*'
-                    {
+                    if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
                         comment_depth += 1;
                         index += 2;
                     } else if index + 1 < bytes.len()
@@ -621,7 +618,10 @@ mod tests {
 
     #[test]
     fn only_comment_classifies_as_other() {
-        assert_eq!(classifier().classify("/* just a comment */"), SqlKind::Other);
+        assert_eq!(
+            classifier().classify("/* just a comment */"),
+            SqlKind::Other
+        );
     }
 
     #[test]

@@ -32,13 +32,17 @@ pub enum PoolError {
     #[error("connection pool for node '{0}' is exhausted (max_pool_size reached)")]
     Exhausted(String),
 
-    #[error("timed out after {timeout_ms} ms waiting for an available connection for node '{node_id}'")]
+    #[error(
+        "timed out after {timeout_ms} ms waiting for an available connection for node '{node_id}'"
+    )]
     AcquireTimeout { node_id: String, timeout_ms: u128 },
 
     #[error("failed to establish new backend connection: {0}")]
     ConnectFailed(String),
 
-    #[error("timed out after {timeout_ms} ms establishing a backend connection for node '{node_id}'")]
+    #[error(
+        "timed out after {timeout_ms} ms establishing a backend connection for node '{node_id}'"
+    )]
     ConnectTimeout { node_id: String, timeout_ms: u128 },
 
     #[error("failed to clean dirty connection before returning to pool: {0}")]
@@ -424,10 +428,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
                 if self.draining.load(Ordering::SeqCst) {
                     self.cleaner.discard(&conn);
                     // Guard will release slot on drop.
-                    return Err(PoolError::Exhausted(format!(
-                        "{} (draining)",
-                        self.node_id
-                    )));
+                    return Err(PoolError::Exhausted(format!("{} (draining)", self.node_id)));
                 }
                 self.register_connection(&conn);
                 metrics::counter!("trident_pool_connections_established_total", "node_id" => self.node_id.clone()).increment(1);
@@ -461,10 +462,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     /// connections are permanently discarded before trying the next entry.
     fn take_reusable_idle(&self) -> Option<BackendConnection> {
         loop {
-            let candidate = self
-                .idle
-                .lock()
-                .pop_front();
+            let candidate = self.idle.lock().pop_front();
             let mut conn = candidate?;
             if self.is_expired(&conn, Instant::now()) {
                 self.cleaner.discard(&conn);
@@ -521,7 +519,9 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             let validate_result = match tokio::time::timeout(
                 self.settings.connection_timeout,
                 self.cleaner.validate(&mut conn),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_elapsed) => {
                     tracing::warn!(
@@ -570,7 +570,8 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             metrics::counter!(
                 "trident_pool_idle_validation_discarded_total",
                 "node_id" => self.node_id.clone()
-            ).increment(discarded as u64);
+            )
+            .increment(discarded as u64);
         }
         discarded
     }
@@ -585,9 +586,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             }
             let mut conn = self.create_reserved_connection().await?;
             conn.idle_since = Some(Instant::now());
-            self.idle
-                .lock()
-                .push_back(conn);
+            self.idle.lock().push_back(conn);
         }
         Ok(())
     }
@@ -610,9 +609,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         self.session_bindings
             .lock()
             .retain(|_, candidate| candidate.backend_pid != conn.backend_pid);
-        let mut pinned = self
-            .pinned_by_session
-            .lock();
+        let mut pinned = self.pinned_by_session.lock();
         pinned.retain(|_, connections| {
             connections.retain(|candidate| candidate.backend_pid != conn.backend_pid);
             !connections.is_empty()
@@ -673,7 +670,10 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
         }
     }
 
-    async fn acquire_transaction_mode(&self, session_id: &str) -> Result<BackendConnection, PoolError> {
+    async fn acquire_transaction_mode(
+        &self,
+        session_id: &str,
+    ) -> Result<BackendConnection, PoolError> {
         // Check draining state
         if self.draining.load(Ordering::SeqCst) {
             return Err(PoolError::Exhausted(format!("{} (draining)", self.node_id)));
@@ -746,10 +746,7 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             match tokio::time::timeout(remaining, notified).await {
                 Ok(()) => {
                     if self.draining.load(Ordering::SeqCst) {
-                        return Err(PoolError::Exhausted(format!(
-                            "{} (draining)",
-                            self.node_id
-                        )));
+                        return Err(PoolError::Exhausted(format!("{} (draining)", self.node_id)));
                     }
                     // Something was released — try again
                     if let Some(conn) = self.take_reusable_idle() {
@@ -776,16 +773,23 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
     /// Records the checkout time for leak detection and increments the
     /// pool checkout counter (used to derive connection reuse ratio).
     fn record_checkout(&self, conn: &BackendConnection) {
-        metrics::counter!("trident_pool_checkouts_total", "node_id" => self.node_id.clone()).increment(1);
+        metrics::counter!("trident_pool_checkouts_total", "node_id" => self.node_id.clone())
+            .increment(1);
         if !self.settings.leak_detection_threshold.is_zero() {
-            self.checkout_times.lock().insert((conn.backend_pid, conn.secret_key), Instant::now());
+            self.checkout_times
+                .lock()
+                .insert((conn.backend_pid, conn.secret_key), Instant::now());
         }
     }
 
     /// Clears checkout tracking and warns if the connection was held too long.
     fn clear_checkout(&self, conn: &BackendConnection) {
         if !self.settings.leak_detection_threshold.is_zero() {
-            if let Some(checkout_time) = self.checkout_times.lock().remove(&(conn.backend_pid, conn.secret_key)) {
+            if let Some(checkout_time) = self
+                .checkout_times
+                .lock()
+                .remove(&(conn.backend_pid, conn.secret_key))
+            {
                 let held_duration = Instant::now().duration_since(checkout_time);
                 if held_duration >= self.settings.leak_detection_threshold {
                     tracing::warn!(
@@ -872,7 +876,9 @@ impl<F: ConnFactory, C: ConnCleaner> NodePool<F, C> {
             let clean_result = match tokio::time::timeout(
                 self.settings.connection_timeout,
                 self.cleaner.clean(&mut conn),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_elapsed) => {
                     tracing::warn!(
@@ -939,7 +945,11 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
         Ok(conn)
     }
 
-    async fn release(&self, session_id: &str, mut conn: BackendConnection) -> Result<(), PoolError> {
+    async fn release(
+        &self,
+        session_id: &str,
+        mut conn: BackendConnection,
+    ) -> Result<(), PoolError> {
         // Defuse the acquire slot guard — we're taking over slot management.
         if let Some(guard) = conn.slot_guard.take() {
             guard.defuse();
@@ -1021,7 +1031,11 @@ impl<F: ConnFactory, C: ConnCleaner> ConnectionPool for NodePool<F, C> {
     }
 
     fn known_pids(&self) -> Vec<i32> {
-        self.known_connections.lock().iter().map(|(pid, _)| *pid).collect()
+        self.known_connections
+            .lock()
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect()
     }
 
     async fn validate_idle(&self) -> usize {
@@ -1103,11 +1117,23 @@ mod tests {
     }
 
     fn session_pool(max: u32) -> NodePool<CountingFactory, CountingCleaner> {
-        NodePool::new("writer", PoolMode::Session, max, CountingFactory::new(), CountingCleaner::new())
+        NodePool::new(
+            "writer",
+            PoolMode::Session,
+            max,
+            CountingFactory::new(),
+            CountingCleaner::new(),
+        )
     }
 
     fn transaction_pool(max: u32) -> NodePool<CountingFactory, CountingCleaner> {
-        NodePool::new("writer", PoolMode::Transaction, max, CountingFactory::new(), CountingCleaner::new())
+        NodePool::new(
+            "writer",
+            PoolMode::Transaction,
+            max,
+            CountingFactory::new(),
+            CountingCleaner::new(),
+        )
     }
 
     // -----------------------------------------------------------------

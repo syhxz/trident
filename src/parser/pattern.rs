@@ -132,12 +132,11 @@ mod tests {
 
     #[test]
     fn multiple_patterns_any_match_suffices() {
-        let matcher = RegexPatternMatcher::new(&[
-            r"GROUP BY.*HAVING".to_string(),
-            r"OVER\s*\(".to_string(),
-        ])
-        .unwrap();
-        assert!(matcher.matches_analytics_pattern("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1"));
+        let matcher =
+            RegexPatternMatcher::new(&[r"GROUP BY.*HAVING".to_string(), r"OVER\s*\(".to_string()])
+                .unwrap();
+        assert!(matcher
+            .matches_analytics_pattern("SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1"));
         assert!(matcher.matches_analytics_pattern("SELECT rank() OVER (ORDER BY a) FROM t"));
         assert!(!matcher.matches_analytics_pattern("SELECT * FROM t"));
     }

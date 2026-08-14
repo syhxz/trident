@@ -164,7 +164,13 @@ impl CustomRoutingRules {
             target.insert(entry.name.to_ascii_lowercase(), entry.rw_mode);
         }
         // Publish both maps together under the same lock to ensure
-        // readers never observe a cross-generation combination.
+        // writers cannot interleave a partial update. Note: readers using
+        // `ArcSwap::load()` without holding this lock may briefly observe
+        // a state where `tables` has been updated but `functions` has not
+        // (or vice versa), since `ArcSwap::store` is two separate atomic
+        // operations. This is acceptable because the window is extremely
+        // short and the consequence is a single query being routed to the
+        // writer when it could have gone to a reader (safe direction).
         self.tables.store(std::sync::Arc::new(tables));
         self.functions.store(std::sync::Arc::new(functions));
     }
@@ -202,7 +208,9 @@ impl CustomRoutingRules {
         if !tables.is_empty() {
             for table in extract_table_names(sql) {
                 if let Some(RwMode::Writer) = tables.get(&table) {
-                    return Some(std::borrow::Cow::Owned(format!("custom routing rule: table '{table}' is writer-only")));
+                    return Some(std::borrow::Cow::Owned(format!(
+                        "custom routing rule: table '{table}' is writer-only"
+                    )));
                 }
             }
         }
@@ -282,13 +290,22 @@ mod tests {
 
     #[test]
     fn extracts_table_after_update_and_into() {
-        assert_eq!(extract_table_names("UPDATE accounts SET balance = 1"), vec!["accounts"]);
-        assert_eq!(extract_table_names("INSERT INTO ledger (a) VALUES (1)"), vec!["ledger"]);
+        assert_eq!(
+            extract_table_names("UPDATE accounts SET balance = 1"),
+            vec!["accounts"]
+        );
+        assert_eq!(
+            extract_table_names("INSERT INTO ledger (a) VALUES (1)"),
+            vec!["ledger"]
+        );
     }
 
     #[test]
     fn extracts_unqualified_segment_of_schema_qualified_table() {
-        assert_eq!(extract_table_names("SELECT * FROM myschema.mytable"), vec!["mytable"]);
+        assert_eq!(
+            extract_table_names("SELECT * FROM myschema.mytable"),
+            vec!["mytable"]
+        );
     }
 
     #[test]
@@ -319,7 +336,9 @@ mod tests {
         let rules = CustomRoutingRules::new();
         rules.set_rule("sensitive_table", RuleTargetKind::Table, RwMode::Writer);
 
-        assert!(rules.forces_writer("SELECT * FROM sensitive_table").is_some());
+        assert!(rules
+            .forces_writer("SELECT * FROM sensitive_table")
+            .is_some());
         assert_eq!(rules.forces_writer("SELECT * FROM other_table"), None);
     }
 

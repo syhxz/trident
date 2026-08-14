@@ -24,9 +24,9 @@ use tokio::time::timeout;
 
 use crate::protocol::message::{BackendMessage, TransactionStatus};
 use crate::protocol::reader::{read_backend_message, read_tagged_frame};
-use crate::protocol::writer::encode_query;
 #[cfg(test)]
 use crate::protocol::writer::encode_backend_message;
+use crate::protocol::writer::encode_query;
 use crate::protocol::ProtocolError;
 
 use crate::config::LsnTrackingMode;
@@ -57,8 +57,7 @@ impl ExtendedQueryRouteTracker {
     /// `statement_name` was processed. Rejects new entries if the cap is
     /// reached (existing entries for the same name are always updated).
     pub fn record_parse_route(&mut self, statement_name: &str, node_id: &str) -> bool {
-        if self.routes.len() >= MAX_TRACKED_STATEMENTS
-            && !self.routes.contains_key(statement_name)
+        if self.routes.len() >= MAX_TRACKED_STATEMENTS && !self.routes.contains_key(statement_name)
         {
             tracing::warn!(
                 statement_name,
@@ -107,7 +106,10 @@ pub fn is_write_command_tag(tag: &str) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_uppercase();
-    matches!(first_word.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY")
+    matches!(
+        first_word.as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY"
+    )
 }
 
 /// Given a backend message and the LSN observed for the just-completed
@@ -292,12 +294,13 @@ where
     // is non-critical metadata and must not abort the user's query.
     if options.appname_prefix.is_some() {
         loop {
-            let (tag, _body) = read_tagged_frame(backend)
-                .await
-                .map_err(|source| QueryRelayError {
-                    source,
-                    error_response_relayed: false,
-                })?;
+            let (tag, _body) =
+                read_tagged_frame(backend)
+                    .await
+                    .map_err(|source| QueryRelayError {
+                        source,
+                        error_response_relayed: false,
+                    })?;
             match tag {
                 b'Z' => {
                     // SET completed. We accept any status (Idle expected,
@@ -307,7 +310,9 @@ where
                 b'E' => {
                     // SET application_name failed — non-fatal, just drain
                     // until ReadyForQuery and continue with user query.
-                    tracing::debug!("pipelined SET application_name returned ErrorResponse, continuing");
+                    tracing::debug!(
+                        "pipelined SET application_name returned ErrorResponse, continuing"
+                    );
                 }
                 // CommandComplete("SET"), NoticeResponse, ParameterStatus: suppress.
                 _ => {}
@@ -324,12 +329,13 @@ where
     // the connection is never reused in an inconsistent state.
     if options.begin_prefix.is_some() {
         loop {
-            let (tag, body) = read_tagged_frame(backend)
-                .await
-                .map_err(|source| QueryRelayError {
-                    source,
-                    error_response_relayed: false,
-                })?;
+            let (tag, body) =
+                read_tagged_frame(backend)
+                    .await
+                    .map_err(|source| QueryRelayError {
+                        source,
+                        error_response_relayed: false,
+                    })?;
             match tag {
                 b'Z' => {
                     if body.len() != 1 {
@@ -380,13 +386,12 @@ where
     const TAG_COPY_IN_RESPONSE: u8 = b'G';
 
     let tx_status = loop {
-        let (tag, body) =
-            read_tagged_frame(backend)
-                .await
-                .map_err(|source| QueryRelayError {
-                    source,
-                    error_response_relayed,
-                })?;
+        let (tag, body) = read_tagged_frame(backend)
+            .await
+            .map_err(|source| QueryRelayError {
+                source,
+                error_response_relayed,
+            })?;
 
         match tag {
             TAG_READY_FOR_QUERY => {
@@ -404,9 +409,10 @@ where
                     Some(s) => s,
                     None => {
                         return Err(QueryRelayError {
-                            source: ProtocolError::Malformed(
-                                format!("ReadyForQuery invalid status byte: 0x{:02x}", body[0]),
-                            ),
+                            source: ProtocolError::Malformed(format!(
+                                "ReadyForQuery invalid status byte: 0x{:02x}",
+                                body[0]
+                            )),
                             error_response_relayed,
                         });
                     }
@@ -446,8 +452,8 @@ where
                         .position(|&b| b == 0)
                         .map(|p| value_start + p)
                         .unwrap_or(body.len());
-                    let value_str = std::str::from_utf8(&body[value_start..value_end])
-                        .unwrap_or("");
+                    let value_str =
+                        std::str::from_utf8(&body[value_start..value_end]).unwrap_or("");
                     reported_lsn = crate::health::parse_lsn(value_str);
                     // Suppress this message from the client.
                 } else {
@@ -509,7 +515,12 @@ where
     };
 
     let (pipelined_lsn, connection_reusable) = if options.pipeline_lsn {
-        match timeout(options.internal_query_timeout, drain_internal_lsn_query(backend)).await {
+        match timeout(
+            options.internal_query_timeout,
+            drain_internal_lsn_query(backend),
+        )
+        .await
+        {
             Ok(Ok(lsn)) => (lsn, true),
             Ok(Err(_)) | Err(_) => (None, false),
         }
@@ -623,9 +634,7 @@ fn extract_cstring(body: &[u8]) -> String {
     }
 }
 
-async fn drain_internal_lsn_query<B>(
-    backend: &mut B,
-) -> Result<Option<u64>, ProtocolError>
+async fn drain_internal_lsn_query<B>(backend: &mut B) -> Result<Option<u64>, ProtocolError>
 where
     B: tokio::io::AsyncRead + Unpin + Send,
 {
@@ -782,7 +791,10 @@ mod tests {
     fn forget_statement_removes_recorded_route() {
         let mut tracker = ExtendedQueryRouteTracker::new();
         tracker.record_parse_route("stmt1", "writer");
-        assert_eq!(tracker.route_for_statement("stmt1"), Some("writer".to_string()));
+        assert_eq!(
+            tracker.route_for_statement("stmt1"),
+            Some("writer".to_string())
+        );
         tracker.forget_statement("stmt1");
         assert_eq!(tracker.route_for_statement("stmt1"), None);
     }
@@ -792,7 +804,10 @@ mod tests {
         let mut tracker = ExtendedQueryRouteTracker::new();
         tracker.record_parse_route("stmt1", "writer");
         tracker.record_parse_route("stmt1", "reader-1");
-        assert_eq!(tracker.route_for_statement("stmt1"), Some("reader-1".to_string()));
+        assert_eq!(
+            tracker.route_for_statement("stmt1"),
+            Some("reader-1".to_string())
+        );
     }
 
     #[test]
@@ -845,18 +860,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            let row_desc = encode_backend_message(&BackendMessage::RowDescription(vec![FieldDescription {
-                name: "col1".to_string(),
-                table_oid: 0,
-                column_attr_num: 1,
-                type_oid: 23,
-                type_size: 4,
-                type_modifier: -1,
-                format_code: 0,
-            }]));
+            let row_desc =
+                encode_backend_message(&BackendMessage::RowDescription(vec![FieldDescription {
+                    name: "col1".to_string(),
+                    table_oid: 0,
+                    column_attr_num: 1,
+                    type_oid: 23,
+                    type_size: 4,
+                    type_modifier: -1,
+                    format_code: 0,
+                }]));
             fake_backend.write_all(&row_desc).await.unwrap();
 
-            let data_row = encode_backend_message(&BackendMessage::DataRow(vec![Some(b"42".to_vec())]));
+            let data_row =
+                encode_backend_message(&BackendMessage::DataRow(vec![Some(b"42".to_vec())]));
             fake_backend.write_all(&data_row).await.unwrap();
 
             let complete = encode_backend_message(&BackendMessage::CommandComplete {
@@ -864,7 +881,8 @@ mod tests {
             });
             fake_backend.write_all(&complete).await.unwrap();
 
-            let ready = encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+            let ready =
+                encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
             fake_backend.write_all(&ready).await.unwrap();
         });
 
@@ -896,7 +914,10 @@ mod tests {
         drop(client_conn);
         let mut buf = [0u8; 16];
         let n = client_observer.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0, "no further bytes (e.g. ReadyForQuery) should have been relayed");
+        assert_eq!(
+            n, 0,
+            "no further bytes (e.g. ReadyForQuery) should have been relayed"
+        );
     }
 
     #[tokio::test]
@@ -926,10 +947,9 @@ mod tests {
             // Expect two CopyData frames then CopyDone from the proxy.
             let mut copy_rows = Vec::new();
             loop {
-                let (tag, body) =
-                    crate::protocol::reader::read_tagged_frame(&mut fake_backend)
-                        .await
-                        .unwrap();
+                let (tag, body) = crate::protocol::reader::read_tagged_frame(&mut fake_backend)
+                    .await
+                    .unwrap();
                 match tag {
                     b'd' => copy_rows.push(body),
                     b'c' => break,
@@ -963,7 +983,10 @@ mod tests {
                 .write_all(&raw_frame(b'd', b"2\tbar\n"))
                 .await
                 .unwrap();
-            client_remote.write_all(&raw_frame(b'c', &[])).await.unwrap();
+            client_remote
+                .write_all(&raw_frame(b'c', &[]))
+                .await
+                .unwrap();
 
             let msg = read_backend_message(&mut client_remote).await.unwrap();
             assert_eq!(
@@ -1002,13 +1025,18 @@ mod tests {
             });
             fake_backend.write_all(&complete).await.unwrap();
 
-            let ready = encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+            let ready =
+                encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
             fake_backend.write_all(&ready).await.unwrap();
         });
 
-        let outcome = forward_simple_query(&mut backend_conn, &mut client_conn, "INSERT INTO t VALUES (1)")
-            .await
-            .unwrap();
+        let outcome = forward_simple_query(
+            &mut backend_conn,
+            &mut client_conn,
+            "INSERT INTO t VALUES (1)",
+        )
+        .await
+        .unwrap();
         backend_task.await.unwrap();
 
         assert_eq!(outcome.write_command_tags, vec!["INSERT 0 1".to_string()]);
@@ -1031,7 +1059,8 @@ mod tests {
             )));
             fake_backend.write_all(&error).await.unwrap();
 
-            let ready = encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Failed));
+            let ready =
+                encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Failed));
             fake_backend.write_all(&ready).await.unwrap();
         });
 
@@ -1056,20 +1085,19 @@ mod tests {
         let (mut backend_conn, mut fake_backend) = connected_pair().await;
         let (mut client_conn, mut client_observer) = connected_pair().await;
 
-        let backend_task = tokio::spawn(async move {
-            let _query = crate::protocol::reader::read_frontend_message(&mut fake_backend)
-                .await
-                .unwrap();
-            let error = encode_backend_message(&BackendMessage::ErrorResponse(PgError::simple(
-                "ERROR",
-                "42601",
-                "syntax error",
-            )));
-            fake_backend.write_all(&error).await.unwrap();
-            // Invalid frame length while the relay is waiting for the final
-            // ReadyForQuery.
-            fake_backend.write_all(&[b'Z', 0, 0, 0, 3]).await.unwrap();
-        });
+        let backend_task =
+            tokio::spawn(async move {
+                let _query = crate::protocol::reader::read_frontend_message(&mut fake_backend)
+                    .await
+                    .unwrap();
+                let error = encode_backend_message(&BackendMessage::ErrorResponse(
+                    PgError::simple("ERROR", "42601", "syntax error"),
+                ));
+                fake_backend.write_all(&error).await.unwrap();
+                // Invalid frame length while the relay is waiting for the final
+                // ReadyForQuery.
+                fake_backend.write_all(&[b'Z', 0, 0, 0, 3]).await.unwrap();
+            });
 
         let failure = forward_simple_query(&mut backend_conn, &mut client_conn, "SELECT invalid")
             .await
@@ -1212,8 +1240,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let data_row =
-                encode_backend_message(&BackendMessage::DataRow(vec![Some(b"16/B374D848".to_vec())]));
+            let data_row = encode_backend_message(&BackendMessage::DataRow(vec![Some(
+                b"16/B374D848".to_vec(),
+            )]));
             fake_backend.write_all(&data_row).await.unwrap();
 
             let complete = encode_backend_message(&BackendMessage::CommandComplete {
@@ -1221,7 +1250,8 @@ mod tests {
             });
             fake_backend.write_all(&complete).await.unwrap();
 
-            let ready = encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+            let ready =
+                encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
             fake_backend.write_all(&ready).await.unwrap();
         });
 
@@ -1235,21 +1265,21 @@ mod tests {
     async fn fetch_current_wal_lsn_returns_none_on_backend_error() {
         let (mut backend_conn, mut fake_backend) = connected_pair().await;
 
-        let backend_task = tokio::spawn(async move {
-            let _query = crate::protocol::reader::read_frontend_message(&mut fake_backend)
-                .await
-                .unwrap();
+        let backend_task =
+            tokio::spawn(async move {
+                let _query = crate::protocol::reader::read_frontend_message(&mut fake_backend)
+                    .await
+                    .unwrap();
 
-            let error = encode_backend_message(&BackendMessage::ErrorResponse(PgError::simple(
-                "ERROR",
-                "58000",
-                "backend unavailable",
-            )));
-            fake_backend.write_all(&error).await.unwrap();
+                let error = encode_backend_message(&BackendMessage::ErrorResponse(
+                    PgError::simple("ERROR", "58000", "backend unavailable"),
+                ));
+                fake_backend.write_all(&error).await.unwrap();
 
-            let ready = encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
-            fake_backend.write_all(&ready).await.unwrap();
-        });
+                let ready =
+                    encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+                fake_backend.write_all(&ready).await.unwrap();
+            });
 
         let lsn = fetch_current_wal_lsn(&mut backend_conn).await.unwrap();
         backend_task.await.unwrap();

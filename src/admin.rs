@@ -304,6 +304,9 @@ struct AdminState {
     /// Shared with `watch_sighup` so SIGHUP reloads also serialize against
     /// Admin PUT operations.
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Drains all per-user pools for a given username. Used for credential
+    /// revocation (P1). `None` if passthrough mode is not configured.
+    drain_user_fn: Option<Box<dyn Fn(&str) -> usize + Send + Sync>>,
 }
 
 /// Bearer token authentication middleware. Checks the `Authorization`
@@ -322,10 +325,9 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(byte);
                 i += 3;
                 continue;
@@ -370,15 +372,14 @@ async fn auth_middleware(
         .map(|s| s.to_string())
         .or_else(|| {
             req.uri().query().and_then(|q| {
-                q.split('&')
-                    .find_map(|pair| {
-                        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                        if k == "token" {
-                            Some(percent_decode(v))
-                        } else {
-                            None
-                        }
-                    })
+                q.split('&').find_map(|pair| {
+                    let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                    if k == "token" {
+                        Some(percent_decode(v))
+                    } else {
+                        None
+                    }
+                })
             })
         })
         .unwrap_or_default();
@@ -424,6 +425,7 @@ fn build_router(
     set_check_interval_fn: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    drain_user_fn: Option<Box<dyn Fn(&str) -> usize + Send + Sync>>,
 ) -> Router {
     let state = Arc::new(AdminState {
         prometheus_handle,
@@ -446,6 +448,7 @@ fn build_router(
         set_check_interval_fn,
         get_check_interval_fn,
         config_write_lock,
+        drain_user_fn,
     });
 
     // Public routes: always accessible (Prometheus scraper, k8s probes, console UI)
@@ -465,22 +468,28 @@ fn build_router(
         )
         .route("/client-stats", get(client_stats_handler))
         .route("/api/overview", get(overview_handler))
-        .route("/api/nodes", get(nodes_handler).post(add_node_handler).delete(remove_node_handler))
+        .route(
+            "/api/nodes",
+            get(nodes_handler)
+                .post(add_node_handler)
+                .delete(remove_node_handler),
+        )
         .route("/api/slow-queries", get(slow_queries_handler))
-        .route("/api/config", get(config_get_handler).put(config_put_handler))
+        .route(
+            "/api/config",
+            get(config_get_handler).put(config_put_handler),
+        )
+        .route("/api/drain-user", post(drain_user_handler))
         .route("/ws/logs", get(ws_logs_handler));
 
     if state.auth_token.as_deref().is_some_and(|t| !t.is_empty()) {
         let auth_state = state.clone();
-        let protected_routes = protected_routes.layer(
-            axum::middleware::from_fn(move |req, next| {
+        let protected_routes =
+            protected_routes.layer(axum::middleware::from_fn(move |req, next| {
                 let state = auth_state.clone();
                 auth_middleware(state, req, next)
-            }),
-        );
-        public_routes
-            .merge(protected_routes)
-            .with_state(state)
+            }));
+        public_routes.merge(protected_routes).with_state(state)
     } else {
         // No auth token configured. Block ALL requests to sensitive protected
         // routes (both read and write). Only /metrics, /healthz, and the
@@ -488,8 +497,8 @@ fn build_router(
         // This prevents accidental information disclosure (SQL logs, node
         // credentials, client IPs) when the admin console is bound to a
         // non-loopback address without a token.
-        let protected_routes = protected_routes.layer(
-            axum::middleware::from_fn(move |req: axum::extract::Request, _next: axum::middleware::Next| {
+        let protected_routes = protected_routes.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, _next: axum::middleware::Next| {
                 async move {
                     let path = req.uri().path().to_string();
                     // Only allow requests that are handled by public_routes
@@ -507,11 +516,9 @@ fn build_router(
                         })),
                     ))
                 }
-            }),
-        );
-        public_routes
-            .merge(protected_routes)
-            .with_state(state)
+            },
+        ));
+        public_routes.merge(protected_routes).with_state(state)
     }
 }
 
@@ -670,9 +677,21 @@ async fn overview_handler(State(state): State<Arc<AdminState>>) -> impl IntoResp
     let resp = OverviewResponse {
         active_connections: parse_gauge(&metrics_text, "trident_active_connections"),
         total_accepted: parse_counter(&metrics_text, "trident_connections_accepted_total"),
-        routing_writer: parse_counter_label(&metrics_text, "trident_routing_decisions_total", "writer"),
-        routing_reader: parse_counter_label(&metrics_text, "trident_routing_decisions_total", "reader"),
-        routing_analytics: parse_counter_label(&metrics_text, "trident_routing_decisions_total", "analytics"),
+        routing_writer: parse_counter_label(
+            &metrics_text,
+            "trident_routing_decisions_total",
+            "writer",
+        ),
+        routing_reader: parse_counter_label(
+            &metrics_text,
+            "trident_routing_decisions_total",
+            "reader",
+        ),
+        routing_analytics: parse_counter_label(
+            &metrics_text,
+            "trident_routing_decisions_total",
+            "analytics",
+        ),
         slow_queries_1m: state.slow_queries.count_since(now_unix.saturating_sub(60)),
         pool_exhausted: parse_counter_sum(&metrics_text, "trident_pool_exhausted_total"),
         healthy: is_healthy(&snapshot),
@@ -797,8 +816,11 @@ async fn add_node_handler(
     let Some(ref nm) = state.node_manager else {
         return (
             StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"status": "error", "message": "node management not available"})),
-        ).into_response();
+            Json(
+                serde_json::json!({"status": "error", "message": "node management not available"}),
+            ),
+        )
+            .into_response();
     };
 
     let node_type = match body.node_type.as_str() {
@@ -820,7 +842,11 @@ async fn add_node_handler(
             Json(serde_json::json!({"status": "error", "message": "node name must be 1-64 characters"})),
         ).into_response();
     }
-    if !body.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !body
+        .name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"status": "error", "message": "node name must contain only alphanumeric characters, hyphens, and underscores"})),
@@ -828,7 +854,10 @@ async fn add_node_handler(
     }
 
     // Host validation: must not be empty, no whitespace or control characters
-    if body.host.is_empty() || body.host.len() > 253 || body.host.chars().any(|c| c.is_control() || c == ' ') {
+    if body.host.is_empty()
+        || body.host.len() > 253
+        || body.host.chars().any(|c| c.is_control() || c == ' ')
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"status": "error", "message": "invalid host: must be 1-253 characters, no whitespace or control characters"})),
@@ -863,11 +892,13 @@ async fn add_node_handler(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "node": body.name})),
-        ).into_response(),
+        )
+            .into_response(),
         Err(msg) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"status": "error", "message": msg})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -878,20 +909,82 @@ async fn remove_node_handler(
     let Some(ref nm) = state.node_manager else {
         return (
             StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"status": "error", "message": "node management not available"})),
-        ).into_response();
+            Json(
+                serde_json::json!({"status": "error", "message": "node management not available"}),
+            ),
+        )
+            .into_response();
     };
 
     match nm.remove_node(&body.name) {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "node": body.name})),
-        ).into_response(),
+        )
+            .into_response(),
         Err(msg) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"status": "error", "message": msg})),
-        ).into_response(),
+        )
+            .into_response(),
     }
+}
+
+/// Request body for `POST /api/drain-user`.
+#[derive(Deserialize)]
+struct DrainUserRequest {
+    username: String,
+}
+
+/// Drains (terminates and removes) all per-user connection pools belonging
+/// to the specified username. Used for credential revocation: after a
+/// password reset or user disable in PostgreSQL, this endpoint ensures no
+/// idle connections authenticated with the old credentials remain pooled.
+///
+/// Returns the number of pools drained. In-flight queries on checked-out
+/// connections are NOT interrupted — they complete naturally, but the
+/// connection is discarded (not returned to the pool) upon release.
+async fn drain_user_handler(
+    State(state): State<Arc<AdminState>>,
+    Json(body): Json<DrainUserRequest>,
+) -> impl IntoResponse {
+    let Some(ref drain_fn) = state.drain_user_fn else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "per-user pool draining not available (passthrough mode not configured)"
+            })),
+        )
+            .into_response();
+    };
+
+    if body.username.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "username must not be empty"
+            })),
+        )
+            .into_response();
+    }
+
+    let drained = drain_fn(&body.username);
+    tracing::info!(
+        username = %body.username,
+        pools_drained = drained,
+        "drained per-user pools for credential revocation"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "username": body.username,
+            "pools_drained": drained
+        })),
+    )
+        .into_response()
 }
 
 async fn slow_queries_handler(
@@ -1212,7 +1305,9 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 /// Binds the admin TCP listener at startup so that binding failures are
 /// detected before the proxy reports "started". Call this during init,
 /// then pass the listener to `run`.
-pub async fn bind_admin_listener(listen_addr: SocketAddr) -> Result<tokio::net::TcpListener, AdminError> {
+pub async fn bind_admin_listener(
+    listen_addr: SocketAddr,
+) -> Result<tokio::net::TcpListener, AdminError> {
     tokio::net::TcpListener::bind(listen_addr)
         .await
         .map_err(|source| AdminError::Bind {
@@ -1244,6 +1339,7 @@ pub async fn run(
     check_interval_setter: Option<Box<dyn Fn(Duration) + Send + Sync>>,
     check_interval_getter: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    drain_user_fn: Option<Box<dyn Fn(&str) -> usize + Send + Sync>>,
 ) -> Result<(), AdminError> {
     let app = build_router(
         prometheus_handle,
@@ -1266,6 +1362,7 @@ pub async fn run(
         check_interval_setter,
         check_interval_getter,
         config_write_lock,
+        drain_user_fn,
     );
 
     let local_addr = listener.local_addr().map_err(|source| AdminError::Bind {
@@ -1392,11 +1489,12 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
-            None, // node_manager
-            Some("test-token".to_string()), // auth_token
-            None, // check_interval_setter
-            None, // check_interval_getter
+            None,                                  // node_manager
+            Some("test-token".to_string()),        // auth_token
+            None,                                  // check_interval_setter
+            None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
+            None,                                  // drain_user_fn
         )
     }
 
@@ -1404,7 +1502,12 @@ mod tests {
     async fn healthz_returns_200_when_healthy() {
         let app = test_router(true);
         let response = app
-            .oneshot(Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1416,19 +1519,31 @@ mod tests {
     async fn healthz_returns_503_when_unhealthy() {
         let app = test_router(false);
         let response = app
-            .oneshot(Request::builder().uri("/healthz").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8(body.to_vec()).unwrap().contains("unavailable"));
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("unavailable"));
     }
 
     #[tokio::test]
     async fn metrics_endpoint_returns_200_with_text_body() {
         let app = test_router(true);
         let response = app
-            .oneshot(Request::builder().uri("/metrics").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1469,7 +1584,10 @@ mod tests {
     #[tokio::test]
     async fn reload_returns_200_on_successful_reload() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("trident-admin-reload-test-{}.yaml", std::process::id()));
+        let path = dir.join(format!(
+            "trident-admin-reload-test-{}.yaml",
+            std::process::id()
+        ));
         std::fs::write(
             &path,
             "proxy:\n  listen_addr: \"0.0.0.0:6432\"\n  max_clients: 10\n\
@@ -1501,11 +1619,12 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
-            None, // node_manager
-            Some("test-token".to_string()), // auth_token
-            None, // check_interval_setter
-            None, // check_interval_getter
+            None,                                  // node_manager
+            Some("test-token".to_string()),        // auth_token
+            None,                                  // check_interval_setter
+            None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
+            None,                                  // drain_user_fn
         );
 
         let response = app
@@ -1546,11 +1665,12 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
-            None, // node_manager
-            Some("test-token".to_string()), // auth_token
-            None, // check_interval_setter
-            None, // check_interval_getter
+            None,                                  // node_manager
+            Some("test-token".to_string()),        // auth_token
+            None,                                  // check_interval_setter
+            None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
+            None,                                  // drain_user_fn
         );
 
         let response = app
@@ -1593,11 +1713,12 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
-            None, // node_manager
-            Some("test-token".to_string()), // auth_token
-            None, // check_interval_setter
-            None, // check_interval_getter
+            None,                                  // node_manager
+            Some("test-token".to_string()),        // auth_token
+            None,                                  // check_interval_setter
+            None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
+            None,                                  // drain_user_fn
         )
     }
 
@@ -1607,8 +1728,14 @@ mod tests {
 
         for (method, body) in [
             ("GET", axum::body::Body::empty()),
-            ("POST", axum::body::Body::from(r#"{"_name":"t1","_type":"t","rw_mode":"w"}"#)),
-            ("DELETE", axum::body::Body::from(r#"{"_name":"t1","_type":"t"}"#)),
+            (
+                "POST",
+                axum::body::Body::from(r#"{"_name":"t1","_type":"t","rw_mode":"w"}"#),
+            ),
+            (
+                "DELETE",
+                axum::body::Body::from(r#"{"_name":"t1","_type":"t"}"#),
+            ),
         ] {
             let response = app
                 .clone()
@@ -1623,7 +1750,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "method {method}");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_IMPLEMENTED,
+                "method {method}"
+            );
         }
     }
 
@@ -1651,14 +1782,24 @@ mod tests {
 
         // Reflected immediately in the shared registry (no restart/reload
         // needed), and via the GET listing endpoint.
-        assert!(rules.forces_writer("SELECT * FROM sensitive_table").is_some());
+        assert!(rules
+            .forces_writer("SELECT * FROM sensitive_table")
+            .is_some());
 
         let list_response = app
-            .oneshot(Request::builder().uri("/custom-rules").header("Authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/custom-rules")
+                    .header("Authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(list_response.status(), StatusCode::OK);
-        let body = to_bytes(list_response.into_body(), usize::MAX).await.unwrap();
+        let body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("sensitive_table"));
     }
@@ -1697,7 +1838,9 @@ mod tests {
                     .uri("/custom-rules")
                     .header("Authorization", "Bearer test-token")
                     .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"_name":"","_type":"t","rw_mode":"w"}"#))
+                    .body(axum::body::Body::from(
+                        r#"{"_name":"","_type":"t","rw_mode":"w"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1729,11 +1872,12 @@ mod tests {
             "5m".to_string(),
             "5s".to_string(),
             "30m".to_string(),
-            None, // node_manager
-            Some("test-token".to_string()), // auth_token
-            None, // check_interval_setter
-            None, // check_interval_getter
+            None,                                  // node_manager
+            Some("test-token".to_string()),        // auth_token
+            None,                                  // check_interval_setter
+            None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
+            None,                                  // drain_user_fn
         )
     }
 
@@ -1745,7 +1889,13 @@ mod tests {
         let app = router_with_client_stats(stats);
 
         let response = app
-            .oneshot(Request::builder().uri("/client-stats").header("Authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/client-stats")
+                    .header("Authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1761,7 +1911,13 @@ mod tests {
         let app = router_with_client_stats(Arc::new(ClientStats::new()));
 
         let response = app
-            .oneshot(Request::builder().uri("/client-stats").header("Authorization", "Bearer test-token").body(axum::body::Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/client-stats")
+                    .header("Authorization", "Bearer test-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

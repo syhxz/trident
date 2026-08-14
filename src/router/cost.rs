@@ -6,8 +6,8 @@
 //! per normalized query template to avoid repeated EXPLAIN calls.
 //! See design.md section 10 and Requirements 10.1-10.5.
 
-use std::collections::HashMap;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -95,7 +95,10 @@ impl PoolExplainRunner {
         self
     }
 
-    async fn get_or_connect(&self, guard: &mut Option<MaybeTlsStream>) -> Result<(), CostEstimationError> {
+    async fn get_or_connect(
+        &self,
+        guard: &mut Option<MaybeTlsStream>,
+    ) -> Result<(), CostEstimationError> {
         if guard.is_some() {
             return Ok(());
         }
@@ -121,11 +124,8 @@ impl ExplainRunner for PoolExplainRunner {
 
         // Try standard EXPLAIN first
         let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
-        let result = tokio::time::timeout(
-            self.timeout,
-            run_explain_query(stream, &explain_sql),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(self.timeout, run_explain_query(stream, &explain_sql)).await;
 
         match result {
             Ok(Ok(cost)) => Ok(cost),
@@ -139,11 +139,9 @@ impl ExplainRunner for PoolExplainRunner {
                 }
                 let stream = guard.as_mut().unwrap();
                 let generic_sql = format!("EXPLAIN (GENERIC_PLAN, FORMAT JSON) {sql}");
-                let result = tokio::time::timeout(
-                    self.timeout,
-                    run_explain_query(stream, &generic_sql),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(self.timeout, run_explain_query(stream, &generic_sql))
+                        .await;
 
                 match result {
                     Ok(Ok(cost)) => Ok(cost),
@@ -153,13 +151,17 @@ impl ExplainRunner for PoolExplainRunner {
                     }
                     Err(_timeout) => {
                         *guard = None;
-                        Err(CostEstimationError::ExplainFailed("EXPLAIN GENERIC_PLAN timed out".into()))
+                        Err(CostEstimationError::ExplainFailed(
+                            "EXPLAIN GENERIC_PLAN timed out".into(),
+                        ))
                     }
                 }
             }
             Err(_timeout) => {
                 *guard = None;
-                Err(CostEstimationError::ExplainFailed("EXPLAIN timed out".into()))
+                Err(CostEstimationError::ExplainFailed(
+                    "EXPLAIN timed out".into(),
+                ))
             }
         }
     }
@@ -196,10 +198,7 @@ async fn run_explain_query<S: AsyncRead + AsyncWrite + Unpin + Send>(
             }
             Ok(BackendMessage::ErrorResponse(fields)) => {
                 saw_error = true;
-                error_msg = fields
-                    .message()
-                    .unwrap_or("unknown error")
-                    .to_string();
+                error_msg = fields.message().unwrap_or("unknown error").to_string();
             }
             Ok(BackendMessage::ReadyForQuery(_)) => break,
             Ok(_) => continue,
@@ -223,23 +222,28 @@ fn parse_total_cost(json_text: &str) -> Result<f64, CostEstimationError> {
     // "Total Cost" and extract the following number.
     // The format is stable across PostgreSQL versions.
     let needle = "Total Cost";
-    let pos = json_text
-        .find(needle)
-        .ok_or_else(|| CostEstimationError::ExplainFailed(
-            format!("'Total Cost' not found in EXPLAIN output: {}", &json_text[..json_text.len().min(200)])
-        ))?;
+    let pos = json_text.find(needle).ok_or_else(|| {
+        CostEstimationError::ExplainFailed(format!(
+            "'Total Cost' not found in EXPLAIN output: {}",
+            &json_text[..json_text.len().min(200)]
+        ))
+    })?;
 
     // After "Total Cost" we expect: `": <number>`
     let after = &json_text[pos + needle.len()..];
     // Skip `": ` or `" : `
     let num_start = after
         .find(|c: char| c.is_ascii_digit() || c == '.')
-        .ok_or_else(|| CostEstimationError::ExplainFailed(
-            "could not find cost number after 'Total Cost'".into()
-        ))?;
+        .ok_or_else(|| {
+            CostEstimationError::ExplainFailed(
+                "could not find cost number after 'Total Cost'".into(),
+            )
+        })?;
     let num_str = &after[num_start..];
     let num_end = num_str
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != 'e' && c != 'E' && c != '+' && c != '-')
+        .find(|c: char| {
+            !c.is_ascii_digit() && c != '.' && c != 'e' && c != 'E' && c != '+' && c != '-'
+        })
         .unwrap_or(num_str.len());
     let cost_str = &num_str[..num_end];
 
@@ -333,7 +337,9 @@ impl<M: PatternMatcher + Send + Sync, E: ExplainRunner> DefaultCostEstimator<M, 
 }
 
 #[async_trait]
-impl<M: PatternMatcher + Send + Sync, E: ExplainRunner> CostEstimator for DefaultCostEstimator<M, E> {
+impl<M: PatternMatcher + Send + Sync, E: ExplainRunner> CostEstimator
+    for DefaultCostEstimator<M, E>
+{
     async fn estimate_cost(&self, sql: &str) -> Result<f64, CostEstimationError> {
         // Requirement 10.1: pattern match takes priority and short-circuits EXPLAIN.
         if self.pattern_matcher.matches_analytics_pattern(sql) {
@@ -477,7 +483,10 @@ mod tests {
             },
         );
 
-        let cost = estimator.estimate_cost("SELECT * FROM fact_sales").await.unwrap();
+        let cost = estimator
+            .estimate_cost("SELECT * FROM fact_sales")
+            .await
+            .unwrap();
         assert_eq!(cost, f64::INFINITY);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -507,9 +516,18 @@ mod tests {
             },
         );
 
-        estimator.estimate_cost("SELECT * FROM t WHERE id = 1").await.unwrap();
-        estimator.estimate_cost("SELECT * FROM t WHERE id = 2").await.unwrap();
-        estimator.estimate_cost("SELECT * FROM u WHERE id = 3").await.unwrap();
+        estimator
+            .estimate_cost("SELECT * FROM t WHERE id = 1")
+            .await
+            .unwrap();
+        estimator
+            .estimate_cost("SELECT * FROM t WHERE id = 2")
+            .await
+            .unwrap();
+        estimator
+            .estimate_cost("SELECT * FROM u WHERE id = 3")
+            .await
+            .unwrap();
 
         assert_eq!(estimator.cache_len(), 2); // "t" and "u" templates
         assert_eq!(calls.load(Ordering::SeqCst), 2);

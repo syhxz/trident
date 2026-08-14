@@ -157,7 +157,11 @@ impl HealthStateMachine {
 
     /// Creates a state machine with a custom threshold for transitions.
     pub fn with_threshold(initially_healthy: bool, threshold: u32) -> Self {
-        let threshold = if threshold == 0 { CONSECUTIVE_THRESHOLD } else { threshold };
+        let threshold = if threshold == 0 {
+            CONSECUTIVE_THRESHOLD
+        } else {
+            threshold
+        };
         HealthStateMachine {
             healthy: initially_healthy,
             consecutive_failures: 0,
@@ -244,11 +248,11 @@ impl HealthProbe for WireProtocolHealthProbe {
     async fn probe(&self, node_type: NodeType) -> HealthCheckResult {
         let mut result = HealthCheckResult::default();
 
-        let tcp_stream = match TcpStream::connect((self.target.host.as_str(), self.target.port)).await
-        {
-            Ok(s) => s,
-            Err(_) => return result, // tcp_reachable = false (default value)
-        };
+        let tcp_stream =
+            match TcpStream::connect((self.target.host.as_str(), self.target.port)).await {
+                Ok(s) => s,
+                Err(_) => return result, // tcp_reachable = false (default value)
+            };
         result.tcp_reachable = true;
 
         let mut stream = match upgrade_probe_stream(tcp_stream, &self.target).await {
@@ -319,10 +323,7 @@ async fn upgrade_probe_stream(
         SslMode::Disable => Ok(MaybeTlsStream::Plain(tcp_stream)),
         SslMode::Prefer | SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
             // Send SSLRequest (8 bytes: length=8, code=80877103)
-            let msg: [u8; 8] = [
-                0x00, 0x00, 0x00, 0x08,
-                0x04, 0xd2, 0x16, 0x2f,
-            ];
+            let msg: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
             tcp_stream.write_all(&msg).await.map_err(|_| ())?;
 
             let mut buf = [0u8; 1];
@@ -350,11 +351,9 @@ async fn upgrade_probe_stream(
                                 // verify-ca: verify chain but not hostname.
                                 // Use the same CaOnlyVerifier as the pool
                                 // connections to get consistent behavior.
-                                let verifier = Arc::new(
-                                    crate::pool::conn::CaOnlyVerifier {
-                                        roots: Arc::new(root_store),
-                                    },
-                                );
+                                let verifier = Arc::new(crate::pool::conn::CaOnlyVerifier {
+                                    roots: Arc::new(root_store),
+                                });
                                 rustls::ClientConfig::builder()
                                     .dangerous()
                                     .with_custom_certificate_verifier(verifier)
@@ -373,9 +372,8 @@ async fn upgrade_probe_stream(
                     };
                     let connector = TlsConnector::from(Arc::new(config));
 
-                    let server_name =
-                        rustls::pki_types::ServerName::try_from(target.host.clone())
-                            .map_err(|_| ())?;
+                    let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+                        .map_err(|_| ())?;
 
                     let tls_stream = connector
                         .connect(server_name, tcp_stream)
@@ -473,7 +471,9 @@ async fn run_simple_query_first_column<S: AsyncRead + AsyncWrite + Unpin + Send>
     }
 }
 
-async fn run_select_1<S: AsyncRead + AsyncWrite + Unpin + Send>(stream: &mut S) -> Result<bool, ()> {
+async fn run_select_1<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+) -> Result<bool, ()> {
     let value = run_simple_query_first_column(stream, "SELECT 1").await?;
     Ok(value.as_deref() == Some("1"))
 }
@@ -507,7 +507,9 @@ async fn query_replication_lag_ms<S: AsyncRead + AsyncWrite + Unpin + Send>(
         "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) * 1000, 0)",
     )
     .await?;
-    Ok(value.and_then(|v| v.parse::<f64>().ok()).map(|ms| ms.max(0.0) as u64))
+    Ok(value
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|ms| ms.max(0.0) as u64))
 }
 
 /// Queries the Writer's current timeline ID from `pg_control_checkpoint()`.
@@ -518,11 +520,9 @@ async fn query_replication_lag_ms<S: AsyncRead + AsyncWrite + Unpin + Send>(
 async fn query_timeline_id<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
 ) -> Result<Option<u32>, ()> {
-    let value = run_simple_query_first_column(
-        stream,
-        "SELECT timeline_id FROM pg_control_checkpoint()",
-    )
-    .await?;
+    let value =
+        run_simple_query_first_column(stream, "SELECT timeline_id FROM pg_control_checkpoint()")
+            .await?;
     Ok(value.and_then(|v| v.trim().parse::<u32>().ok()))
 }
 
@@ -559,7 +559,9 @@ async fn query_aurora_reader_status<S: AsyncRead + AsyncWrite + Unpin + Send>(
         match crate::protocol::reader::read_backend_message(stream).await {
             Ok(crate::protocol::message::BackendMessage::DataRow(cols)) => {
                 if let Some(Some(bytes)) = cols.first() {
-                    lsn = String::from_utf8(bytes.clone()).ok().and_then(|v| parse_lsn(&v));
+                    lsn = String::from_utf8(bytes.clone())
+                        .ok()
+                        .and_then(|v| parse_lsn(&v));
                 }
                 if let Some(Some(bytes)) = cols.get(1) {
                     lag_ms = String::from_utf8(bytes.clone())
@@ -588,11 +590,19 @@ pub fn parse_lsn(text: &str) -> Option<u64> {
         let hi = u64::from_str_radix(hi, 16).ok()?;
         let lo = u64::from_str_radix(lo, 16).ok()?;
         let lsn = (hi << 32) | lo;
-        if lsn == 0 { None } else { Some(lsn) }
+        if lsn == 0 {
+            None
+        } else {
+            Some(lsn)
+        }
     } else {
         // Aurora numeric format: plain decimal integer
         let lsn = trimmed.parse::<u64>().ok()?;
-        if lsn == 0 { None } else { Some(lsn) }
+        if lsn == 0 {
+            None
+        } else {
+            Some(lsn)
+        }
     }
 }
 
@@ -653,7 +663,12 @@ impl<P: HealthProbe> HealthChecker<P> {
         max_replication_lag_ms: u64,
         check_timeout: Duration,
     ) -> Self {
-        Self::with_max_retries(node_probes, max_replication_lag_ms, check_timeout, CONSECUTIVE_THRESHOLD)
+        Self::with_max_retries(
+            node_probes,
+            max_replication_lag_ms,
+            check_timeout,
+            CONSECUTIVE_THRESHOLD,
+        )
     }
 
     /// Creates a HealthChecker with a custom `max_retries` threshold for
@@ -665,7 +680,11 @@ impl<P: HealthProbe> HealthChecker<P> {
         check_timeout: Duration,
         max_retries: u32,
     ) -> Self {
-        let threshold = if max_retries == 0 { CONSECUTIVE_THRESHOLD } else { max_retries };
+        let threshold = if max_retries == 0 {
+            CONSECUTIVE_THRESHOLD
+        } else {
+            max_retries
+        };
         let mut probes = HashMap::new();
         let mut nodes = HashMap::new();
         for (node_id, node_type, weight, probe) in node_probes {
@@ -786,7 +805,11 @@ impl<P: HealthProbe> HealthChecker<P> {
                     "to" => if is_healthy_now { "healthy" } else { "unhealthy" }
                 )
                 .increment(1);
-                tracing::info!(node_id, healthy = is_healthy_now, "backend node health state changed");
+                tracing::info!(
+                    node_id,
+                    healthy = is_healthy_now,
+                    "backend node health state changed"
+                );
             }
             if let Some(lsn) = result.replay_lsn {
                 node.last_replay_lsn = lsn;
@@ -810,11 +833,12 @@ impl<P: HealthProbe> HealthChecker<P> {
                         // The new Writer's LSN space is incomparable to the
                         // old one — we must reset global LSN and invalidate
                         // all session LSNs.
-                        let timeline_changed = match (result.writer_timeline_id, node.last_timeline_id) {
-                            (Some(new_tl), Some(old_tl)) => new_tl != old_tl,
-                            // First observation or query failed — not a change.
-                            _ => false,
-                        };
+                        let timeline_changed =
+                            match (result.writer_timeline_id, node.last_timeline_id) {
+                                (Some(new_tl), Some(old_tl)) => new_tl != old_tl,
+                                // First observation or query failed — not a change.
+                                _ => false,
+                            };
 
                         if timeline_changed {
                             let old_tl = node.last_timeline_id.unwrap_or(0);
@@ -840,8 +864,14 @@ impl<P: HealthProbe> HealthChecker<P> {
                 }
             }
             // Update tracked timeline_id for future comparisons.
-            if let Some(tl) = result.writer_timeline_id {
-                node.last_timeline_id = Some(tl);
+            // Only update on successful probes to prevent a failed probe
+            // from polluting the baseline (issue F: a failed probe returning
+            // a stale or intermediate timeline_id could mask a real timeline
+            // switch on the next successful probe).
+            if success {
+                if let Some(tl) = result.writer_timeline_id {
+                    node.last_timeline_id = Some(tl);
+                }
             }
             node.last_replication_lag_ms = result.replication_lag_ms;
         }
@@ -877,9 +907,14 @@ impl<P: HealthProbe> HealthChecker<P> {
             probes
                 .iter()
                 .filter_map(|(node_id, probe)| {
-                    nodes
-                        .get(node_id)
-                        .map(|node| (node_id.clone(), node.node_type, node.generation, Arc::clone(probe)))
+                    nodes.get(node_id).map(|node| {
+                        (
+                            node_id.clone(),
+                            node.node_type,
+                            node.generation,
+                            Arc::clone(probe),
+                        )
+                    })
                 })
                 .collect()
         };
@@ -901,7 +936,9 @@ impl<P: HealthProbe> HealthChecker<P> {
 
         while let Some(completed) = tasks.join_next().await {
             match completed {
-                Ok((node_id, generation, result)) => self.apply_result(&node_id, generation, result),
+                Ok((node_id, generation, result)) => {
+                    self.apply_result(&node_id, generation, result)
+                }
                 Err(error) => {
                     tracing::error!(%error, "backend health-check task failed");
                 }
@@ -1010,7 +1047,9 @@ impl<P: HealthProbe> HealthChecker<P> {
             ticker.tick().await;
             self.check_all_and_update().await;
             // Check if the interval was dynamically adjusted.
-            let current_ms = self.check_interval_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let current_ms = self
+                .check_interval_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
             let current_period = Duration::from_millis(current_ms);
             if current_period != ticker.period() && !current_period.is_zero() {
                 ticker = tokio::time::interval(current_period);
@@ -1029,14 +1068,16 @@ impl<P: HealthProbe> HealthChecker<P> {
     pub fn set_check_interval(&self, interval: Duration) {
         let ms = interval.as_millis() as u64;
         if ms > 0 {
-            self.check_interval_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+            self.check_interval_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
     /// Returns the current health check interval.
     pub fn check_interval(&self) -> Duration {
         Duration::from_millis(
-            self.check_interval_ms.load(std::sync::atomic::Ordering::Relaxed)
+            self.check_interval_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -1063,7 +1104,9 @@ impl<P: HealthProbe> HealthChecker<P> {
         // Monotonic generation counter prevents ABA: even if a node is
         // removed and re-added rapidly, the new incarnation always gets a
         // strictly higher generation than any prior one.
-        let gen = self.next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let gen = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         nodes.insert(
             node_id.clone(),
             TrackedNode {
@@ -1096,7 +1139,11 @@ impl<P: HealthProbe> HealthChecker<P> {
 
     /// Removes a node with an optional last-writer safety check.
     /// Returns `Err(reason)` if the node cannot be removed.
-    pub fn remove_node_checked(&self, node_id: &str, prevent_last_writer: bool) -> Result<(), &'static str> {
+    pub fn remove_node_checked(
+        &self,
+        node_id: &str,
+        prevent_last_writer: bool,
+    ) -> Result<(), &'static str> {
         let mut nodes = self.nodes.lock();
 
         if !nodes.contains_key(node_id) {
@@ -1106,7 +1153,10 @@ impl<P: HealthProbe> HealthChecker<P> {
         if prevent_last_writer {
             let target_type = nodes.get(node_id).map(|n| n.node_type);
             if target_type == Some(NodeType::Writer) {
-                let writer_count = nodes.values().filter(|n| n.node_type == NodeType::Writer).count();
+                let writer_count = nodes
+                    .values()
+                    .filter(|n| n.node_type == NodeType::Writer)
+                    .count();
                 if writer_count <= 1 {
                     return Err("cannot remove the last writer node");
                 }
@@ -1412,12 +1462,7 @@ mod tests {
         }
 
         let checker = HealthChecker::new(
-            vec![(
-                "slow".to_string(),
-                NodeType::Writer,
-                1,
-                SlowProbe,
-            )],
+            vec![("slow".to_string(), NodeType::Writer, 1, SlowProbe)],
             1000,
             Duration::from_millis(50),
         );
@@ -1452,7 +1497,9 @@ mod tests {
                 "writer".to_string(),
                 NodeType::Writer,
                 1,
-                MockProbe { result: probe_result },
+                MockProbe {
+                    result: probe_result,
+                },
             )],
             1000,
             Duration::from_secs(1),
@@ -1473,16 +1520,20 @@ mod tests {
         // A higher Writer LSN in a subsequent check advances global further
         let higher_lsn = writer_lsn + 1000;
         // Directly call apply_result to simulate a new probe
-        checker.apply_result("writer", 1, HealthCheckResult {
-            tcp_reachable: true,
-            select_1_ok: true,
-            is_in_recovery: Some(false),
-            current_wal_lsn: Some(higher_lsn),
-            replay_lsn: None,
-            replication_lag_ms: None,
-            timed_out: false,
-            writer_timeline_id: None,
-        });
+        checker.apply_result(
+            "writer",
+            1,
+            HealthCheckResult {
+                tcp_reachable: true,
+                select_1_ok: true,
+                is_in_recovery: Some(false),
+                current_wal_lsn: Some(higher_lsn),
+                replay_lsn: None,
+                replication_lag_ms: None,
+                timed_out: false,
+                writer_timeline_id: None,
+            },
+        );
         assert_eq!(tracker.global_write_lsn(), higher_lsn);
     }
 
@@ -1507,7 +1558,14 @@ mod tests {
         };
 
         let mut checker = HealthChecker::new(
-            vec![("writer".into(), NodeType::Writer, 1, MockProbe { result: probe_result })],
+            vec![(
+                "writer".into(),
+                NodeType::Writer,
+                1,
+                MockProbe {
+                    result: probe_result,
+                },
+            )],
             1000,
             Duration::from_secs(1),
         );
@@ -1523,17 +1581,25 @@ mod tests {
 
         // A stale probe returns LSN=90, same timeline=1.
         // This must NOT reset global back to 90.
-        checker.apply_result("writer", 1, HealthCheckResult {
-            tcp_reachable: true,
-            select_1_ok: true,
-            is_in_recovery: Some(false),
-            current_wal_lsn: Some(90),
-            replay_lsn: None,
-            replication_lag_ms: None,
-            timed_out: false,
-            writer_timeline_id: Some(1),
-        });
-        assert_eq!(tracker.global_write_lsn(), 500, "stale probe must not regress global LSN");
+        checker.apply_result(
+            "writer",
+            1,
+            HealthCheckResult {
+                tcp_reachable: true,
+                select_1_ok: true,
+                is_in_recovery: Some(false),
+                current_wal_lsn: Some(90),
+                replay_lsn: None,
+                replication_lag_ms: None,
+                timed_out: false,
+                writer_timeline_id: Some(1),
+            },
+        );
+        assert_eq!(
+            tracker.global_write_lsn(),
+            500,
+            "stale probe must not regress global LSN"
+        );
     }
 
     /// Timeline switch: a genuine failover (timeline_id changes) resets
@@ -1556,7 +1622,14 @@ mod tests {
         };
 
         let mut checker = HealthChecker::new(
-            vec![("writer".into(), NodeType::Writer, 1, MockProbe { result: probe_result })],
+            vec![(
+                "writer".into(),
+                NodeType::Writer,
+                1,
+                MockProbe {
+                    result: probe_result,
+                },
+            )],
             1000,
             Duration::from_secs(1),
         );
@@ -1571,21 +1644,33 @@ mod tests {
         assert_eq!(tracker.session_write_lsn("session-a"), 800);
 
         // Failover: new Writer on timeline=2 with lower LSN=300
-        checker.apply_result("writer", 1, HealthCheckResult {
-            tcp_reachable: true,
-            select_1_ok: true,
-            is_in_recovery: Some(false),
-            current_wal_lsn: Some(300),
-            replay_lsn: None,
-            replication_lag_ms: None,
-            timed_out: false,
-            writer_timeline_id: Some(2),
-        });
+        checker.apply_result(
+            "writer",
+            1,
+            HealthCheckResult {
+                tcp_reachable: true,
+                select_1_ok: true,
+                is_in_recovery: Some(false),
+                current_wal_lsn: Some(300),
+                replay_lsn: None,
+                replication_lag_ms: None,
+                timed_out: false,
+                writer_timeline_id: Some(2),
+            },
+        );
 
         // Global must be reset to the new Writer's position
-        assert_eq!(tracker.global_write_lsn(), 300, "timeline switch must reset global LSN");
+        assert_eq!(
+            tracker.global_write_lsn(),
+            300,
+            "timeline switch must reset global LSN"
+        );
         // Sessions must be invalidated
-        assert_eq!(tracker.session_write_lsn("session-a"), 0, "sessions must be invalidated on timeline switch");
+        assert_eq!(
+            tracker.session_write_lsn("session-a"),
+            0,
+            "sessions must be invalidated on timeline switch"
+        );
     }
 
     /// Timeline switch: if timeline_id is not available (query failed or
@@ -1608,7 +1693,14 @@ mod tests {
         };
 
         let mut checker = HealthChecker::new(
-            vec![("writer".into(), NodeType::Writer, 1, MockProbe { result: probe_result })],
+            vec![(
+                "writer".into(),
+                NodeType::Writer,
+                1,
+                MockProbe {
+                    result: probe_result,
+                },
+            )],
             1000,
             Duration::from_secs(1),
         );
@@ -1622,17 +1714,25 @@ mod tests {
         tracker.advance_global_lsn(800);
 
         // Probe returns lower LSN without timeline info — must NOT reset
-        checker.apply_result("writer", 1, HealthCheckResult {
-            tcp_reachable: true,
-            select_1_ok: true,
-            is_in_recovery: Some(false),
-            current_wal_lsn: Some(200),
-            replay_lsn: None,
-            replication_lag_ms: None,
-            timed_out: false,
-            writer_timeline_id: None,
-        });
-        assert_eq!(tracker.global_write_lsn(), 800, "unknown timeline must not trigger reset");
+        checker.apply_result(
+            "writer",
+            1,
+            HealthCheckResult {
+                tcp_reachable: true,
+                select_1_ok: true,
+                is_in_recovery: Some(false),
+                current_wal_lsn: Some(200),
+                replay_lsn: None,
+                replication_lag_ms: None,
+                timed_out: false,
+                writer_timeline_id: None,
+            },
+        );
+        assert_eq!(
+            tracker.global_write_lsn(),
+            800,
+            "unknown timeline must not trigger reset"
+        );
     }
 
     /// Health generation ABA fix: verify that add_node after remove_node
@@ -1652,8 +1752,22 @@ mod tests {
         };
         let checker = HealthChecker::new(
             vec![
-                ("node-a".into(), NodeType::Writer, 1, MockProbe { result: healthy.clone() }),
-                ("node-b".into(), NodeType::Reader, 1, MockProbe { result: healthy.clone() }),
+                (
+                    "node-a".into(),
+                    NodeType::Writer,
+                    1,
+                    MockProbe {
+                        result: healthy.clone(),
+                    },
+                ),
+                (
+                    "node-b".into(),
+                    NodeType::Reader,
+                    1,
+                    MockProbe {
+                        result: healthy.clone(),
+                    },
+                ),
             ],
             1000,
             Duration::from_secs(1),
@@ -1664,7 +1778,12 @@ mod tests {
 
         // Re-add node-b: must get a generation strictly higher than any
         // previous generation (including the now-removed one)
-        assert!(checker.add_node("node-b".into(), NodeType::Reader, 1, MockProbe { result: healthy }));
+        assert!(checker.add_node(
+            "node-b".into(),
+            NodeType::Reader,
+            1,
+            MockProbe { result: healthy }
+        ));
 
         // Get the new generation by inspecting internal state
         let nodes = checker.nodes.lock();
@@ -1674,7 +1793,8 @@ mod tests {
         assert!(
             node_b_gen > node_a_gen,
             "re-added node must have strictly higher generation: node_b={} vs node_a={}",
-            node_b_gen, node_a_gen
+            node_b_gen,
+            node_a_gen
         );
     }
 
@@ -1693,8 +1813,20 @@ mod tests {
         };
         let checker = HealthChecker::new(
             vec![
-                ("writer".into(), NodeType::Writer, 1, MockProbe { result: healthy.clone() }),
-                ("reader".into(), NodeType::Reader, 1, MockProbe { result: healthy }),
+                (
+                    "writer".into(),
+                    NodeType::Writer,
+                    1,
+                    MockProbe {
+                        result: healthy.clone(),
+                    },
+                ),
+                (
+                    "reader".into(),
+                    NodeType::Reader,
+                    1,
+                    MockProbe { result: healthy },
+                ),
             ],
             5000, // max_replication_lag_ms = 5s
             Duration::from_secs(1),
@@ -1734,8 +1866,20 @@ mod tests {
         };
         let checker = HealthChecker::new(
             vec![
-                ("writer".into(), NodeType::Writer, 1, MockProbe { result: healthy.clone() }),
-                ("reader".into(), NodeType::Reader, 1, MockProbe { result: healthy }),
+                (
+                    "writer".into(),
+                    NodeType::Writer,
+                    1,
+                    MockProbe {
+                        result: healthy.clone(),
+                    },
+                ),
+                (
+                    "reader".into(),
+                    NodeType::Reader,
+                    1,
+                    MockProbe { result: healthy },
+                ),
             ],
             5000,
             Duration::from_secs(1),
@@ -1746,7 +1890,8 @@ mod tests {
             let mut nodes = checker.nodes.lock();
             nodes.get_mut("writer").unwrap().last_current_wal_lsn = 50 * 1024 * 1024;
             nodes.get_mut("reader").unwrap().last_replay_lsn = 50 * 1024 * 1024; // fully caught up
-            nodes.get_mut("reader").unwrap().last_replication_lag_ms = Some(600_000); // stale
+            nodes.get_mut("reader").unwrap().last_replication_lag_ms = Some(600_000);
+            // stale
         }
         checker.refresh_cached_snapshot();
 

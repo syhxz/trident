@@ -46,7 +46,9 @@ impl LoadBalancer for WeightedRoundRobin {
 
         // Increase each candidate's current weight by its configured weight.
         for candidate in candidates {
-            let entry = current_weights.entry(candidate.node_id.clone()).or_insert(0);
+            let entry = current_weights
+                .entry(candidate.node_id.clone())
+                .or_insert(0);
             *entry += candidate.weight as i64;
         }
 

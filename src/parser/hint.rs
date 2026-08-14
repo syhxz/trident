@@ -31,7 +31,9 @@ fn hint_comment_regex() -> &'static Regex {
 
 fn consistency_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)^CONSISTENCY\s*\(\s*(EVENTUAL|SESSION|GLOBAL)\s*\)$").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)^CONSISTENCY\s*\(\s*(EVENTUAL|SESSION|GLOBAL)\s*\)$").unwrap()
+    })
 }
 
 /// Extracts the leading comment/whitespace prefix of a SQL statement,

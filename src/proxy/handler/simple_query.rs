@@ -450,7 +450,10 @@ where
         session.state.tx_state = apply_ready_for_query(outcome.tx_status);
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend {
+                conn: OwnedConn::new(conn, Some(Arc::clone(&pool))),
+                source_pool: Some(Arc::clone(&pool)),
+            });
         } else {
             pool.release(&session.state.id, conn).await?;
         }
@@ -558,8 +561,11 @@ where
             return false;
         }
 
-        let result =
-            tokio::time::timeout(timeout_duration, fetch_wal_lsn_with_mode(&mut conn.stream, self.lsn_tracking.mode)).await;
+        let result = tokio::time::timeout(
+            timeout_duration,
+            fetch_wal_lsn_with_mode(&mut conn.stream, self.lsn_tracking.mode),
+        )
+        .await;
         match result {
             Ok(Ok(lsn)) => {
                 if let Err(error) = pool.release(&session.state.id, conn).await {
@@ -693,7 +699,10 @@ where
             return Ok(());
         }
         if conn.pinned {
-            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend {
+                conn: OwnedConn::new(conn, Some(Arc::clone(&pool))),
+                source_pool: Some(Arc::clone(&pool)),
+            });
         } else {
             pool.release(&session.state.id, conn).await?;
         }
@@ -890,7 +899,9 @@ where
                 session_write_lsn,
                 global_write_lsn,
             };
-            self.router.route(sql, &mut ctx, &readers, &analytics, &writers).await
+            self.router
+                .route(sql, &mut ctx, &readers, &analytics, &writers)
+                .await
         };
         // Always put the state back, including when routing fails. The prior
         // implementation used `?` before this assignment and could silently
@@ -912,7 +923,9 @@ where
                         session_write_lsn: self.lsn_tracker.session_write_lsn(&session.state.id),
                         global_write_lsn: self.lsn_tracker.global_write_lsn(),
                     };
-                    self.router.route(sql, &mut ctx, &readers, &analytics, &writers).await
+                    self.router
+                        .route(sql, &mut ctx, &readers, &analytics, &writers)
+                        .await
                 };
                 session.state.tx_split = reroute_split;
                 decision = reroute_result?;
@@ -1050,11 +1063,15 @@ where
             }
         }
 
-        let current_gen = self.connection_registry.map(|r| r.node_generation(&target_node_id));
+        let current_gen = self
+            .connection_registry
+            .map(|r| r.node_generation(&target_node_id));
         let mut conn = if let Some(mut held) = session.held_backend.take() {
             // PostgreSQL transaction and session state is connection-local.
             held.conn.take()
-        } else if let Some(mut cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
+        } else if let Some(mut cached) =
+            session.take_cached_if_matches(&target_node_id, current_gen)
+        {
             // Fast path: reuse the complete cached idle connection.
             cached.conn.take()
         } else {
@@ -1106,10 +1123,25 @@ where
         // succeeded independently of the user query. Use a standalone
         // internal cycle so the per-connection cache is updated only after
         // SET is confirmed successful.
+        //
+        // The expected transaction status depends on how the connection was
+        // obtained. Freshly acquired from the pool or cached idle → Idle.
+        // Taken from held_backend (in-transaction) → InTransaction.
+        // After a split upgrade, the Reader was rolled back and a fresh
+        // Writer acquired, so it's Idle (BEGIN will be pipelined later).
+        let appname_expected_status = if split_reader_rolled_back || split_was_pending {
+            // Fresh Writer after upgrade or pending split activation: Idle
+            // (the delayed BEGIN hasn't been sent yet).
+            TransactionStatus::Idle
+        } else if session.state.tx_state == TxState::InTransaction {
+            TransactionStatus::InTransaction
+        } else {
+            TransactionStatus::Idle
+        };
         if let Err(error) = ensure_application_name(
             &mut conn,
             &session.application_name,
-            TransactionStatus::Idle,
+            appname_expected_status,
         )
         .await
         {
@@ -1261,6 +1293,21 @@ where
         // state from the backend's original ReadyForQuery status byte.
         session.state.tx_state = apply_ready_for_query(relay_outcome.tx_status);
 
+        // After a successful split upgrade (Reader→Writer), reset
+        // `need_upgrade` so the next statement correctly enters the
+        // fast-path `forward_on_held_backend` instead of re-entering the
+        // main routing pipeline. Without this, `need_upgrade` remains
+        // `true` causing `ensure_application_name(..., Idle)` to be called
+        // on an InTransaction connection (the "SET application_name ended
+        // with InTransaction, expected Idle" bug).
+        if decision.requires_split_upgrade && !relay_outcome.had_error_response {
+            if let Some(ref mut split) = session.state.tx_split {
+                split.active = true;
+                split.on_reader = false;
+                split.need_upgrade = false;
+            }
+        }
+
         // The client write/commit already completed even if the internal
         // LSN cycle timed out. Preserve that success, discard the unknown
         // backend stream, and resolve the pending watermark lazily later.
@@ -1278,13 +1325,19 @@ where
         }
 
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend {
+                conn: OwnedConn::new(conn, Some(Arc::clone(&pool))),
+                source_pool: Some(Arc::clone(&pool)),
+            });
         } else if conn.dirty {
             // Dirty connections cannot be cached; release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache the complete clean idle connection for same-node reuse.
-            session.cached_idle_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
+            session.cached_idle_backend = Some(HeldBackend {
+                conn: OwnedConn::new(conn, Some(Arc::clone(&pool))),
+                source_pool: Some(Arc::clone(&pool)),
+            });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await?;

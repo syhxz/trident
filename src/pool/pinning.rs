@@ -55,9 +55,7 @@ fn listen_re() -> &'static Regex {
 
 fn create_temp_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?is)^\s*CREATE\s+(TEMP|TEMPORARY)\s+TABLE\b").unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"(?is)^\s*CREATE\s+(TEMP|TEMPORARY)\s+TABLE\b").unwrap())
 }
 
 fn advisory_lock_re() -> &'static Regex {

@@ -9,8 +9,8 @@
 //! replacement. `CancelRegistry` independently tracks PostgreSQL cancel keys.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -54,11 +54,7 @@ impl ConnectionRegistry {
 
     /// Returns the current generation for a node. Lock-free hot-path read.
     pub fn node_generation(&self, node_id: &str) -> u64 {
-        self.snapshot
-            .load()
-            .get(node_id)
-            .copied()
-            .unwrap_or(0)
+        self.snapshot.load().get(node_id).copied().unwrap_or(0)
     }
 
     /// Invalidates factories and connections from the current incarnation.
@@ -175,7 +171,10 @@ impl ConnCleaner for DiscardAllCleaner {
                 Ok(BackendMessage::ReadyForQuery(_)) => break,
                 Ok(BackendMessage::ErrorResponse(error)) => {
                     query_error = Some(
-                        error.message().unwrap_or("validation query failed").to_string(),
+                        error
+                            .message()
+                            .unwrap_or("validation query failed")
+                            .to_string(),
                     );
                 }
                 Ok(_) => continue,
@@ -310,22 +309,37 @@ impl CancelRegistry {
     /// FIX (TOCTOU): Also returns the session_id so the caller can
     /// re-verify the target is still active after establishing the cancel
     /// connection but before sending the cancel bytes.
-    pub fn resolve_cancel_target(&self, backend_pid: i32, secret_key: i32) -> Option<(String, i32, i32, String, u64)> {
+    pub fn resolve_cancel_target(
+        &self,
+        backend_pid: i32,
+        secret_key: i32,
+    ) -> Option<(String, i32, i32, String, u64)> {
         let session_id = {
             let sessions = self.sessions_by_key.lock();
             sessions.get(&(backend_pid, secret_key)).cloned()
         }?;
         let active = self.active_backends.lock();
-        active
-            .get(&session_id)
-            .map(|a| (a.node_id.clone(), a.backend_pid, a.secret_key, session_id.clone(), a.generation))
+        active.get(&session_id).map(|a| {
+            (
+                a.node_id.clone(),
+                a.backend_pid,
+                a.secret_key,
+                session_id.clone(),
+                a.generation,
+            )
+        })
     }
 
     /// Re-verifies that the given session still has an active query targeting
     /// the specified backend_pid at the expected generation. Returns false if
     /// the target has changed (connection was released/reassigned) or if a
     /// new query has started (ABA scenario).
-    pub fn verify_cancel_target(&self, session_id: &str, expected_pid: i32, expected_generation: u64) -> bool {
+    pub fn verify_cancel_target(
+        &self,
+        session_id: &str,
+        expected_pid: i32,
+        expected_generation: u64,
+    ) -> bool {
         let active = self.active_backends.lock();
         active
             .get(session_id)
@@ -363,10 +377,12 @@ pub async fn send_cancel_request_with_timeout(
     } else {
         tokio::time::timeout(connect_timeout, connect_fut)
             .await
-            .map_err(|_| std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "cancel request connect timed out",
-            ))??
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "cancel request connect timed out",
+                )
+            })??
     };
     let bytes = encode_frontend_message(&FrontendMessage::CancelRequest {
         backend_pid,

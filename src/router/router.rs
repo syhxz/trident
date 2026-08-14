@@ -20,7 +20,9 @@ use arc_swap::ArcSwap;
 use crate::balancer::{LoadBalancer, NodeCandidate};
 use crate::config::{ConsistencyLevel, NodeType};
 use crate::health::BackendNodeSnapshot;
-use crate::parser::classifier::{contains_multiple_statements, multi_statement_all_readable, Classifier};
+use crate::parser::classifier::{
+    contains_multiple_statements, multi_statement_all_readable, Classifier,
+};
 use crate::parser::hint::{HintParser, RouteHint};
 use crate::router::consistency::ConsistencyChecker;
 use crate::router::cost::CostEstimator;
@@ -81,7 +83,11 @@ impl RouteDecision {
         }
     }
 
-    fn forced(target: NodeType, node_id: Option<String>, reason: impl Into<Cow<'static, str>>) -> Self {
+    fn forced(
+        target: NodeType,
+        node_id: Option<String>,
+        reason: impl Into<Cow<'static, str>>,
+    ) -> Self {
         RouteDecision {
             target,
             node_id,
@@ -92,7 +98,11 @@ impl RouteDecision {
         }
     }
 
-    fn selected(target: NodeType, node_id: Option<String>, reason: impl Into<Cow<'static, str>>) -> Self {
+    fn selected(
+        target: NodeType,
+        node_id: Option<String>,
+        reason: impl Into<Cow<'static, str>>,
+    ) -> Self {
         RouteDecision {
             target,
             node_id,
@@ -315,8 +325,7 @@ where
         // statements are read-only, allow routing to Reader. Otherwise
         // conservatively route to Writer. This safety rule intentionally
         // takes precedence over Reader hints for mixed-intent batches.
-        if contains_multiple_statements(sql)
-            && !multi_statement_all_readable(&self.classifier, sql)
+        if contains_multiple_statements(sql) && !multi_statement_all_readable(&self.classifier, sql)
         {
             return Ok(RouteDecision::writer(
                 "multiple statements with write intent in one simple-query message",
@@ -328,11 +337,19 @@ where
         if settings.enable_hint_routing {
             match self.hint_parser.parse_hint(sql) {
                 RouteHint::ForceWriter => {
-                    return Ok(RouteDecision::forced(NodeType::Writer, None, "hint: ROUTE_TO_WRITER"));
+                    return Ok(RouteDecision::forced(
+                        NodeType::Writer,
+                        None,
+                        "hint: ROUTE_TO_WRITER",
+                    ));
                 }
                 RouteHint::ForceReader => {
                     let node_id = self.select_all_candidates(readers);
-                    return Ok(RouteDecision::forced(NodeType::Reader, node_id, "hint: ROUTE_TO_READER"));
+                    return Ok(RouteDecision::forced(
+                        NodeType::Reader,
+                        node_id,
+                        "hint: ROUTE_TO_READER",
+                    ));
                 }
                 RouteHint::ForceAnalytics => {
                     let node_id = self.select_all_candidates(analytics_nodes);
@@ -388,35 +405,43 @@ where
                 return Ok(match action {
                     TxRouteAction::RouteToReader => {
                         let node_id = self.select_all_candidates(readers);
-                        RouteDecision::selected(NodeType::Reader, node_id, "transaction split: TX_READING")
+                        RouteDecision::selected(
+                            NodeType::Reader,
+                            node_id,
+                            "transaction split: TX_READING",
+                        )
                     }
                     TxRouteAction::RouteToWriter => {
                         RouteDecision::writer("transaction split: routed to Writer")
                     }
-                    TxRouteAction::UpgradeReaderToWriter => {
-                        RouteDecision::writer_upgrade(
-                            "transaction split: upgrading from Reader to Writer",
-                        )
-                    }
+                    TxRouteAction::UpgradeReaderToWriter => RouteDecision::writer_upgrade(
+                        "transaction split: upgrading from Reader to Writer",
+                    ),
                 });
             }
             // No tx_split state tracked (transaction splitting effectively
             // disabled for this session): explicit transactions go to Writer.
-            return Ok(RouteDecision::writer("explicit transaction, no split tracking"));
+            return Ok(RouteDecision::writer(
+                "explicit transaction, no split tracking",
+            ));
         }
 
         // Step 3-4: SQL classification and write-function detection
         // (Requirements 1.1, 1.3).
         let sql_kind = self.classifier.classify(sql);
         if sql_kind.requires_writer() || self.classifier.has_write_function_call(sql) {
-            return Ok(RouteDecision::writer("write statement or write function call"));
+            return Ok(RouteDecision::writer(
+                "write statement or write function call",
+            ));
         }
 
         if !sql_kind.readable() {
             // Statements not recognized as clearly read-only (Requirement
             // 1.2 only covers plain SELECT/SHOW/EXPLAIN) are conservatively
             // routed to Writer.
-            return Ok(RouteDecision::writer("unclassified statement, defaulting to Writer"));
+            return Ok(RouteDecision::writer(
+                "unclassified statement, defaulting to Writer",
+            ));
         }
 
         // Step 4.5: Custom table/function routing rules (see
@@ -512,14 +537,24 @@ where
             if let Some(node_id) = self.load_balancer.select(&all_candidates) {
                 // Check if the selected node is a writer
                 if writers.iter().any(|w| w.node_id == node_id) {
-                    return Ok(RouteDecision::writer("autocommit read, writer selected by load balancer"));
+                    return Ok(RouteDecision::writer(
+                        "autocommit read, writer selected by load balancer",
+                    ));
                 }
-                return Ok(RouteDecision::selected(NodeType::Reader, Some(node_id), "autocommit read, consistency satisfied"));
+                return Ok(RouteDecision::selected(
+                    NodeType::Reader,
+                    Some(node_id),
+                    "autocommit read, consistency satisfied",
+                ));
             }
         }
 
         let node_id = self.select_from_candidates(&eligible, readers);
-        Ok(RouteDecision::selected(NodeType::Reader, node_id, "autocommit read, consistency satisfied"))
+        Ok(RouteDecision::selected(
+            NodeType::Reader,
+            node_id,
+            "autocommit read, consistency satisfied",
+        ))
     }
 }
 
@@ -614,7 +649,13 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)]; // far behind, would fail Global check
         let decision = router
-            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx, &readers, &[], &[])
+            .route(
+                "/*+ ROUTE_TO_READER */ SELECT 1",
+                &mut ctx,
+                &readers,
+                &[],
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
@@ -635,7 +676,10 @@ mod tests {
             session_write_lsn: 0,
             global_write_lsn: 0,
         };
-        let decision = router.route("SELECT 1", &mut ctx, &[], &[], &[]).await.unwrap();
+        let decision = router
+            .route("SELECT 1", &mut ctx, &[], &[], &[])
+            .await
+            .unwrap();
         assert_eq!(decision.target, NodeType::Writer);
     }
 
@@ -660,7 +704,10 @@ mod tests {
         };
         // No readers satisfy the (very strict) consistency requirement, but
         // the decision must never set fallback_to_writer=true.
-        let decision = router.route("SELECT 1", &mut ctx, &[], &[], &[]).await.unwrap();
+        let decision = router
+            .route("SELECT 1", &mut ctx, &[], &[], &[])
+            .await
+            .unwrap();
         assert!(!decision.fallback_to_writer);
     }
 
@@ -682,7 +729,13 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)];
         let decision = router
-            .route("SELECT * FROM sensitive_table", &mut ctx, &readers, &[], &[])
+            .route(
+                "SELECT * FROM sensitive_table",
+                &mut ctx,
+                &readers,
+                &[],
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Writer);
@@ -708,7 +761,13 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)];
         let decision = router
-            .route("SELECT * FROM unrelated_table", &mut ctx, &readers, &[], &[])
+            .route(
+                "SELECT * FROM unrelated_table",
+                &mut ctx,
+                &readers,
+                &[],
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
@@ -736,7 +795,8 @@ mod tests {
                 "/*+ ROUTE_TO_READER */ SELECT * FROM sensitive_table",
                 &mut ctx,
                 &readers,
-                &[], &[],
+                &[],
+                &[],
             )
             .await
             .unwrap();
@@ -841,7 +901,13 @@ mod tests {
         };
         let readers = vec![reader("r1", 0)];
         let decision = router
-            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx, &readers, &[], &[])
+            .route(
+                "/*+ ROUTE_TO_READER */ SELECT 1",
+                &mut ctx,
+                &readers,
+                &[],
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
@@ -863,7 +929,13 @@ mod tests {
             global_write_lsn: 0,
         };
         let decision2 = router
-            .route("/*+ ROUTE_TO_READER */ SELECT 1", &mut ctx2, &readers, &[], &[])
+            .route(
+                "/*+ ROUTE_TO_READER */ SELECT 1",
+                &mut ctx2,
+                &readers,
+                &[],
+                &[],
+            )
             .await
             .unwrap();
         assert!(!decision2.forced_by_hint);
@@ -898,7 +970,10 @@ mod tests {
             global_write_lsn: 1000,
         };
         let readers = vec![reader("r1", 0)];
-        let decision = router.route("SELECT 1", &mut ctx, &readers, &[], &[]).await.unwrap();
+        let decision = router
+            .route("SELECT 1", &mut ctx, &readers, &[], &[])
+            .await
+            .unwrap();
         assert_eq!(decision.target, NodeType::Writer);
         assert!(decision.fallback_to_writer);
     }
@@ -915,7 +990,10 @@ mod tests {
             global_write_lsn: 100,
         };
         let readers = vec![reader("r1", 200)];
-        let decision = router.route("SELECT 1", &mut ctx, &readers, &[], &[]).await.unwrap();
+        let decision = router
+            .route("SELECT 1", &mut ctx, &readers, &[], &[])
+            .await
+            .unwrap();
         assert_eq!(decision.target, NodeType::Reader);
         assert_eq!(decision.node_id, Some("r1".to_string()));
     }

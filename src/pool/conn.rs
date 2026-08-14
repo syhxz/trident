@@ -146,8 +146,14 @@ pub(crate) struct AcquireSlotGuard {
 }
 
 impl AcquireSlotGuard {
-    pub(crate) fn new(active_connections: Arc<AtomicU32>, release_notify: Arc<tokio::sync::Notify>) -> Self {
-        AcquireSlotGuard { active_connections, release_notify }
+    pub(crate) fn new(
+        active_connections: Arc<AtomicU32>,
+        release_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        AcquireSlotGuard {
+            active_connections,
+            release_notify,
+        }
     }
 
     /// Disarm the guard — the pool code is taking ownership of slot management.
@@ -160,7 +166,9 @@ impl Drop for AcquireSlotGuard {
     fn drop(&mut self) {
         self.active_connections.fetch_sub(1, AtomicOrdering::SeqCst);
         self.release_notify.notify_one();
-        tracing::warn!("connection slot released via AcquireSlotGuard drop (possible cancellation leak)");
+        tracing::warn!(
+            "connection slot released via AcquireSlotGuard drop (possible cancellation leak)"
+        );
     }
 }
 
@@ -312,19 +320,18 @@ pub async fn establish_connection(
     };
     send_startup(&mut stream, &startup).await?;
     tracing::debug!(node_id, "startup message sent, starting auth");
-    authenticate_backend(
-        &mut stream,
-        &target.username,
-        target.password.as_deref(),
-    )
-    .await
-    .map_err(|error| ConnError::AuthFailed(error.to_string()))?;
+    authenticate_backend(&mut stream, &target.username, target.password.as_deref())
+        .await
+        .map_err(|error| ConnError::AuthFailed(error.to_string()))?;
 
     let mut backend_pid = None;
     let mut secret_key = None;
     loop {
         match read_backend_message(&mut stream).await {
-            Ok(BackendMessage::BackendKeyData { pid, secret_key: key }) => {
+            Ok(BackendMessage::BackendKeyData {
+                pid,
+                secret_key: key,
+            }) => {
                 backend_pid = Some(pid);
                 secret_key = Some(key);
             }
@@ -441,7 +448,12 @@ async fn upgrade_to_tls_verified(
     connector
         .connect(server_name, tcp_stream)
         .await
-        .map_err(|e| ConnError::AuthFailed(format!("TLS handshake failed (certificate verification): {}", e)))
+        .map_err(|e| {
+            ConnError::AuthFailed(format!(
+                "TLS handshake failed (certificate verification): {}",
+                e
+            ))
+        })
 }
 
 /// A TLS certificate verifier that accepts any server certificate.
@@ -531,19 +543,25 @@ impl rustls::client::danger::ServerCertVerifier for CaOnlyVerifier {
         chain.extend_from_slice(intermediates);
         // Use the webpki anchors to verify the chain.
         let _ = verifier; // just to suppress unused
-        // Simpler approach: use the same verifier but catch hostname errors.
-        // rustls doesn't separate chain from hostname easily.
-        // Best approach: just do chain validation via webpki directly.
-        // Use a placeholder name — if chain is invalid, it'll fail before
-        // hostname check. If chain is valid but hostname mismatches, the
-        // WebPkiServerVerifier returns InvalidCertificate(NotValidForName).
-        // We accept that specific error for verify-ca.
+                          // Simpler approach: use the same verifier but catch hostname errors.
+                          // rustls doesn't separate chain from hostname easily.
+                          // Best approach: just do chain validation via webpki directly.
+                          // Use a placeholder name — if chain is invalid, it'll fail before
+                          // hostname check. If chain is valid but hostname mismatches, the
+                          // WebPkiServerVerifier returns InvalidCertificate(NotValidForName).
+                          // We accept that specific error for verify-ca.
         let dummy_name = rustls::pki_types::ServerName::try_from("verify-ca-placeholder.invalid")
             .map_err(|_| rustls::Error::General("internal error".into()))?;
         let inner_verifier = rustls::client::WebPkiServerVerifier::builder(self.roots.clone())
             .build()
             .map_err(|e| rustls::Error::General(format!("{}", e)))?;
-        match inner_verifier.verify_server_cert(end_entity, intermediates, &dummy_name, _ocsp_response, now) {
+        match inner_verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            &dummy_name,
+            _ocsp_response,
+            now,
+        ) {
             Ok(v) => Ok(v),
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
                 // Chain is valid, hostname just doesn't match — that's OK for verify-ca
@@ -626,10 +644,7 @@ pub(crate) mod test_utils {
 
     /// Creates a complete backend connection backed by a local TCP pair.
     /// The peer is kept alive by a detached task until the connection closes.
-    pub async fn mock_backend_connection(
-        node_id: &str,
-        backend_pid: i32,
-    ) -> BackendConnection {
+    pub async fn mock_backend_connection(node_id: &str, backend_pid: i32) -> BackendConnection {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr);

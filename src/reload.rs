@@ -74,13 +74,12 @@ pub async fn reload_from_file(
     // blocking-friendly thread so a slow/contended filesystem never stalls
     // the async runtime's worker threads.
     let path_owned = path.to_string();
-    let config: AppConfig = tokio::task::spawn_blocking(move || AppConfig::load_from_file(&path_owned))
-        .await
-        .map_err(|e| ReloadError::Apply(format!("reload task panicked: {e}")))??;
+    let config: AppConfig =
+        tokio::task::spawn_blocking(move || AppConfig::load_from_file(&path_owned))
+            .await
+            .map_err(|e| ReloadError::Apply(format!("reload task panicked: {e}")))??;
 
-    target
-        .apply(&config.routing)
-        .map_err(ReloadError::Apply)?;
+    target.apply(&config.routing).map_err(ReloadError::Apply)?;
 
     Ok(())
 }
@@ -124,7 +123,9 @@ pub async fn watch_sighup(
         };
         match reload_from_file(&path, target.as_ref()).await {
             Ok(()) => tracing::info!("routing configuration reloaded successfully"),
-            Err(e) => tracing::warn!(error = %e, "routing configuration reload failed; keeping previous configuration"),
+            Err(e) => {
+                tracing::warn!(error = %e, "routing configuration reload failed; keeping previous configuration")
+            }
         }
     }
 }
@@ -171,7 +172,11 @@ mod tests {
 
     fn write_minimal_config(cost_threshold: f64) -> std::path::PathBuf {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("trident-reload-test-{}-{}.yaml", std::process::id(), cost_threshold as u64));
+        let path = dir.join(format!(
+            "trident-reload-test-{}-{}.yaml",
+            std::process::id(),
+            cost_threshold as u64
+        ));
         let yaml = format!(
             "proxy:\n  listen_addr: \"0.0.0.0:6432\"\n  max_clients: 10\n\
              nodes:\n  - name: primary\n    host: 127.0.0.1\n    port: 5432\n    type: writer\n    weight: 1\n    database: mydb\n    username: proxy_user\n    password: secret\n\
@@ -201,7 +206,10 @@ mod tests {
     #[tokio::test]
     async fn reload_from_file_never_calls_apply_when_config_is_invalid() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("trident-reload-invalid-{}.yaml", std::process::id()));
+        let path = dir.join(format!(
+            "trident-reload-invalid-{}.yaml",
+            std::process::id()
+        ));
         std::fs::write(&path, "not: [valid").unwrap();
         let target = RecordingTarget::new();
 
@@ -237,11 +245,15 @@ mod tests {
         let target = RecordingTarget::new();
 
         let path1 = write_minimal_config(10.0);
-        reload_from_file(path1.to_str().unwrap(), &target).await.unwrap();
+        reload_from_file(path1.to_str().unwrap(), &target)
+            .await
+            .unwrap();
         let _ = std::fs::remove_file(&path1);
 
         let path2 = write_minimal_config(20.0);
-        reload_from_file(path2.to_str().unwrap(), &target).await.unwrap();
+        reload_from_file(path2.to_str().unwrap(), &target)
+            .await
+            .unwrap();
         let _ = std::fs::remove_file(&path2);
 
         let applied = target.applied.lock().unwrap();

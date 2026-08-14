@@ -156,7 +156,10 @@ mod tests {
 
     #[test]
     fn ready_for_query_byte_mapping() {
-        assert_eq!(TxState::from_ready_for_query_byte(b'I'), Some(TxState::Idle));
+        assert_eq!(
+            TxState::from_ready_for_query_byte(b'I'),
+            Some(TxState::Idle)
+        );
         assert_eq!(
             TxState::from_ready_for_query_byte(b'T'),
             Some(TxState::InTransaction)

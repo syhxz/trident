@@ -145,12 +145,18 @@ pub(super) fn compute_synthetic_schedule(batch: &[ExtendedFrame], skip: &[usize]
 }
 
 /// Like `assemble_extended_outbound` but skips frames at the specified indices.
-pub(super) fn assemble_extended_outbound_filtered(batch: &[ExtendedFrame], skip: &[usize]) -> Vec<u8> {
+pub(super) fn assemble_extended_outbound_filtered(
+    batch: &[ExtendedFrame],
+    skip: &[usize],
+) -> Vec<u8> {
     const SYNC_FRAME: [u8; 5] = [b'S', 0, 0, 0, 4];
-    let total: usize = batch.iter().enumerate()
+    let total: usize = batch
+        .iter()
+        .enumerate()
         .filter(|(i, _)| !skip.contains(i))
         .map(|(_, f)| 5 + f.body.len())
-        .sum::<usize>() + SYNC_FRAME.len();
+        .sum::<usize>()
+        + SYNC_FRAME.len();
     let mut outbound = Vec::with_capacity(total);
     for (i, frame) in batch.iter().enumerate() {
         if skip.contains(&i) {
@@ -234,7 +240,9 @@ pub(super) fn record_statement_routes(
                 if let Some(stmt_name) = frame.bind_statement() {
                     if let Some(portal_name) = frame.bind_portal() {
                         if session.write_function_stmts.contains(stmt_name) {
-                            session.write_function_portals.insert(portal_name.to_string());
+                            session
+                                .write_function_portals
+                                .insert(portal_name.to_string());
                         } else {
                             // Rebinding a portal to a non-write stmt clears it.
                             session.write_function_portals.remove(portal_name);

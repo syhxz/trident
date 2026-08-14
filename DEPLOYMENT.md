@@ -58,7 +58,7 @@ Trident supports multiple client authentication modes via `proxy.client_auth`:
 | `md5` | Proxy validates against a local `auth_file` (PgBouncer-compatible `userlist.txt`) | Environments needing proxy-level auth without backend round-trip |
 | `scram-sha-256` | Proxy validates SCRAM verifier from `auth_file` | Same as md5 but stronger hash |
 
-**Passthrough mode** (recommended) preserves database-level RBAC, audit identity, and password rotation — the proxy never stores or validates client passwords itself; authentication is delegated to the backend PostgreSQL instance.
+**Passthrough mode** (recommended) preserves database-level RBAC and audit identity — the proxy never stores or validates client passwords itself; authentication is delegated to the backend PostgreSQL instance. Note that password changes are **not** immediately enforced; see the caveat below.
 
 > **⚠️ Password rotation caveat:** After a backend `ALTER ROLE ... PASSWORD` change, idle pooled connections that were authenticated with the old password remain valid until they reach `max_lifetime` (default 30 minutes). During this window, a client presenting the old password may still be admitted because (1) the password hash matches the cached pool entry, and (2) the pre-verification step may reuse an existing idle connection rather than opening a new one that would fail authentication. To minimize this window, reduce `pool.max_lifetime` to an acceptable value (e.g. `5m`) or restart/reload the proxy after rotating credentials.
 

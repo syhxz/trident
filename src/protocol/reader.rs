@@ -17,7 +17,9 @@
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::cursor::ByteReader;
-use super::message::{BackendMessage, DescribeKind, FieldDescription, FrontendMessage, PgError, TransactionStatus};
+use super::message::{
+    BackendMessage, DescribeKind, FieldDescription, FrontendMessage, PgError, TransactionStatus,
+};
 use super::ProtocolError;
 
 /// Frontend message type bytes
@@ -276,7 +278,9 @@ pub fn parse_backend_body(msg_type: u8, body: &[u8]) -> Result<BackendMessage, P
             let tag = r.read_cstring()?;
             BackendMessage::CommandComplete { tag }
         }
-        backend_tag::ERROR_RESPONSE => BackendMessage::ErrorResponse(parse_pg_error_fields(&mut r)?),
+        backend_tag::ERROR_RESPONSE => {
+            BackendMessage::ErrorResponse(parse_pg_error_fields(&mut r)?)
+        }
         backend_tag::NOTICE_RESPONSE => {
             BackendMessage::NoticeResponse(parse_pg_error_fields(&mut r)?)
         }
@@ -481,7 +485,10 @@ mod tests {
 
     #[test]
     fn parses_sync_and_terminate_with_empty_body() {
-        assert_eq!(parse_frontend_body(b'S', &[]).unwrap(), FrontendMessage::Sync);
+        assert_eq!(
+            parse_frontend_body(b'S', &[]).unwrap(),
+            FrontendMessage::Sync
+        );
         assert_eq!(
             parse_frontend_body(b'X', &[]).unwrap(),
             FrontendMessage::Terminate
@@ -522,7 +529,10 @@ mod tests {
     #[test]
     fn invalid_message_type_returns_error_not_panic() {
         let result = parse_frontend_body(0xFF, &[]);
-        assert!(matches!(result, Err(ProtocolError::InvalidMessageType(0xFF))));
+        assert!(matches!(
+            result,
+            Err(ProtocolError::InvalidMessageType(0xFF))
+        ));
     }
 
     #[test]

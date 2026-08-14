@@ -12,4 +12,4 @@ pub mod router;
 pub use consistency::{ConsistencyChecker, LsnConsistencyChecker};
 pub use cost::{CostEstimationError, CostEstimator, DefaultCostEstimator, ExplainRunner};
 pub use custom_rules::{CustomRoutingRules, CustomRuleEntry, RuleTargetKind, RwMode};
-pub use router::{Router, RouteDecision, RouterError, RouterSettings, RoutingContext};
+pub use router::{RouteDecision, Router, RouterError, RouterSettings, RoutingContext};

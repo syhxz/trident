@@ -3,8 +3,8 @@
 //! Handles parsing and encoding of PostgreSQL Wire Protocol messages, and
 //! Startup/authentication handling.
 
-mod cursor;
 pub mod auth;
+mod cursor;
 pub mod message;
 pub mod reader;
 pub mod startup;
@@ -15,7 +15,10 @@ pub use message::{
     TransactionStatus,
 };
 pub use reader::{read_backend_message, read_frontend_message, MessageReader, TokioMessageReader};
-pub use startup::{read_startup_packet, AuthOutcome, ClientCredentials, PassthroughStartupHandler, StartupHandler, StartupPacket, TrustStartupHandler};
+pub use startup::{
+    read_startup_packet, AuthOutcome, ClientCredentials, PassthroughStartupHandler, StartupHandler,
+    StartupPacket, TrustStartupHandler,
+};
 pub use writer::{
     encode_backend_message, encode_frontend_message, encode_password_message,
     encode_sasl_initial_response, encode_sasl_response, MessageWriter, TokioMessageWriter,

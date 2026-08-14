@@ -55,9 +55,7 @@ fn encode_pg_error_body(err: &PgError) -> Vec<u8> {
 pub fn encode_backend_message(msg: &BackendMessage) -> Vec<u8> {
     match msg {
         BackendMessage::AuthenticationOk => frame(b'R', 0i32.to_be_bytes().to_vec()),
-        BackendMessage::AuthenticationCleartextPassword => {
-            frame(b'R', 3i32.to_be_bytes().to_vec())
-        }
+        BackendMessage::AuthenticationCleartextPassword => frame(b'R', 3i32.to_be_bytes().to_vec()),
         BackendMessage::AuthenticationMd5Password { salt } => {
             let mut body = 5i32.to_be_bytes().to_vec();
             body.extend_from_slice(salt);
@@ -316,8 +314,8 @@ impl<S: AsyncWrite + Unpin + Send> MessageWriter for TokioMessageWriter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::reader::{parse_backend_body, parse_frontend_body};
     use crate::protocol::message::{FieldDescription, TransactionStatus};
+    use crate::protocol::reader::{parse_backend_body, parse_frontend_body};
     use proptest::prelude::*;
 
     // -----------------------------------------------------------------
@@ -409,7 +407,9 @@ mod tests {
 
     #[test]
     fn ready_for_query_roundtrip() {
-        roundtrip_backend(BackendMessage::ReadyForQuery(TransactionStatus::InTransaction));
+        roundtrip_backend(BackendMessage::ReadyForQuery(
+            TransactionStatus::InTransaction,
+        ));
     }
 
     #[test]
@@ -446,9 +446,7 @@ mod tests {
     fn authentication_messages_roundtrip() {
         roundtrip_backend(BackendMessage::AuthenticationOk);
         roundtrip_backend(BackendMessage::AuthenticationCleartextPassword);
-        roundtrip_backend(BackendMessage::AuthenticationMd5Password {
-            salt: [1, 2, 3, 4],
-        });
+        roundtrip_backend(BackendMessage::AuthenticationMd5Password { salt: [1, 2, 3, 4] });
         roundtrip_backend(BackendMessage::AuthenticationSasl {
             mechanisms: vec!["SCRAM-SHA-256".to_string()],
         });
@@ -468,16 +466,18 @@ mod tests {
     fn password_and_sasl_response_frames_match_wire_format() {
         assert_eq!(
             encode_password_message("secret"),
-            [vec![b'p'], 11i32.to_be_bytes().to_vec(), b"secret\0".to_vec()].concat()
+            [
+                vec![b'p'],
+                11i32.to_be_bytes().to_vec(),
+                b"secret\0".to_vec()
+            ]
+            .concat()
         );
 
         let initial = encode_sasl_initial_response("SCRAM-SHA-256", b"n,,n=,r=nonce");
         assert_eq!(initial[0], b'p');
         assert_eq!(&initial[5..19], b"SCRAM-SHA-256\0");
-        assert_eq!(
-            i32::from_be_bytes(initial[19..23].try_into().unwrap()),
-            13
-        );
+        assert_eq!(i32::from_be_bytes(initial[19..23].try_into().unwrap()), 13);
         assert_eq!(&initial[23..], b"n,,n=,r=nonce");
 
         let response = encode_sasl_response(b"c=biws,r=nonce,p=proof");
@@ -536,7 +536,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(buf, encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle)));
+        assert_eq!(
+            buf,
+            encode_backend_message(&BackendMessage::ReadyForQuery(TransactionStatus::Idle))
+        );
     }
 
     #[tokio::test]

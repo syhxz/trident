@@ -14,7 +14,9 @@ use crate::protocol::message::{PgError, TransactionStatus};
 use crate::protocol::reader::{frontend_tag, read_tagged_frame};
 use crate::protocol::ProtocolError;
 use crate::proxy::error::ProxyError;
-use crate::proxy::forwarder::{apply_ready_for_query, is_write_command_tag, relay_copy_in_stream_with_timeout};
+use crate::proxy::forwarder::{
+    apply_ready_for_query, is_write_command_tag, relay_copy_in_stream_with_timeout,
+};
 use crate::router::router::RoutingContext;
 use crate::session::session::TxState;
 
@@ -69,11 +71,16 @@ where
             let execute_only_match = if !batch.iter().any(|f| f.tag == frontend_tag::PARSE)
                 && !batch.iter().any(|f| f.tag == frontend_tag::BIND)
             {
-                batch.iter()
+                batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::EXECUTE)
                     .find_map(|f| {
                         f.execute_portal().and_then(|p| {
-                            session.failed_state_portals.get(p).copied().map(|tag| (p.to_string(), tag))
+                            session
+                                .failed_state_portals
+                                .get(p)
+                                .copied()
+                                .map(|tag| (p.to_string(), tag))
                         })
                     })
             } else {
@@ -95,7 +102,8 @@ where
                 for frame in batch.iter() {
                     match frame.tag {
                         tag_byte if tag_byte == frontend_tag::EXECUTE => {
-                            let is_virtual = frame.execute_portal()
+                            let is_virtual = frame
+                                .execute_portal()
                                 .is_some_and(|p| p == virtual_portal_name);
                             if is_virtual {
                                 let cmd = crate::protocol::writer::encode_backend_message(
@@ -103,7 +111,9 @@ where
                                         tag: effective_tag.to_string(),
                                     },
                                 );
-                                client_stream.write_all(&cmd).await
+                                client_stream
+                                    .write_all(&cmd)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             } else {
                                 // Other Executes in same batch were in Failed
@@ -131,7 +141,9 @@ where
                             // processes Close even in Failed state, returning
                             // CloseComplete. Synthesize it.
                             let close_complete = [b'3', 0, 0, 0, 4];
-                            client_stream.write_all(&close_complete).await
+                            client_stream
+                                .write_all(&close_complete)
+                                .await
                                 .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         }
                         _ => {}
@@ -157,7 +169,10 @@ where
                         // Record in prepared_stmts cache for cross-Sync support.
                         if let Some(name) = frame.parse_name() {
                             if !name.is_empty() {
-                                session.state.prepared_stmts.insert(name.to_string(), sql.to_string());
+                                session
+                                    .state
+                                    .prepared_stmts
+                                    .insert(name.to_string(), sql.to_string());
                             }
                         }
                         break;
@@ -171,7 +186,9 @@ where
                 for frame in batch.iter().filter(|f| f.tag == frontend_tag::BIND) {
                     if let Some(stmt_name) = frame.bind_statement() {
                         if let Some(cached_sql) = session.state.prepared_stmts.get(stmt_name) {
-                            if let Some(tag) = crate::session::transaction::transaction_end_tag(cached_sql) {
+                            if let Some(tag) =
+                                crate::session::transaction::transaction_end_tag(cached_sql)
+                            {
                                 txn_end_tag = Some(tag);
                                 txn_parse_stmt_name = Some(stmt_name);
                                 break;
@@ -183,25 +200,26 @@ where
 
             if let Some(tag) = txn_end_tag {
                 // (a) Verify Bind references the correct statement.
-                let has_matching_bind = txn_parse_stmt_name.is_some_and( |stmt_name| {
+                let has_matching_bind = txn_parse_stmt_name.is_some_and(|stmt_name| {
                     batch.iter().any(|f| {
-                        f.tag == frontend_tag::BIND
-                            && f.bind_statement() == Some(stmt_name)
+                        f.tag == frontend_tag::BIND && f.bind_statement() == Some(stmt_name)
                     })
                 });
 
                 // Find the portal created by the matching Bind.
                 let txn_portal_name = txn_parse_stmt_name.and_then(|stmt_name| {
-                    batch.iter()
-                        .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(stmt_name))
+                    batch
+                        .iter()
+                        .filter(|f| {
+                            f.tag == frontend_tag::BIND && f.bind_statement() == Some(stmt_name)
+                        })
                         .find_map(|f| f.bind_portal())
                 });
 
                 // Verify Execute references the correct portal.
-                let has_matching_execute = txn_portal_name.is_some_and( |portal| {
+                let has_matching_execute = txn_portal_name.is_some_and(|portal| {
                     batch.iter().any(|f| {
-                        f.tag == frontend_tag::EXECUTE
-                            && f.execute_portal() == Some(portal)
+                        f.tag == frontend_tag::EXECUTE && f.execute_portal() == Some(portal)
                     })
                 });
 
@@ -225,10 +243,15 @@ where
                         match frame.tag {
                             tag_byte if tag_byte == frontend_tag::PARSE => {
                                 let is_txn_parse = frame.parse_name().unwrap_or("") == txn_stmt
-                                    && frame.parse_sql().and_then(crate::session::transaction::transaction_end_tag).is_some();
+                                    && frame
+                                        .parse_sql()
+                                        .and_then(crate::session::transaction::transaction_end_tag)
+                                        .is_some();
                                 if is_txn_parse {
                                     let pc = [b'1', 0, 0, 0, 4];
-                                    client_stream.write_all(&pc).await
+                                    client_stream
+                                        .write_all(&pc)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 } else {
                                     // Non-txn Parse in Failed state: 25P02.
@@ -243,7 +266,9 @@ where
                                 let is_txn_bind = frame.bind_statement() == Some(txn_stmt);
                                 if is_txn_bind {
                                     let bc = [b'2', 0, 0, 0, 4];
-                                    client_stream.write_all(&bc).await
+                                    client_stream
+                                        .write_all(&bc)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 } else {
                                     let error = PgError::simple(
@@ -261,7 +286,9 @@ where
                                             tag: effective_tag.to_string(),
                                         },
                                     );
-                                    client_stream.write_all(&cmd).await
+                                    client_stream
+                                        .write_all(&cmd)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 } else {
                                     let error = PgError::simple(
@@ -281,7 +308,9 @@ where
                             tag_byte if tag_byte == frontend_tag::CLOSE => {
                                 // PostgreSQL processes Close even in Failed state.
                                 let cc = [b'3', 0, 0, 0, 4];
-                                client_stream.write_all(&cc).await
+                                client_stream
+                                    .write_all(&cc)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             _ => {}
@@ -300,11 +329,15 @@ where
                     let has_parse_in_batch = batch.iter().any(|f| f.tag == frontend_tag::PARSE);
                     if has_parse_in_batch {
                         let parse_complete = [b'1', 0, 0, 0, 4];
-                        client_stream.write_all(&parse_complete).await
+                        client_stream
+                            .write_all(&parse_complete)
+                            .await
                             .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     }
                     let bind_complete = [b'2', 0, 0, 0, 4];
-                    client_stream.write_all(&bind_complete).await
+                    client_stream
+                        .write_all(&bind_complete)
+                        .await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     // FIX (Bug 1): Always send RFQ — this function is only
                     // called when a Sync message triggers the batch.
@@ -317,7 +350,9 @@ where
                     // FIX (Bug 1): Always send RFQ — this function is only
                     // called when a Sync message triggers the batch.
                     let parse_complete = [b'1', 0, 0, 0, 4];
-                    client_stream.write_all(&parse_complete).await
+                    client_stream
+                        .write_all(&parse_complete)
+                        .await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     send_ready_for_query(client_stream, TxState::Failed).await?;
                     return Ok(());
@@ -354,18 +389,25 @@ where
                 // reference local SET portals. If any Execute targets a
                 // non-local portal (bound on the backend in a prior Sync),
                 // we must fall through so it reaches the backend.
-                let all_execs_local = batch.iter()
-                    .filter(|f| f.tag == frontend_tag::EXECUTE)
-                    .all(|f| {
-                        f.execute_portal()
-                            .is_some_and(|p| session.local_set_portals.contains_key(p))
-                    });
+                let all_execs_local =
+                    batch
+                        .iter()
+                        .filter(|f| f.tag == frontend_tag::EXECUTE)
+                        .all(|f| {
+                            f.execute_portal()
+                                .is_some_and(|p| session.local_set_portals.contains_key(p))
+                        });
                 let local_exec = if all_execs_local {
-                    batch.iter()
+                    batch
+                        .iter()
                         .filter(|f| f.tag == frontend_tag::EXECUTE)
                         .find_map(|f| {
                             f.execute_portal().and_then(|p| {
-                                session.local_set_portals.get(p).cloned().map(|sql| (p.to_string(), sql))
+                                session
+                                    .local_set_portals
+                                    .get(p)
+                                    .cloned()
+                                    .map(|sql| (p.to_string(), sql))
                             })
                         })
                 } else {
@@ -377,24 +419,23 @@ where
                     for frame in batch.iter() {
                         match frame.tag {
                             tag if tag == frontend_tag::EXECUTE => {
-                                let is_local = frame.execute_portal()
-                                    .is_some_and(|p| p == portal_name);
+                                let is_local =
+                                    frame.execute_portal().is_some_and(|p| p == portal_name);
                                 if is_local {
                                     let cmd_complete = crate::protocol::writer::encode_backend_message(
                                         &crate::protocol::message::BackendMessage::CommandComplete {
                                             tag: "SET".to_string(),
                                         },
                                     );
-                                    client_stream.write_all(&cmd_complete).await
+                                    client_stream
+                                        .write_all(&cmd_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 } else {
                                     // Non-local Execute in same batch: error
                                     // (should not happen in well-formed usage).
-                                    let error = PgError::simple(
-                                        "ERROR",
-                                        "34000",
-                                        "portal does not exist",
-                                    );
+                                    let error =
+                                        PgError::simple("ERROR", "34000", "portal does not exist");
                                     send_pg_error_response(client_stream, error).await?;
                                 }
                             }
@@ -402,7 +443,9 @@ where
                                 // Describe('P', portal) for the local SET portal.
                                 // SET produces no rows: NoData.
                                 let no_data = [b'n', 0, 0, 0, 4];
-                                client_stream.write_all(&no_data).await
+                                client_stream
+                                    .write_all(&no_data)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             tag if tag == frontend_tag::CLOSE => {
@@ -413,7 +456,9 @@ where
                                     }
                                 }
                                 let close_complete = [b'3', 0, 0, 0, 4];
-                                client_stream.write_all(&close_complete).await
+                                client_stream
+                                    .write_all(&close_complete)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             _ => {}
@@ -427,11 +472,13 @@ where
             // Handle Describe('S', stmt_name) for local SET statements.
             // Must come before the Bind check since a batch could be
             // Describe-only.
-            let describe_local = batch.iter()
+            let describe_local = batch
+                .iter()
                 .filter(|f| f.tag == frontend_tag::DESCRIBE)
                 .all(|f| {
-                    f.kind_and_name()
-                        .is_some_and(|(kind, name)| kind == b'S' && session.local_set_stmts.contains_key(name))
+                    f.kind_and_name().is_some_and(|(kind, name)| {
+                        kind == b'S' && session.local_set_stmts.contains_key(name)
+                    })
                 });
             let has_only_describe_and_close = describe_local
                 && !batch.iter().any(|f| f.tag == frontend_tag::BIND)
@@ -446,9 +493,13 @@ where
                             // ParameterDescription (0 params) + NoData.
                             let param_desc = [b't', 0, 0, 0, 6, 0, 0]; // tag + len(6) + 0 params
                             let no_data = [b'n', 0, 0, 0, 4];
-                            client_stream.write_all(&param_desc).await
+                            client_stream
+                                .write_all(&param_desc)
+                                .await
                                 .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
-                            client_stream.write_all(&no_data).await
+                            client_stream
+                                .write_all(&no_data)
+                                .await
                                 .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         }
                         tag if tag == frontend_tag::CLOSE => {
@@ -460,7 +511,9 @@ where
                                 }
                             }
                             let close_complete = [b'3', 0, 0, 0, 4];
-                            client_stream.write_all(&close_complete).await
+                            client_stream
+                                .write_all(&close_complete)
+                                .await
                                 .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         }
                         _ => {}
@@ -470,26 +523,29 @@ where
                 return Ok(());
             }
 
-            let all_binds_are_local = batch.iter()
-                .filter(|f| f.tag == frontend_tag::BIND)
-                .all(|f| {
-                    f.bind_statement()
-                        .is_some_and(|name| session.local_set_stmts.contains_key(name))
-                });
+            let all_binds_are_local =
+                batch
+                    .iter()
+                    .filter(|f| f.tag == frontend_tag::BIND)
+                    .all(|f| {
+                        f.bind_statement()
+                            .is_some_and(|name| session.local_set_stmts.contains_key(name))
+                    });
             let local_set_sql = if all_binds_are_local {
-                batch.iter()
+                batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::BIND)
                     .find_map(|f| {
-                        f.bind_statement().and_then(|stmt_name| {
-                            session.local_set_stmts.get(stmt_name).cloned()
-                        })
+                        f.bind_statement()
+                            .and_then(|stmt_name| session.local_set_stmts.get(stmt_name).cloned())
                     })
             } else {
                 None
             };
             if let Some(sql) = local_set_sql {
                 // Find the portal name created by this Bind.
-                let bind_portal = batch.iter()
+                let bind_portal = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::BIND)
                     .find_map(|f| {
                         f.bind_statement().and_then(|stmt_name| {
@@ -501,7 +557,8 @@ where
                         })
                     });
                 // Collect all local SET portal names for Execute matching.
-                let local_portal_names: Vec<&str> = batch.iter()
+                let local_portal_names: Vec<&str> = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::BIND)
                     .filter_map(|f| {
                         f.bind_statement().and_then(|stmt_name| {
@@ -516,25 +573,38 @@ where
                 // Check if Execute references the portal.
                 let has_execute = bind_portal.is_some_and(|portal| {
                     batch.iter().any(|f| {
-                        f.tag == frontend_tag::EXECUTE
-                            && f.execute_portal() == Some(portal)
+                        f.tag == frontend_tag::EXECUTE && f.execute_portal() == Some(portal)
                     })
                 });
                 // FIX (P1 swallow): Verify ALL Execute frames reference
                 // local SET portals. Cross-Sync Execute for a non-local
                 // portal must not be swallowed.
-                let all_executes_are_local = batch.iter()
+                let all_executes_are_local = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::EXECUTE)
                     .all(|f| {
-                        f.execute_portal()
-                            .is_some_and(|p| {
-                                local_portal_names.contains(&p)
-                                    || session.local_set_portals.contains_key(p)
-                            })
+                        f.execute_portal().is_some_and(|p| {
+                            local_portal_names.contains(&p)
+                                || session.local_set_portals.contains_key(p)
+                        })
                     });
                 if has_execute && all_executes_are_local {
-                    // Full Bind+Execute: apply the SET and respond.
-                    session.state.apply_consistency_set_command(&sql);
+                    // Full Bind+Execute: apply ALL local SET commands in
+                    // order (FIX issue B: previously only the first was
+                    // applied when multiple Binds referenced different SET
+                    // statements in the same cross-Sync batch).
+                    // Build a map: portal_name -> SQL for this batch's Binds.
+                    let portal_to_sql: Vec<(&str, String)> = batch
+                        .iter()
+                        .filter(|f| f.tag == frontend_tag::BIND)
+                        .filter_map(|f| {
+                            f.bind_statement().and_then(|stmt_name| {
+                                session.local_set_stmts.get(stmt_name).map(|sql| {
+                                    (f.bind_portal().unwrap_or(""), sql.clone())
+                                })
+                            })
+                        })
+                        .collect();
                     // FIX: Iterate ALL frames in the batch to generate
                     // correct responses for Describe/Close that may
                     // accompany Bind+Execute in a cross-Sync batch.
@@ -542,7 +612,9 @@ where
                         match frame.tag {
                             tag if tag == frontend_tag::BIND => {
                                 let bind_complete = [b'2', 0, 0, 0, 4];
-                                client_stream.write_all(&bind_complete).await
+                                client_stream
+                                    .write_all(&bind_complete)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             tag if tag == frontend_tag::DESCRIBE => {
@@ -551,21 +623,34 @@ where
                                 if let Some((kind, _)) = frame.kind_and_name() {
                                     if kind == b'S' {
                                         let param_desc = [b't', 0, 0, 0, 6, 0, 0];
-                                        client_stream.write_all(&param_desc).await
-                                            .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                        client_stream.write_all(&param_desc).await.map_err(
+                                            |e| ProxyError::Protocol(ProtocolError::Io(e)),
+                                        )?;
                                     }
                                 }
                                 let no_data = [b'n', 0, 0, 0, 4];
-                                client_stream.write_all(&no_data).await
+                                client_stream
+                                    .write_all(&no_data)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             tag if tag == frontend_tag::EXECUTE => {
+                                // Apply the SET for this specific Execute's
+                                // portal (in order) so multiple SETs take
+                                // effect sequentially.
+                                if let Some(portal) = frame.execute_portal() {
+                                    if let Some((_, set_sql)) = portal_to_sql.iter().find(|(p, _)| *p == portal) {
+                                        session.state.apply_consistency_set_command(set_sql);
+                                    }
+                                }
                                 let cmd_complete = crate::protocol::writer::encode_backend_message(
                                     &crate::protocol::message::BackendMessage::CommandComplete {
                                         tag: "SET".to_string(),
                                     },
                                 );
-                                client_stream.write_all(&cmd_complete).await
+                                client_stream
+                                    .write_all(&cmd_complete)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             tag if tag == frontend_tag::CLOSE => {
@@ -577,7 +662,9 @@ where
                                     }
                                 }
                                 let close_complete = [b'3', 0, 0, 0, 4];
-                                client_stream.write_all(&close_complete).await
+                                client_stream
+                                    .write_all(&close_complete)
+                                    .await
                                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                             }
                             _ => {}
@@ -590,13 +677,14 @@ where
                     // FIX (Bug 4): Record the portal so a later Execute-only
                     // batch can resolve it locally.
                     if let Some(portal) = bind_portal {
-                        session.local_set_portals.insert(
-                            portal.to_string(),
-                            sql.clone(),
-                        );
+                        session
+                            .local_set_portals
+                            .insert(portal.to_string(), sql.clone());
                     }
                     let bind_complete = [b'2', 0, 0, 0, 4];
-                    client_stream.write_all(&bind_complete).await
+                    client_stream
+                        .write_all(&bind_complete)
+                        .await
                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                     send_ready_for_query(client_stream, session.state.tx_state).await?;
                     return Ok(());
@@ -633,7 +721,8 @@ where
                 }
             }
             // Collect ALL SET consistency Parse frames (not just the first).
-            let set_parse_frames: Vec<_> = batch.iter()
+            let set_parse_frames: Vec<_> = batch
+                .iter()
                 .enumerate()
                 .filter(|(_, f)| f.tag == frontend_tag::PARSE)
                 .filter(|(_, f)| {
@@ -645,14 +734,14 @@ where
                 .collect();
 
             if !set_parse_frames.is_empty() {
-                let set_stmt_names: Vec<&str> = set_parse_frames.iter()
-                    .map(|(_, _, name)| *name)
-                    .collect();
+                let set_stmt_names: Vec<&str> =
+                    set_parse_frames.iter().map(|(_, _, name)| *name).collect();
                 let first_sql = set_parse_frames[0].1;
                 let first_stmt_name = set_parse_frames[0].2;
 
                 // Find all portals bound to SET statements.
-                let set_portal_names: Vec<&str> = batch.iter()
+                let set_portal_names: Vec<&str> = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::BIND)
                     .filter(|f| {
                         f.bind_statement()
@@ -663,22 +752,26 @@ where
                     .collect();
 
                 let has_matching_bind = batch.iter().any(|f| {
-                    f.tag == frontend_tag::BIND
-                        && f.bind_statement() == Some(first_stmt_name)
+                    f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name)
                 });
 
-                let set_portal_name = batch.iter()
-                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name))
+                let set_portal_name = batch
+                    .iter()
+                    .filter(|f| {
+                        f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name)
+                    })
                     .find_map(|f| f.bind_portal());
 
                 let has_matching_execute = set_portal_name.is_some_and(|portal| {
                     batch.iter().any(|f| {
-                        f.tag == frontend_tag::EXECUTE
-                            && f.execute_portal() == Some(portal)
+                        f.tag == frontend_tag::EXECUTE && f.execute_portal() == Some(portal)
                     })
                 });
 
-                let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
+                let parse_count = batch
+                    .iter()
+                    .filter(|f| f.tag == frontend_tag::PARSE)
+                    .count();
 
                 // FIX (P1 swallow): Before taking the pure-local fast path,
                 // verify that ALL Bind/Execute/Describe frames in the batch
@@ -686,14 +779,17 @@ where
                 // (e.g. Bind/Execute referencing a previously prepared real
                 // query via cross-Sync portal reuse), we must NOT return
                 // early — those frames need to reach the backend.
-                let all_binds_are_set = batch.iter()
-                    .filter(|f| f.tag == frontend_tag::BIND)
-                    .all(|f| {
-                        f.bind_statement()
-                            .map(|s| set_stmt_names.contains(&s))
-                            .unwrap_or(false)
-                    });
-                let all_executes_are_set = batch.iter()
+                let all_binds_are_set =
+                    batch
+                        .iter()
+                        .filter(|f| f.tag == frontend_tag::BIND)
+                        .all(|f| {
+                            f.bind_statement()
+                                .map(|s| set_stmt_names.contains(&s))
+                                .unwrap_or(false)
+                        });
+                let all_executes_are_set = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::EXECUTE)
                     .all(|f| {
                         f.execute_portal()
@@ -712,33 +808,43 @@ where
                             match frame.tag {
                                 tag if tag == frontend_tag::PARSE => {
                                     let parse_complete = [b'1', 0, 0, 0, 4];
-                                    client_stream.write_all(&parse_complete).await
+                                    client_stream
+                                        .write_all(&parse_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::BIND => {
                                     let bind_complete = [b'2', 0, 0, 0, 4];
-                                    client_stream.write_all(&bind_complete).await
+                                    client_stream
+                                        .write_all(&bind_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::DESCRIBE => {
                                     if let Some((kind, _)) = frame.kind_and_name() {
                                         if kind == b'S' {
                                             let param_desc = [b't', 0, 0, 0, 6, 0, 0];
-                                            client_stream.write_all(&param_desc).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(&param_desc).await.map_err(
+                                                |e| ProxyError::Protocol(ProtocolError::Io(e)),
+                                            )?;
                                         }
                                     }
                                     let no_data = [b'n', 0, 0, 0, 4];
-                                    client_stream.write_all(&no_data).await
+                                    client_stream
+                                        .write_all(&no_data)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::EXECUTE => {
-                                    use crate::protocol::writer::encode_backend_message;
                                     use crate::protocol::message::BackendMessage;
-                                    let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                                        tag: "SET".to_string(),
-                                    });
-                                    client_stream.write_all(&cmd_complete).await
+                                    use crate::protocol::writer::encode_backend_message;
+                                    let cmd_complete =
+                                        encode_backend_message(&BackendMessage::CommandComplete {
+                                            tag: "SET".to_string(),
+                                        });
+                                    client_stream
+                                        .write_all(&cmd_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::CLOSE => {
@@ -750,7 +856,9 @@ where
                                         }
                                     }
                                     let close_complete = [b'3', 0, 0, 0, 4];
-                                    client_stream.write_all(&close_complete).await
+                                    client_stream
+                                        .write_all(&close_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 _ => {}
@@ -766,34 +874,29 @@ where
                         pending_set_commands.push(first_sql.to_string());
                         for (i, frame) in batch.iter().enumerate() {
                             let should_skip = match frame.tag {
-                                tag if tag == frontend_tag::PARSE => {
-                                    frame.parse_sql()
-                                        .map(|s| session.state.is_consistency_set_command(s))
-                                        .unwrap_or(false)
-                                }
-                                tag if tag == frontend_tag::BIND => {
-                                    frame.bind_statement()
-                                        .map(|s| set_stmt_names.contains(&s))
-                                        .unwrap_or(false)
-                                }
-                                tag if tag == frontend_tag::EXECUTE => {
-                                    frame.execute_portal()
-                                        .map(|p| set_portal_names.contains(&p))
-                                        .unwrap_or(false)
-                                }
+                                tag if tag == frontend_tag::PARSE => frame
+                                    .parse_sql()
+                                    .map(|s| session.state.is_consistency_set_command(s))
+                                    .unwrap_or(false),
+                                tag if tag == frontend_tag::BIND => frame
+                                    .bind_statement()
+                                    .map(|s| set_stmt_names.contains(&s))
+                                    .unwrap_or(false),
+                                tag if tag == frontend_tag::EXECUTE => frame
+                                    .execute_portal()
+                                    .map(|p| set_portal_names.contains(&p))
+                                    .unwrap_or(false),
                                 tag if tag == frontend_tag::DESCRIBE => {
-                                    frame.kind_and_name()
-                                        .is_some_and(|(kind, name)| {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        })
+                                    frame.kind_and_name().is_some_and(|(kind, name)| {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    })
                                 }
                                 tag if tag == frontend_tag::CLOSE => {
-                                    frame.kind_and_name()
-                                        .is_some_and(|(kind, name)| {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        })
+                                    frame.kind_and_name().is_some_and(|(kind, name)| {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    })
                                 }
                                 _ => false,
                             };
@@ -807,13 +910,14 @@ where
                         // FIX (Bug 1/3): Always send RFQ. Also record virtual
                         // prepared statement for cross-Sync support.
                         if !first_stmt_name.is_empty() {
-                            session.local_set_stmts.insert(
-                                first_stmt_name.to_string(),
-                                first_sql.to_string(),
-                            );
+                            session
+                                .local_set_stmts
+                                .insert(first_stmt_name.to_string(), first_sql.to_string());
                         }
                         let parse_complete = [b'1', 0, 0, 0, 4];
-                        client_stream.write_all(&parse_complete).await
+                        client_stream
+                            .write_all(&parse_complete)
+                            .await
                             .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
@@ -827,11 +931,13 @@ where
                     // have modified session state.
                     for &(_, sql, sname) in &set_parse_frames {
                         let has_bind = batch.iter().any(|f| {
-                            f.tag == frontend_tag::BIND
-                                && f.bind_statement() == Some(sname)
+                            f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname)
                         });
-                        let portal = batch.iter()
-                            .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname))
+                        let portal = batch
+                            .iter()
+                            .filter(|f| {
+                                f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname)
+                            })
                             .find_map(|f| f.bind_portal());
                         let has_exec = portal.is_some_and(|p| {
                             batch.iter().any(|f| {
@@ -849,7 +955,8 @@ where
                     for (i, frame) in batch.iter().enumerate() {
                         let should_skip = match frame.tag {
                             tag if tag == frontend_tag::PARSE => {
-                                let is_set = frame.parse_sql()
+                                let is_set = frame
+                                    .parse_sql()
                                     .map(|s| session.state.is_consistency_set_command(s))
                                     .unwrap_or(false);
                                 let name = frame.parse_name().unwrap_or("");
@@ -883,28 +990,26 @@ where
                             // Close that reference virtual SET objects so they
                             // don't reach the backend (which doesn't know them).
                             tag if tag == frontend_tag::DESCRIBE => {
-                                frame.kind_and_name()
-                                    .is_some_and(|(kind, name)| {
-                                        if name.is_empty() {
-                                            (kind == b'S' && held_current_unnamed_is_set)
-                                                || (kind == b'P' && held_current_unnamed_portal_is_set)
-                                        } else {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        }
-                                    })
+                                frame.kind_and_name().is_some_and(|(kind, name)| {
+                                    if name.is_empty() {
+                                        (kind == b'S' && held_current_unnamed_is_set)
+                                            || (kind == b'P' && held_current_unnamed_portal_is_set)
+                                    } else {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    }
+                                })
                             }
                             tag if tag == frontend_tag::CLOSE => {
-                                frame.kind_and_name()
-                                    .is_some_and(|(kind, name)| {
-                                        if name.is_empty() {
-                                            (kind == b'S' && held_current_unnamed_is_set)
-                                                || (kind == b'P' && held_current_unnamed_portal_is_set)
-                                        } else {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        }
-                                    })
+                                frame.kind_and_name().is_some_and(|(kind, name)| {
+                                    if name.is_empty() {
+                                        (kind == b'S' && held_current_unnamed_is_set)
+                                            || (kind == b'P' && held_current_unnamed_portal_is_set)
+                                    } else {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    }
+                                })
                             }
                             _ => false,
                         };
@@ -924,7 +1029,9 @@ where
                         use super::helpers::compute_synthetic_schedule;
                         let schedule = compute_synthetic_schedule(batch, &held_set_skip_indices);
                         if !schedule[0].is_empty() {
-                            client_stream.write_all(&schedule[0]).await
+                            client_stream
+                                .write_all(&schedule[0])
+                                .await
                                 .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
@@ -965,8 +1072,7 @@ where
                         // Mark session as Failed and discard the held backend.
                         session.state.tx_state = TxState::Failed;
                         let mut held = session.held_backend.take().unwrap();
-                        if let Some(pool) =
-                            self.resolve_pool_existing(&held.conn.node_id, session)
+                        if let Some(pool) = self.resolve_pool_existing(&held.conn.node_id, session)
                         {
                             let _ = pool.discard(held.conn.take());
                         }
@@ -1052,7 +1158,9 @@ where
                         &mut held.conn.stream,
                         "ROLLBACK",
                         TransactionStatus::Idle,
-                    ).await {
+                    )
+                    .await
+                    {
                         // ROLLBACK failed — discard the connection.
                         let _ = reader_pool.discard(held.conn.take());
                         session.state.tx_state = TxState::Failed;
@@ -1065,7 +1173,9 @@ where
                         match reader_pool.mode() {
                             PoolMode::Transaction => {
                                 held.conn.dirty = false;
-                                reader_pool.release(&session.state.id, held.conn.take()).await?;
+                                reader_pool
+                                    .release(&session.state.id, held.conn.take())
+                                    .await?;
                             }
                             PoolMode::Session => {
                                 let _ = reader_pool.discard(held.conn.take());
@@ -1085,7 +1195,13 @@ where
 
             if session.held_backend.is_some() {
                 return self
-                    .forward_extended_on_held_backend(client_stream, session, batch, &held_set_skip_indices, &pending_set_commands)
+                    .forward_extended_on_held_backend(
+                        client_stream,
+                        session,
+                        batch,
+                        &held_set_skip_indices,
+                        &pending_set_commands,
+                    )
                     .await;
             }
         }
@@ -1154,8 +1270,7 @@ where
                     // should not create a write watermark.
                     let stmt_name = frame.parse_name().unwrap_or("");
                     let has_bind = batch.iter().any(|f| {
-                        f.tag == frontend_tag::BIND
-                            && f.bind_statement() == Some(stmt_name)
+                        f.tag == frontend_tag::BIND && f.bind_statement() == Some(stmt_name)
                     });
                     if has_bind {
                         sql_is_write = true;
@@ -1245,7 +1360,8 @@ where
         // Collect ALL SET consistency Parse frames (not just the first).
         // A batch may contain multiple SET commands; we must filter all of
         // them and their corresponding Bind/Execute frames.
-        let set_parse_frames: Vec<_> = batch.iter()
+        let set_parse_frames: Vec<_> = batch
+            .iter()
             .enumerate()
             .filter(|(_, f)| f.tag == frontend_tag::PARSE)
             .filter(|(_, f)| {
@@ -1258,9 +1374,8 @@ where
 
         if !set_parse_frames.is_empty() {
             // Collect all SET statement names for Bind matching.
-            let set_stmt_names: Vec<&str> = set_parse_frames.iter()
-                .map(|(_, _, name)| *name)
-                .collect();
+            let set_stmt_names: Vec<&str> =
+                set_parse_frames.iter().map(|(_, _, name)| *name).collect();
 
             // For the single-SET, single-Parse path we still need the
             // first SET's info for backward-compatible behavior.
@@ -1269,7 +1384,8 @@ where
 
             if session.state.tx_state != TxState::Failed {
                 // Find all portals bound to SET statements.
-                let set_portal_names: Vec<&str> = batch.iter()
+                let set_portal_names: Vec<&str> = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::BIND)
                     .filter(|f| {
                         f.bind_statement()
@@ -1281,40 +1397,47 @@ where
 
                 // Check if there's at least one matching Bind+Execute for the first SET.
                 let has_matching_bind = batch.iter().any(|f| {
-                    f.tag == frontend_tag::BIND
-                        && f.bind_statement() == Some(first_stmt_name)
+                    f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name)
                 });
-                let set_portal_name = batch.iter()
-                    .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name))
+                let set_portal_name = batch
+                    .iter()
+                    .filter(|f| {
+                        f.tag == frontend_tag::BIND && f.bind_statement() == Some(first_stmt_name)
+                    })
                     .find_map(|f| f.bind_portal());
                 let has_matching_execute = set_portal_name.is_some_and(|portal| {
                     batch.iter().any(|f| {
-                        f.tag == frontend_tag::EXECUTE
-                            && f.execute_portal() == Some(portal)
+                        f.tag == frontend_tag::EXECUTE && f.execute_portal() == Some(portal)
                     })
                 });
 
-                let parse_count = batch.iter().filter(|f| f.tag == frontend_tag::PARSE).count();
+                let parse_count = batch
+                    .iter()
+                    .filter(|f| f.tag == frontend_tag::PARSE)
+                    .count();
 
                 // FIX (P1 swallow): Before taking the pure-local fast path,
                 // verify that ALL Bind/Execute frames in the batch belong to
                 // SET statements. Cross-Sync portal reuse can place non-SET
                 // Bind/Execute in the same batch as a SET Parse.
-                let all_binds_are_set_nonheld = batch.iter()
+                let all_binds_are_set_nonheld = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::BIND)
                     .all(|f| {
                         f.bind_statement()
                             .map(|s| set_stmt_names.contains(&s))
                             .unwrap_or(false)
                     });
-                let all_executes_are_set_nonheld = batch.iter()
+                let all_executes_are_set_nonheld = batch
+                    .iter()
                     .filter(|f| f.tag == frontend_tag::EXECUTE)
                     .all(|f| {
                         f.execute_portal()
                             .map(|p| set_portal_names.contains(&p))
                             .unwrap_or(false)
                     });
-                let batch_is_pure_set_nonheld = all_binds_are_set_nonheld && all_executes_are_set_nonheld;
+                let batch_is_pure_set_nonheld =
+                    all_binds_are_set_nonheld && all_executes_are_set_nonheld;
 
                 if parse_count <= 1 {
                     if has_matching_bind && has_matching_execute && batch_is_pure_set_nonheld {
@@ -1328,12 +1451,16 @@ where
                             match frame.tag {
                                 tag if tag == frontend_tag::PARSE => {
                                     let parse_complete = [b'1', 0, 0, 0, 4];
-                                    client_stream.write_all(&parse_complete).await
+                                    client_stream
+                                        .write_all(&parse_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::BIND => {
                                     let bind_complete = [b'2', 0, 0, 0, 4];
-                                    client_stream.write_all(&bind_complete).await
+                                    client_stream
+                                        .write_all(&bind_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::DESCRIBE => {
@@ -1342,21 +1469,27 @@ where
                                     if let Some((kind, _)) = frame.kind_and_name() {
                                         if kind == b'S' {
                                             let param_desc = [b't', 0, 0, 0, 6, 0, 0];
-                                            client_stream.write_all(&param_desc).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(&param_desc).await.map_err(
+                                                |e| ProxyError::Protocol(ProtocolError::Io(e)),
+                                            )?;
                                         }
                                     }
                                     let no_data = [b'n', 0, 0, 0, 4];
-                                    client_stream.write_all(&no_data).await
+                                    client_stream
+                                        .write_all(&no_data)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::EXECUTE => {
-                                    use crate::protocol::writer::encode_backend_message;
                                     use crate::protocol::message::BackendMessage;
-                                    let cmd_complete = encode_backend_message(&BackendMessage::CommandComplete {
-                                        tag: "SET".to_string(),
-                                    });
-                                    client_stream.write_all(&cmd_complete).await
+                                    use crate::protocol::writer::encode_backend_message;
+                                    let cmd_complete =
+                                        encode_backend_message(&BackendMessage::CommandComplete {
+                                            tag: "SET".to_string(),
+                                        });
+                                    client_stream
+                                        .write_all(&cmd_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 tag if tag == frontend_tag::CLOSE => {
@@ -1368,7 +1501,9 @@ where
                                         }
                                     }
                                     let close_complete = [b'3', 0, 0, 0, 4];
-                                    client_stream.write_all(&close_complete).await
+                                    client_stream
+                                        .write_all(&close_complete)
+                                        .await
                                         .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                                 }
                                 _ => {}
@@ -1376,41 +1511,39 @@ where
                         }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
-                    } else if has_matching_bind && has_matching_execute && !batch_is_pure_set_nonheld {
+                    } else if has_matching_bind
+                        && has_matching_execute
+                        && !batch_is_pure_set_nonheld
+                    {
                         // SET has full Parse+Bind+Execute but the batch also
                         // contains non-SET operations (cross-Sync portal
                         // reuse). Fall through to multi-Parse filtering path.
                         pending_set_commands_nonheld.push(first_sql.to_string());
                         for (i, frame) in batch.iter().enumerate() {
                             let should_skip = match frame.tag {
-                                tag if tag == frontend_tag::PARSE => {
-                                    frame.parse_sql()
-                                        .map(|s| session.state.is_consistency_set_command(s))
-                                        .unwrap_or(false)
-                                }
-                                tag if tag == frontend_tag::BIND => {
-                                    frame.bind_statement()
-                                        .map(|s| set_stmt_names.contains(&s))
-                                        .unwrap_or(false)
-                                }
-                                tag if tag == frontend_tag::EXECUTE => {
-                                    frame.execute_portal()
-                                        .map(|p| set_portal_names.contains(&p))
-                                        .unwrap_or(false)
-                                }
+                                tag if tag == frontend_tag::PARSE => frame
+                                    .parse_sql()
+                                    .map(|s| session.state.is_consistency_set_command(s))
+                                    .unwrap_or(false),
+                                tag if tag == frontend_tag::BIND => frame
+                                    .bind_statement()
+                                    .map(|s| set_stmt_names.contains(&s))
+                                    .unwrap_or(false),
+                                tag if tag == frontend_tag::EXECUTE => frame
+                                    .execute_portal()
+                                    .map(|p| set_portal_names.contains(&p))
+                                    .unwrap_or(false),
                                 tag if tag == frontend_tag::DESCRIBE => {
-                                    frame.kind_and_name()
-                                        .is_some_and(|(kind, name)| {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        })
+                                    frame.kind_and_name().is_some_and(|(kind, name)| {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    })
                                 }
                                 tag if tag == frontend_tag::CLOSE => {
-                                    frame.kind_and_name()
-                                        .is_some_and(|(kind, name)| {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        })
+                                    frame.kind_and_name().is_some_and(|(kind, name)| {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    })
                                 }
                                 _ => false,
                             };
@@ -1425,13 +1558,14 @@ where
                         // FIX (Bug 1/3): Always send RFQ. Also record virtual
                         // prepared statement for cross-Sync support.
                         if !first_stmt_name.is_empty() {
-                            session.local_set_stmts.insert(
-                                first_stmt_name.to_string(),
-                                first_sql.to_string(),
-                            );
+                            session
+                                .local_set_stmts
+                                .insert(first_stmt_name.to_string(), first_sql.to_string());
                         }
                         let parse_complete = [b'1', 0, 0, 0, 4];
-                        client_stream.write_all(&parse_complete).await
+                        client_stream
+                            .write_all(&parse_complete)
+                            .await
                             .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
                         return Ok(());
@@ -1443,11 +1577,13 @@ where
                     // apply AFTER the batch succeeds (FIX Bug 3).
                     for &(_, sql, sname) in &set_parse_frames {
                         let has_bind = batch.iter().any(|f| {
-                            f.tag == frontend_tag::BIND
-                                && f.bind_statement() == Some(sname)
+                            f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname)
                         });
-                        let portal = batch.iter()
-                            .filter(|f| f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname))
+                        let portal = batch
+                            .iter()
+                            .filter(|f| {
+                                f.tag == frontend_tag::BIND && f.bind_statement() == Some(sname)
+                            })
                             .find_map(|f| f.bind_portal());
                         let has_exec = portal.is_some_and(|p| {
                             batch.iter().any(|f| {
@@ -1465,8 +1601,6 @@ where
                     // When multiple Parse frames share the unnamed statement
                     // name "", a Bind("") belongs to the most recent Parse("")
                     // that precedes it, not to all Parse("") frames.
-                    let set_parse_indices: std::collections::HashSet<usize> =
-                        set_parse_frames.iter().map(|(i, _, _)| *i).collect();
                     // Track the "current" Parse at each position: as we scan
                     // forward, record whether the active unnamed stmt is SET.
                     let mut current_unnamed_is_set = false;
@@ -1476,7 +1610,8 @@ where
                     for (i, frame) in batch.iter().enumerate() {
                         let should_skip = match frame.tag {
                             tag if tag == frontend_tag::PARSE => {
-                                let is_set = frame.parse_sql()
+                                let is_set = frame
+                                    .parse_sql()
                                     .map(|s| session.state.is_consistency_set_command(s))
                                     .unwrap_or(false);
                                 // Update tracking for unnamed stmt.
@@ -1514,28 +1649,26 @@ where
                             // Close that reference virtual SET objects so they
                             // don't reach the backend (which doesn't know them).
                             tag if tag == frontend_tag::DESCRIBE => {
-                                frame.kind_and_name()
-                                    .is_some_and(|(kind, name)| {
-                                        if name.is_empty() {
-                                            (kind == b'S' && current_unnamed_is_set)
-                                                || (kind == b'P' && current_unnamed_portal_is_set)
-                                        } else {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        }
-                                    })
+                                frame.kind_and_name().is_some_and(|(kind, name)| {
+                                    if name.is_empty() {
+                                        (kind == b'S' && current_unnamed_is_set)
+                                            || (kind == b'P' && current_unnamed_portal_is_set)
+                                    } else {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    }
+                                })
                             }
                             tag if tag == frontend_tag::CLOSE => {
-                                frame.kind_and_name()
-                                    .is_some_and(|(kind, name)| {
-                                        if name.is_empty() {
-                                            (kind == b'S' && current_unnamed_is_set)
-                                                || (kind == b'P' && current_unnamed_portal_is_set)
-                                        } else {
-                                            (kind == b'S' && set_stmt_names.contains(&name))
-                                                || (kind == b'P' && set_portal_names.contains(&name))
-                                        }
-                                    })
+                                frame.kind_and_name().is_some_and(|(kind, name)| {
+                                    if name.is_empty() {
+                                        (kind == b'S' && current_unnamed_is_set)
+                                            || (kind == b'P' && current_unnamed_portal_is_set)
+                                    } else {
+                                        (kind == b'S' && set_stmt_names.contains(&name))
+                                            || (kind == b'P' && set_portal_names.contains(&name))
+                                    }
+                                })
                             }
                             _ => false,
                         };
@@ -1551,7 +1684,8 @@ where
                     // to the SELECT, causing the INSERT to be routed to a
                     // Reader.
                     if !force_writer {
-                        route_sql = batch.iter()
+                        route_sql = batch
+                            .iter()
                             .filter(|f| f.tag == frontend_tag::PARSE)
                             .filter_map(|f| f.parse_sql())
                             .find(|s| !session.state.is_consistency_set_command(s));
@@ -1578,7 +1712,9 @@ where
                         // schedule[0] contains all synthetic responses (since
                         // forwarded_count=0, there's only one slot).
                         if !schedule[0].is_empty() {
-                            client_stream.write_all(&schedule[0]).await
+                            client_stream
+                                .write_all(&schedule[0])
+                                .await
                                 .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
                         }
                         send_ready_for_query(client_stream, session.state.tx_state).await?;
@@ -1646,7 +1782,9 @@ where
             None
         };
 
-        let (target_node_id, deferred_begin_sql) = if self.lsn_tracking.mode == LsnTrackingMode::AuroraWriteForwarding {
+        let (target_node_id, deferred_begin_sql) = if self.lsn_tracking.mode
+            == LsnTrackingMode::AuroraWriteForwarding
+        {
             // Aurora write forwarding pins every session to one Reader and
             // bypasses the Router entirely; extended batches must honor the
             // same binding or session consistency breaks.
@@ -1715,7 +1853,11 @@ where
 
             // If a split transaction is pending, capture the deferred BEGIN.
             let begin = if session.state.tx_split.as_ref().is_some_and(|s| !s.active) {
-                session.state.tx_split.as_ref().map(|s| s.begin_sql().to_string())
+                session
+                    .state
+                    .tx_split
+                    .as_ref()
+                    .map(|s| s.begin_sql().to_string())
             } else {
                 None
             };
@@ -1783,9 +1925,8 @@ where
 
             // Capture deferred BEGIN SQL for split transactions that have
             // not yet opened a real backend transaction.
-            let needs_begin = split_was_pending
-                || decision.requires_split_upgrade
-                || pre_route_need_upgrade;
+            let needs_begin =
+                split_was_pending || decision.requires_split_upgrade || pre_route_need_upgrade;
             let deferred_begin_sql = if needs_begin {
                 session
                     .state
@@ -1819,8 +1960,12 @@ where
                 target_node_id.clone(),
             ))
         })?;
-        let current_gen = self.connection_registry.map(|r| r.node_generation(&target_node_id));
-        let mut conn = if let Some(mut cached) = session.take_cached_if_matches(&target_node_id, current_gen) {
+        let current_gen = self
+            .connection_registry
+            .map(|r| r.node_generation(&target_node_id));
+        let mut conn = if let Some(mut cached) =
+            session.take_cached_if_matches(&target_node_id, current_gen)
+        {
             // Fast path: reuse the complete cached connection.
             cached.conn.take()
         } else {
@@ -1919,9 +2064,11 @@ where
             // path would see `!split.active` and send BEGIN again.
             if let Some(ref mut s) = session.state.tx_split {
                 s.active = true;
-                let is_writer = self.pool_manager.snapshot().iter().any(|n| {
-                    n.node_id == target_node_id && n.node_type == NodeType::Writer
-                });
+                let is_writer = self
+                    .pool_manager
+                    .snapshot()
+                    .iter()
+                    .any(|n| n.node_id == target_node_id && n.node_type == NodeType::Writer);
                 s.on_reader = !is_writer;
             }
         }
@@ -1955,7 +2102,9 @@ where
         // Emit any synthetic responses that precede all forwarded frames.
         if let Some(ref schedule) = synthetic_schedule {
             if !schedule[0].is_empty() {
-                client_stream.write_all(&schedule[0]).await
+                client_stream
+                    .write_all(&schedule[0])
+                    .await
                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
             }
         }
@@ -2017,7 +2166,9 @@ where
         // After an ErrorResponse, the backend skips remaining frames until
         // Sync, so we stop tracking boundaries on error.
         let forwarded_frame_tags: Vec<u8> = if synthetic_schedule.is_some() {
-            batch.iter().enumerate()
+            batch
+                .iter()
+                .enumerate()
                 .filter(|(i, _)| !set_frame_skip_indices.contains(i))
                 .map(|(_, f)| f.tag)
                 .collect()
@@ -2092,8 +2243,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2132,7 +2284,8 @@ where
                         &mut conn.stream,
                         client_stream,
                         self.client_idle_timeout,
-                    ).await;
+                    )
+                    .await;
                     // The Sync pipelined behind Execute was consumed and
                     // ignored by the backend while in copy-in mode (per
                     // protocol spec); send a fresh one or ReadyForQuery
@@ -2178,8 +2331,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2200,8 +2354,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2221,9 +2376,9 @@ where
                     if !had_error && synthetic_schedule.is_some() {
                         if let Some(&cur_tag) = forwarded_frame_tags.get(forwarded_response_idx) {
                             let is_boundary = match tag {
-                                b'1' => cur_tag == frontend_tag::PARSE,        // ParseComplete
-                                b'2' => cur_tag == frontend_tag::BIND,         // BindComplete
-                                b'3' => cur_tag == frontend_tag::CLOSE,        // CloseComplete
+                                b'1' => cur_tag == frontend_tag::PARSE, // ParseComplete
+                                b'2' => cur_tag == frontend_tag::BIND,  // BindComplete
+                                b'3' => cur_tag == frontend_tag::CLOSE, // CloseComplete
                                 b'T' => {
                                     // RowDescription: boundary for Describe
                                     // (either Statement or Portal). Also
@@ -2251,8 +2406,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2321,13 +2477,19 @@ where
 
         // Return or hold the backend connection.
         if session.state.tx_state != TxState::Idle || conn.pinned {
-            session.held_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
+            session.held_backend = Some(HeldBackend {
+                conn: OwnedConn::new(conn, Some(Arc::clone(&pool))),
+                source_pool: Some(Arc::clone(&pool)),
+            });
         } else if conn.dirty {
             // Dirty connections cannot be cached — release runs the cleaner.
             pool.release(&session.state.id, conn).await?;
         } else {
             // Cache for reuse by the next query in this session.
-            session.cached_idle_backend = Some(HeldBackend { conn: OwnedConn::new(conn, Some(Arc::clone(&pool))), source_pool: Some(Arc::clone(&pool)) });
+            session.cached_idle_backend = Some(HeldBackend {
+                conn: OwnedConn::new(conn, Some(Arc::clone(&pool))),
+                source_pool: Some(Arc::clone(&pool)),
+            });
         }
 
         send_ready_for_query(client_stream, session.state.tx_state).await
@@ -2393,7 +2555,9 @@ where
         // Emit any synthetic responses that precede all forwarded frames.
         if let Some(ref schedule) = synthetic_schedule {
             if !schedule[0].is_empty() {
-                client_stream.write_all(&schedule[0]).await
+                client_stream
+                    .write_all(&schedule[0])
+                    .await
                     .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
             }
         }
@@ -2416,7 +2580,9 @@ where
         // FIX (Bug 5): Only count Parse frames that have a matching
         // Bind+Execute in this batch — Parse-only (preparation without
         // execution) should not seed write_detected.
-        let mut write_detected = batch.iter().enumerate()
+        let mut write_detected = batch
+            .iter()
+            .enumerate()
             .filter(|(i, _)| !set_skip_indices.contains(i))
             .any(|(_, frame)| {
                 if frame.tag == frontend_tag::PARSE {
@@ -2427,8 +2593,7 @@ where
                         // Check if there's a matching Bind+Execute for this Parse.
                         let stmt_name = frame.parse_name().unwrap_or("");
                         let has_bind = batch.iter().any(|f| {
-                            f.tag == frontend_tag::BIND
-                                && f.bind_statement() == Some(stmt_name)
+                            f.tag == frontend_tag::BIND && f.bind_statement() == Some(stmt_name)
                         });
                         return has_bind;
                     }
@@ -2462,7 +2627,9 @@ where
 
         // Build expected response-boundary sequence for forwarded frames.
         let forwarded_frame_tags: Vec<u8> = if synthetic_schedule.is_some() {
-            batch.iter().enumerate()
+            batch
+                .iter()
+                .enumerate()
                 .filter(|(i, _)| !set_skip_indices.contains(i))
                 .map(|(_, f)| f.tag)
                 .collect()
@@ -2526,8 +2693,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2556,12 +2724,12 @@ where
                         self.discard_held_backend(session);
                         return Err(ProxyError::Protocol(ProtocolError::Io(e)));
                     }
-                    let copy_result =
-                        relay_copy_in_stream_with_timeout(
-                            &mut held.conn.stream,
-                            client_stream,
-                            self.client_idle_timeout,
-                        ).await;
+                    let copy_result = relay_copy_in_stream_with_timeout(
+                        &mut held.conn.stream,
+                        client_stream,
+                        self.client_idle_timeout,
+                    )
+                    .await;
                     let sync_result = match copy_result {
                         Ok(()) => held
                             .conn
@@ -2600,8 +2768,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2622,8 +2791,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }
@@ -2662,8 +2832,9 @@ where
                                 if let Some(ref schedule) = synthetic_schedule {
                                     if let Some(syn) = schedule.get(forwarded_response_idx) {
                                         if !syn.is_empty() {
-                                            client_stream.write_all(syn).await
-                                                .map_err(|e| ProxyError::Protocol(ProtocolError::Io(e)))?;
+                                            client_stream.write_all(syn).await.map_err(|e| {
+                                                ProxyError::Protocol(ProtocolError::Io(e))
+                                            })?;
                                         }
                                     }
                                 }

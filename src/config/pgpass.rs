@@ -254,7 +254,9 @@ mod tests {
 
     /// Shared env-var serialization lock (same instance used by config::tests).
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::config::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::config::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     // -----------------------------------------------------------------

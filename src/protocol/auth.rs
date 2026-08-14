@@ -15,9 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::message::BackendMessage;
 use super::reader::read_backend_message;
-use super::writer::{
-    encode_password_message, encode_sasl_initial_response, encode_sasl_response,
-};
+use super::writer::{encode_password_message, encode_sasl_initial_response, encode_sasl_response};
 use super::ProtocolError;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -78,7 +76,9 @@ where
             BackendMessage::AuthenticationMd5Password { salt } => {
                 let password = password.ok_or(BackendAuthError::MissingPassword)?;
                 let response = postgres_md5_password(username, password, salt);
-                stream.write_all(&encode_password_message(&response)).await?;
+                stream
+                    .write_all(&encode_password_message(&response))
+                    .await?;
                 stream.flush().await?;
             }
             BackendMessage::AuthenticationSasl { mechanisms } => {
@@ -90,7 +90,10 @@ where
                 let mut scram = ScramSha256Client::new(password);
                 let initial = scram.initial_message();
                 stream
-                    .write_all(&encode_sasl_initial_response(SCRAM_SHA_256, initial.as_bytes()))
+                    .write_all(&encode_sasl_initial_response(
+                        SCRAM_SHA_256,
+                        initial.as_bytes(),
+                    ))
                     .await?;
                 stream.flush().await?;
 
@@ -135,7 +138,10 @@ where
 }
 
 fn error_message(error: &super::message::PgError) -> String {
-    error.message().unwrap_or("unknown authentication error").to_string()
+    error
+        .message()
+        .unwrap_or("unknown authentication error")
+        .to_string()
 }
 
 /// PostgreSQL's legacy MD5 response:
@@ -192,10 +198,7 @@ impl ScramSha256Client {
         format!("n,,{}", self.client_first_bare)
     }
 
-    fn handle_server_first(
-        &mut self,
-        server_first: &str,
-    ) -> Result<String, BackendAuthError> {
+    fn handle_server_first(&mut self, server_first: &str) -> Result<String, BackendAuthError> {
         let attributes = parse_scram_attributes(server_first)?;
         if attributes.iter().any(|(key, _)| *key == 'm') {
             return Err(BackendAuthError::InvalidScramMessage(
@@ -208,9 +211,9 @@ impl ScramSha256Client {
                 "server nonce does not extend the client nonce".into(),
             ));
         }
-        let salt = BASE64.decode(required_attribute(&attributes, 's')?).map_err(|_| {
-            BackendAuthError::InvalidScramMessage("invalid base64 salt".into())
-        })?;
+        let salt = BASE64
+            .decode(required_attribute(&attributes, 's')?)
+            .map_err(|_| BackendAuthError::InvalidScramMessage("invalid base64 salt".into()))?;
         let iterations: u32 = required_attribute(&attributes, 'i')?
             .parse()
             .map_err(|_| BackendAuthError::InvalidScramMessage("invalid iteration count".into()))?;
@@ -268,9 +271,7 @@ impl ScramSha256Client {
         let signature = BASE64
             .decode(required_attribute(&attributes, 'v')?)
             .map_err(|_| {
-                BackendAuthError::InvalidScramMessage(
-                    "invalid base64 server signature".into(),
-                )
+                BackendAuthError::InvalidScramMessage("invalid base64 server signature".into())
             })?;
         let server_key = self.server_key.ok_or_else(|| {
             BackendAuthError::InvalidScramMessage(
@@ -302,9 +303,12 @@ fn parse_scram_attributes(input: &str) -> Result<Vec<(char, &str)>, BackendAuthE
             BackendAuthError::InvalidScramMessage("attribute is missing '='".into())
         })?;
         let mut chars = key.chars();
-        let key = chars.next().filter(|_| chars.next().is_none()).ok_or_else(|| {
-            BackendAuthError::InvalidScramMessage("attribute name must be one character".into())
-        })?;
+        let key = chars
+            .next()
+            .filter(|_| chars.next().is_none())
+            .ok_or_else(|| {
+                BackendAuthError::InvalidScramMessage("attribute name must be one character".into())
+            })?;
         if attributes.iter().any(|(existing, _)| *existing == key) {
             return Err(BackendAuthError::InvalidScramMessage(format!(
                 "duplicate SCRAM attribute '{key}'"
@@ -325,9 +329,7 @@ fn required_attribute<'a>(
         .map(|(_, value)| *value)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            BackendAuthError::InvalidScramMessage(format!(
-                "missing SCRAM attribute '{key}'"
-            ))
+            BackendAuthError::InvalidScramMessage(format!("missing SCRAM attribute '{key}'"))
         })
 }
 

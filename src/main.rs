@@ -23,7 +23,9 @@ use trident::pool::manager::InMemoryPoolManager;
 use trident::pool::pool::{ConnectionPool, NodePool, NodePoolSettings, PoolError};
 use trident::pool::PoolManager;
 use trident::protocol::startup::TrustStartupHandler;
-use trident::proxy::registry::{CancelRegistry, ConnectionRegistry, DiscardAllCleaner, LiveConnFactory, NodeAddress};
+use trident::proxy::registry::{
+    CancelRegistry, ConnectionRegistry, DiscardAllCleaner, LiveConnFactory, NodeAddress,
+};
 use trident::proxy::server::{ProxyDeps, ProxyServer};
 use trident::router::consistency::LsnConsistencyChecker;
 use trident::router::cost::{DefaultCostEstimator, PoolExplainRunner};
@@ -165,10 +167,7 @@ impl admin::NodeManager for LiveNodeManager {
             ssl_mode: config.ssl_mode,
             extra_startup_params: HashMap::new(),
         };
-        let factory = LiveConnFactory {
-            target,
-            generation,
-        };
+        let factory = LiveConnFactory { target, generation };
         let cleaner = DiscardAllCleaner::new().with_check_query(self.check_query.clone());
         let pool = NodePool::with_settings(
             config.name.clone(),
@@ -184,11 +183,17 @@ impl admin::NodeManager for LiveNodeManager {
             // that were registered during the partial warm-up.
             self.health_checker.remove_node(&config.name);
             self.connection_registry.remove_by_node(&config.name);
-            return Err(format!("failed to warm up pool for '{}': {}", config.name, e));
+            return Err(format!(
+                "failed to warm up pool for '{}': {}",
+                config.name, e
+            ));
         }
 
         // Add pool to manager
-        if !self.pool_manager.add_pool(config.name.clone(), Box::new(pool)) {
+        if !self
+            .pool_manager
+            .add_pool(config.name.clone(), Box::new(pool))
+        {
             // Should not happen since we checked health_checker first,
             // but handle gracefully and invalidate this generation.
             self.health_checker.remove_node(&config.name);
@@ -228,9 +233,10 @@ impl admin::NodeManager for LiveNodeManager {
         // Serialize with other add/remove operations. Use try_lock since
         // this is a sync function; if the lock is held by a concurrent
         // add (which does async warm_up), reject rather than deadlock.
-        let _guard = self.mutation_lock.try_lock().map_err(|_| {
-            "another node add/remove operation is in progress".to_string()
-        })?;
+        let _guard = self
+            .mutation_lock
+            .try_lock()
+            .map_err(|_| "another node add/remove operation is in progress".to_string())?;
 
         // Atomically check last-writer protection and remove under the
         // health checker's internal lock — prevents concurrent removes
@@ -409,11 +415,9 @@ async fn run(
     // The TCP listener is also bound here so binding failures abort startup
     // rather than silently letting the proxy run without admin access.
     let admin_listener: Option<tokio::net::TcpListener> = if config.admin.enabled {
-        let addr: SocketAddr = config
-            .admin
-            .listen_addr
-            .parse()
-            .map_err(|e| StartupError::InvalidAdminListenAddr(config.admin.listen_addr.clone(), e))?;
+        let addr: SocketAddr = config.admin.listen_addr.parse().map_err(|e| {
+            StartupError::InvalidAdminListenAddr(config.admin.listen_addr.clone(), e)
+        })?;
 
         // Warn when admin is on a non-loopback interface without auth_token.
         // Read-only endpoints expose SQL text, client IPs, and node state.
@@ -452,7 +456,11 @@ async fn run(
             Duration::from_secs(5),
         ),
         leak_detection_threshold: parse_duration_or(
-            config.pool.leak_detection_threshold.as_deref().unwrap_or("0s"),
+            config
+                .pool
+                .leak_detection_threshold
+                .as_deref()
+                .unwrap_or("0s"),
             Duration::ZERO,
         ),
     };
@@ -470,8 +478,7 @@ async fn run(
             target,
             generation: registry.node_generation(&node.name),
         };
-        let cleaner =
-            DiscardAllCleaner::new().with_check_query(config.pool.check_query.clone());
+        let cleaner = DiscardAllCleaner::new().with_check_query(config.pool.check_query.clone());
         let pool = NodePool::with_settings(
             node.name.clone(),
             config.pool.mode,
@@ -502,9 +509,8 @@ async fn run(
     let cancel_registry = Arc::new(CancelRegistry::new());
 
     let health_checker_for_snapshot = health_checker.clone();
-    let mut pool_manager = InMemoryPoolManager::new(pools, move || {
-        health_checker_for_snapshot.snapshot()
-    });
+    let mut pool_manager =
+        InMemoryPoolManager::new(pools, move || health_checker_for_snapshot.snapshot());
 
     // --- Passthrough mode: install UserPoolFactory ---
     if config.proxy.client_auth == trident::config::ClientAuthMode::Passthrough {
@@ -561,8 +567,7 @@ async fn run(
                     target,
                     generation: self.registry.node_generation(node_id),
                 };
-                let cleaner =
-                    DiscardAllCleaner::new().with_check_query(self.check_query.clone());
+                let cleaner = DiscardAllCleaner::new().with_check_query(self.check_query.clone());
                 // Per-user pools use min_pool_size=0 (no prewarming since
                 // we cannot predict which users will connect) and a smaller
                 // max_pool_size to prevent total connection explosion.
@@ -588,15 +593,25 @@ async fn run(
         }
 
         impl NodeConfigUpdater for LiveNodeConfigUpdater {
-            fn add_node(&self, node_id: &str, host: &str, port: u16, database: &str, ssl_mode: trident::config::SslMode) {
+            fn add_node(
+                &self,
+                node_id: &str,
+                host: &str,
+                port: u16,
+                database: &str,
+                ssl_mode: trident::config::SslMode,
+            ) {
                 self.node_configs.rcu(|current| {
                     let mut new_map = (**current).clone();
-                    new_map.insert(node_id.to_string(), NodeConnInfo {
-                        host: host.to_string(),
-                        port,
-                        database: database.to_string(),
-                        ssl_mode,
-                    });
+                    new_map.insert(
+                        node_id.to_string(),
+                        NodeConnInfo {
+                            host: host.to_string(),
+                            port,
+                            database: database.to_string(),
+                            ssl_mode,
+                        },
+                    );
                     Arc::new(new_map)
                 });
             }
@@ -612,12 +627,15 @@ async fn run(
 
         let mut node_configs_map = HashMap::new();
         for node in &config.nodes {
-            node_configs_map.insert(node.name.clone(), NodeConnInfo {
-                host: node.host.clone(),
-                port: node.port,
-                database: node.database.clone(),
-                ssl_mode: node.ssl_mode,
-            });
+            node_configs_map.insert(
+                node.name.clone(),
+                NodeConnInfo {
+                    host: node.host.clone(),
+                    port: node.port,
+                    database: node.database.clone(),
+                    ssl_mode: node.ssl_mode,
+                },
+            );
         }
         let passthrough_node_configs = Arc::new(arc_swap::ArcSwap::new(Arc::new(node_configs_map)));
 
@@ -634,7 +652,9 @@ async fn run(
             node_configs: passthrough_node_configs,
         }));
 
-        tracing::info!("credential passthrough mode enabled: per-user pools will be created on demand");
+        tracing::info!(
+            "credential passthrough mode enabled: per-user pools will be created on demand"
+        );
     }
 
     pool_manager.set_user_pool_limits(config.pool.max_user_pools);
@@ -665,7 +685,12 @@ async fn run(
         .nodes
         .iter()
         .find(|n| n.node_type == trident::config::NodeType::Reader)
-        .or_else(|| config.nodes.iter().find(|n| n.node_type == trident::config::NodeType::Writer))
+        .or_else(|| {
+            config
+                .nodes
+                .iter()
+                .find(|n| n.node_type == trident::config::NodeType::Writer)
+        })
         .expect("at least one reader or writer node must be configured");
     let explain_target = ConnectTarget {
         host: explain_node.host.clone(),
@@ -703,9 +728,14 @@ async fn run(
     let server = ProxyServer::new(listen_addr, config.proxy.max_clients);
     let next_backend_pid = Arc::new(AtomicI32::new(1));
 
-    let default_consistency = Arc::new(arc_swap::ArcSwap::new(Arc::new(config.routing.default_consistency)));
+    let default_consistency = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+        config.routing.default_consistency,
+    )));
     let client_stats = Arc::new(trident::proxy::client_stats::ClientStats::new());
-    let query_log = trident::proxy::handler::QueryLogSettings::new(config.logging.query_trace, config.logging.slow_query);
+    let query_log = trident::proxy::handler::QueryLogSettings::new(
+        config.logging.query_trace,
+        config.logging.slow_query,
+    );
     let slow_queries = Arc::new(trident::admin::SlowQueryBuffer::new(500));
 
     // --- Client TLS setup ---
@@ -713,31 +743,30 @@ async fn run(
         match (&config.proxy.tls_cert, &config.proxy.tls_key) {
             (Some(cert_path), Some(key_path)) => {
                 let certs = load_certs(cert_path).map_err(|e| {
-                    StartupError::ClientTls(
-                        format!("failed to load TLS cert '{}': {}", cert_path, e),
-                    )
+                    StartupError::ClientTls(format!(
+                        "failed to load TLS cert '{}': {}",
+                        cert_path, e
+                    ))
                 })?;
                 let key = load_private_key(key_path).map_err(|e| {
-                    StartupError::ClientTls(
-                        format!("failed to load TLS key '{}': {}", key_path, e),
-                    )
+                    StartupError::ClientTls(format!("failed to load TLS key '{}': {}", key_path, e))
                 })?;
 
                 let tls_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
-                    .map_err(|e| {
-                        StartupError::ClientTls(
-                            format!("TLS config error: {}", e),
-                        )
-                    })?;
+                    .map_err(|e| StartupError::ClientTls(format!("TLS config error: {}", e)))?;
 
                 tracing::info!(cert = %cert_path, key = %key_path, "client TLS enabled");
-                Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))))
+                Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(
+                    tls_config,
+                ))))
             }
             (None, None) => None,
             _ => {
-                tracing::error!("proxy.tls_cert and proxy.tls_key must both be set or both be unset");
+                tracing::error!(
+                    "proxy.tls_cert and proxy.tls_key must both be set or both be unset"
+                );
                 std::process::exit(1);
             }
         };
@@ -756,7 +785,10 @@ async fn run(
         tls_acceptor,
         startup_timeout: parse_duration_or(&config.proxy.startup_timeout, Duration::from_secs(30)),
         client_idle_timeout: parse_duration_or(&config.proxy.client_idle_timeout, Duration::ZERO),
-        cancel_connect_timeout: parse_duration_or(&config.proxy.cancel_connect_timeout, Duration::from_secs(5)),
+        cancel_connect_timeout: parse_duration_or(
+            &config.proxy.cancel_connect_timeout,
+            Duration::from_secs(5),
+        ),
         connection_registry: registry.clone(),
     };
 
@@ -773,7 +805,11 @@ async fn run(
         let pool_manager_for_metrics = pool_manager.clone();
         // Defense-in-depth: if check_interval is somehow zero (config
         // validation should prevent this), fall back to 3s to avoid panic.
-        let interval = if check_interval.is_zero() { Duration::from_secs(3) } else { check_interval };
+        let interval = if check_interval.is_zero() {
+            Duration::from_secs(3)
+        } else {
+            check_interval
+        };
         let max_pool_size = config.pool.max_pool_size;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -791,7 +827,8 @@ async fn run(
     // Also emits per-user pool metrics on each tick.
     if config.proxy.client_auth == trident::config::ClientAuthMode::Passthrough {
         let pool_manager_for_eviction = pool_manager.clone();
-        let eviction_max_idle = parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(300));
+        let eviction_max_idle =
+            parse_duration_or(&config.pool.max_idle_time, Duration::from_secs(300));
         let max_user_pools_cfg = config.pool.max_user_pools;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
@@ -804,7 +841,11 @@ async fn run(
                 metrics::gauge!("trident_user_pools_total").set(current_pools as f64);
                 if evicted > 0 {
                     metrics::counter!("trident_user_pools_evicted_total").increment(evicted as u64);
-                    tracing::info!(evicted, remaining = current_pools, "evicted idle per-user pools");
+                    tracing::info!(
+                        evicted,
+                        remaining = current_pools,
+                        "evicted idle per-user pools"
+                    );
                 }
             }
         });
@@ -815,7 +856,8 @@ async fn run(
     // the configured check_query. Dead connections are discarded so clients
     // never hit a stale socket.
     {
-        let idle_check_interval = parse_duration_or(&config.pool.idle_check_interval, Duration::from_secs(30));
+        let idle_check_interval =
+            parse_duration_or(&config.pool.idle_check_interval, Duration::from_secs(30));
         if !idle_check_interval.is_zero() {
             let pool_manager_for_validation = pool_manager.clone();
             tokio::spawn(async move {
@@ -837,7 +879,8 @@ async fn run(
                         }
                     }
                     // Also validate per-user pools (passthrough mode)
-                    let user_discarded = pool_manager_for_validation.validate_idle_user_pools().await;
+                    let user_discarded =
+                        pool_manager_for_validation.validate_idle_user_pools().await;
                     if user_discarded > 0 {
                         tracing::debug!(
                             user_discarded,
@@ -853,15 +896,17 @@ async fn run(
     // subset of settings considered safe to change without a restart
     // (Router settings, analytics_patterns, default_consistency) -- see
     // `trident::reload` and DEPLOYMENT.md's hot-reload section.
-    let routing_config_snapshot = Arc::new(arc_swap::ArcSwap::new(Arc::new(config.routing.clone())));
-    let reload_target: Arc<dyn trident::reload::RoutingReloadTarget> = Arc::new(RouterReloadTarget {
-        router: router.clone(),
-        pattern_matcher,
-        custom_rules: custom_rules.clone(),
-        default_consistency: default_consistency.clone(),
-        admin_routing_config: Some(routing_config_snapshot.clone()),
-        reload_lock: std::sync::Mutex::new(()),
-    });
+    let routing_config_snapshot =
+        Arc::new(arc_swap::ArcSwap::new(Arc::new(config.routing.clone())));
+    let reload_target: Arc<dyn trident::reload::RoutingReloadTarget> =
+        Arc::new(RouterReloadTarget {
+            router: router.clone(),
+            pattern_matcher,
+            custom_rules: custom_rules.clone(),
+            default_consistency: default_consistency.clone(),
+            admin_routing_config: Some(routing_config_snapshot.clone()),
+            reload_lock: std::sync::Mutex::new(()),
+        });
     // FIX (reload race): Create a shared config_write_lock used by both
     // SIGHUP handler and admin API to serialize config mutations.
     let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -910,6 +955,7 @@ async fn run(
         let hc_for_interval = health_checker.clone();
         let hc_for_interval_get = health_checker.clone();
         let config_write_lock_for_admin = config_write_lock.clone();
+        let pool_manager_for_drain = pool_manager.clone();
         tokio::spawn(async move {
             if let Err(e) = admin::run(
                 admin_listener,
@@ -933,6 +979,9 @@ async fn run(
                 Some(Box::new(move |d| hc_for_interval.set_check_interval(d))),
                 Some(Box::new(move || hc_for_interval_get.check_interval())),
                 config_write_lock_for_admin,
+                Some(Box::new(move |username: &str| {
+                    pool_manager_for_drain.drain_user_pools(username)
+                })),
             )
             .await
             {
@@ -1155,7 +1204,10 @@ mod tests {
         let pid = 42;
         let secrets: std::collections::HashSet<_> =
             (0..64).map(|_| generate_cancel_secret()).collect();
-        assert!(secrets.len() > 1, "cancel secret generator must not be constant");
+        assert!(
+            secrets.len() > 1,
+            "cancel secret generator must not be constant"
+        );
         assert!(
             secrets.iter().any(|secret| *secret != pid * 1000),
             "cancel secrets must not use the former predictable PID formula"

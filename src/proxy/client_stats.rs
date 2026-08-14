@@ -30,9 +30,9 @@
 //! never evicted, so the table can never shrink below the current active
 //! connection count, which is already bounded by `proxy.max_clients`.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -122,7 +122,10 @@ impl ClientStats {
     /// (bounded by `proxy.max_clients`).
     pub fn distinct_active_ip_count(&self) -> usize {
         let entries = self.entries.lock();
-        entries.values().filter(|e| e.active_connections > 0).count()
+        entries
+            .values()
+            .filter(|e| e.active_connections > 0)
+            .count()
     }
 
     /// Returns a point-in-time snapshot of every tracked IP's stats, for

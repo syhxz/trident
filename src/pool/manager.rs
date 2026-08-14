@@ -67,7 +67,8 @@ pub trait PoolManager: Send + Sync {
         _username: &str,
         _database: Option<&str>,
         _extra_params: &HashMap<String, String>,
-    ) {}
+    ) {
+    }
 }
 
 /// Factory trait for creating per-user connection pools. Implemented by
@@ -123,7 +124,14 @@ pub struct InMemoryPoolManager {
 
 /// Allows the pool manager to notify the UserPoolFactory of node changes.
 pub trait NodeConfigUpdater: Send + Sync {
-    fn add_node(&self, node_id: &str, host: &str, port: u16, database: &str, ssl_mode: crate::config::SslMode);
+    fn add_node(
+        &self,
+        node_id: &str,
+        host: &str,
+        port: u16,
+        database: &str,
+        ssl_mode: crate::config::SslMode,
+    );
     fn remove_node(&self, node_id: &str);
 }
 
@@ -180,6 +188,28 @@ fn password_hash_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// RAII guard that decrements `pending_pool_creates` on drop.
+/// Ensures the counter is always decremented even if the pool creation
+/// path panics, preventing a permanent "slot leak" that would eventually
+/// block all new pool creations.
+struct PendingPoolGuard<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> PendingPoolGuard<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for PendingPoolGuard<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Parameters excluded from the pool key because they are per-client
 /// metadata that doesn't affect backend session state for query execution.
 /// `application_name` is set per-checkout via SET and reset on release.
@@ -220,10 +250,8 @@ impl InMemoryPoolManager {
         pools: HashMap<String, Box<dyn ConnectionPool>>,
         health_snapshots: impl Fn() -> Vec<BackendNodeSnapshot> + Send + Sync + 'static,
     ) -> Self {
-        let arc_pools: HashMap<String, Arc<dyn ConnectionPool>> = pools
-            .into_iter()
-            .map(|(k, v)| (k, Arc::from(v)))
-            .collect();
+        let arc_pools: HashMap<String, Arc<dyn ConnectionPool>> =
+            pools.into_iter().map(|(k, v)| (k, Arc::from(v))).collect();
         InMemoryPoolManager {
             pools: ArcSwap::new(Arc::new(arc_pools)),
             health_snapshots: Box::new(health_snapshots),
@@ -245,20 +273,14 @@ impl InMemoryPoolManager {
     /// Installs a `UserPoolFactory` to enable per-user pool creation
     /// (passthrough credential mode). Once set, `pool_for_user` will
     /// lazily create pools for each unique (node, user) pair.
-    pub fn set_user_pool_factory(
-        &mut self,
-        factory: Box<dyn UserPoolFactory + Send + Sync>,
-    ) {
+    pub fn set_user_pool_factory(&mut self, factory: Box<dyn UserPoolFactory + Send + Sync>) {
         self.user_pool_factory = Some(factory);
     }
 
     /// Installs a `NodeConfigUpdater` that gets called when nodes are
     /// dynamically added/removed, so the UserPoolFactory can update its
     /// internal node address map.
-    pub fn set_node_config_updater(
-        &mut self,
-        updater: Arc<dyn NodeConfigUpdater + Send + Sync>,
-    ) {
+    pub fn set_node_config_updater(&mut self, updater: Arc<dyn NodeConfigUpdater + Send + Sync>) {
         self.node_config_updater = Some(updater);
     }
 
@@ -300,6 +322,33 @@ impl InMemoryPoolManager {
         self.user_pools.lock().len()
     }
 
+    /// Drains and removes all per-user pools for a specific username across
+    /// all nodes. Used for credential revocation: after a password change or
+    /// user disable in the backend, calling this ensures no idle connections
+    /// authenticated with the old credentials remain available for reuse.
+    ///
+    /// Returns the number of pools drained.
+    pub fn drain_user_pools(&self, username: &str) -> usize {
+        let mut pools = self.user_pools.lock();
+        // Key format is "node_id\0username\0database\0params_key"
+        let keys_to_drain: Vec<String> = pools
+            .keys()
+            .filter(|key| {
+                key.split('\0')
+                    .nth(1)
+                    .is_some_and(|u| u == username)
+            })
+            .cloned()
+            .collect();
+        let count = keys_to_drain.len();
+        for key in &keys_to_drain {
+            if let Some(entry) = pools.remove(key) {
+                entry.pool.drain();
+            }
+        }
+        count
+    }
+
     /// Validates idle connections in all per-user pools. Returns the total
     /// number of stale connections discarded across all pools.
     pub async fn validate_idle_user_pools(&self) -> usize {
@@ -307,7 +356,10 @@ impl InMemoryPoolManager {
         // to avoid holding the mutex across await points.
         let pool_arcs: Vec<Arc<dyn ConnectionPool>> = {
             let pools = self.user_pools.lock();
-            pools.values().map(|entry| Arc::clone(&entry.pool)).collect()
+            pools
+                .values()
+                .map(|entry| Arc::clone(&entry.pool))
+                .collect()
         };
         let mut total_discarded = 0;
         for pool in pool_arcs {
@@ -363,7 +415,9 @@ impl InMemoryPoolManager {
             let current = self.pools.load();
             current.get(node_id).cloned()
         };
-        let old_ptr = old_pool.as_ref().map(|p| Arc::as_ptr(p) as *const () as usize);
+        let old_ptr = old_pool
+            .as_ref()
+            .map(|p| Arc::as_ptr(p) as *const () as usize);
         if let Some(pool) = &old_pool {
             pool.drain();
         }
@@ -449,7 +503,7 @@ impl PoolManager for InMemoryPoolManager {
         // Fast path: pool already exists.
         // Also enforce max_user_pools atomically within the same lock scope
         // to prevent concurrent bypass of the limit.
-        {
+        let pending_guard = {
             let mut pools = self.user_pools.lock();
             if let Some(entry) = pools.get_mut(&key) {
                 if password_hash_eq(&entry.password_hash, &pw_hash) {
@@ -487,14 +541,15 @@ impl PoolManager for InMemoryPoolManager {
                 // Replacement creation also reserves an in-flight slot so
                 // pending accounting cannot underflow and concurrent creates
                 // cannot bypass the global cap.
-                self.pending_pool_creates
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                PendingPoolGuard::new(&self.pending_pool_creates)
             } else {
                 // New pool needed — check limit while still holding the lock.
                 // Include pending (in-flight) creations in the count to
                 // prevent concurrent requests from all passing the check.
                 let effective_count = pools.len()
-                    + self.pending_pool_creates.load(std::sync::atomic::Ordering::SeqCst);
+                    + self
+                        .pending_pool_creates
+                        .load(std::sync::atomic::Ordering::SeqCst);
                 if self.max_user_pools > 0 && effective_count >= self.max_user_pools {
                     tracing::warn!(
                         node_id,
@@ -504,25 +559,29 @@ impl PoolManager for InMemoryPoolManager {
                         pending = effective_count - pools.len(),
                         "global user pool limit reached, rejecting new pool creation"
                     );
-                    metrics::counter!("trident_user_pool_rejected_total", "reason" => "max_pools").increment(1);
+                    metrics::counter!("trident_user_pool_rejected_total", "reason" => "max_pools")
+                        .increment(1);
                     return None;
                 }
                 // Reserve a slot by incrementing the pending counter.
-                self.pending_pool_creates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                PendingPoolGuard::new(&self.pending_pool_creates)
             }
-        }
+        };
 
         // Slow path: create a new pool for this (node, user) pair.
         // Pool creation happens outside the lock to avoid holding it during
         // potentially slow network operations (connecting to backend).
-        // Always decrement pending counter when done (success or failure).
-        let new_pool = match factory.create_pool(node_id, username, password, database, extra_params) {
-            Some(pool) => pool,
-            None => {
-                self.pending_pool_creates.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                return None;
-            }
-        };
+        // The RAII guard ensures the counter is decremented even if
+        // `create_pool` panics.
+        let _pool_guard = pending_guard;
+        let new_pool =
+            match factory.create_pool(node_id, username, password, database, extra_params) {
+                Some(pool) => pool,
+                None => {
+                    // Guard drops here, decrementing the counter.
+                    return None;
+                }
+            };
         let pool_arc: Arc<dyn ConnectionPool> = Arc::from(new_pool);
 
         let mut pools = self.user_pools.lock();
@@ -535,8 +594,7 @@ impl PoolManager for InMemoryPoolManager {
                 // Same password — reuse the existing pool (our freshly
                 // created one will be dropped).
                 existing.last_access = now;
-                self.pending_pool_creates
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                // Guard drops here, decrementing the counter.
                 return Some(Arc::clone(&existing.pool));
             }
             // Password mismatch: another concurrent request created a pool
@@ -547,8 +605,7 @@ impl PoolManager for InMemoryPoolManager {
                     username,
                     "concurrent pool creation race with password mismatch, rejecting (cooldown active)"
                 );
-                self.pending_pool_creates
-                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                // Guard drops here, decrementing the counter.
                 return None;
             }
             // Cooldown expired — replace with our pool (ours has the newer password)
@@ -565,8 +622,7 @@ impl PoolManager for InMemoryPoolManager {
                 password_hash: pw_hash,
                 replace_cooldown_until: now + POOL_REPLACE_COOLDOWN,
             };
-            self.pending_pool_creates
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // Guard drops here, decrementing the counter.
             return Some(Arc::clone(&pool_arc));
         }
 
@@ -575,24 +631,30 @@ impl PoolManager for InMemoryPoolManager {
         // concurrently (ABA) between the initial check and pool creation.
         // Without this, a user pool created against the old node's address
         // could be inserted into the new node's namespace.
-        let still_same = self.pools.load().get(node_id)
+        let still_same = self
+            .pools
+            .load()
+            .get(node_id)
             .is_some_and(|p| Arc::as_ptr(p) as *const () as usize == base_pool_ptr);
         if !still_same {
             pool_arc.drain();
-            self.pending_pool_creates
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // Guard drops here, decrementing the counter.
             return None;
         }
 
         // No existing entry — insert ours.
-        pools.insert(key, UserPoolEntry {
-            pool: Arc::clone(&pool_arc),
-            last_access: now,
-            password_hash: pw_hash,
-            replace_cooldown_until: now + POOL_REPLACE_COOLDOWN,
-        });
-        self.pending_pool_creates
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        pools.insert(
+            key,
+            UserPoolEntry {
+                pool: Arc::clone(&pool_arc),
+                last_access: now,
+                password_hash: pw_hash,
+                replace_cooldown_until: now + POOL_REPLACE_COOLDOWN,
+            },
+        );
+        // Guard drops here, decrementing the counter. The counter only
+        // tracks in-flight creations, not inserted pools.
+        drop(_pool_guard);
         Some(pool_arc)
     }
 
@@ -618,7 +680,8 @@ impl PoolManager for InMemoryPoolManager {
         // prefix match as a best-effort for backward compatibility.
         if extra_params.is_empty() {
             let prefix = format!("{}\0{}\0{}\0", node_id, username, db);
-            return pools.iter()
+            return pools
+                .iter()
                 .find(|(k, _)| k.starts_with(&prefix))
                 .map(|(_, entry)| Arc::clone(&entry.pool));
         }
@@ -694,7 +757,8 @@ pub fn emit_pool_metrics(snapshot: &[BackendNodeSnapshot], max_pool_size: u32) {
     for node in snapshot {
         metrics::gauge!("trident_pool_active_connections", "node_id" => node.node_id.clone())
             .set(node.active_connections as f64);
-        metrics::gauge!("trident_pool_max_size", "node_id" => node.node_id.clone()).set(max_pool_size as f64);
+        metrics::gauge!("trident_pool_max_size", "node_id" => node.node_id.clone())
+            .set(max_pool_size as f64);
         if let Some(lag_ms) = node.replication_lag_ms {
             metrics::gauge!("trident_node_replication_lag_ms", "node_id" => node.node_id.clone())
                 .set(lag_ms as f64);

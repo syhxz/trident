@@ -250,7 +250,8 @@ impl ProxyServer {
 
             active_clients.fetch_add(1, Ordering::SeqCst);
             metrics::counter!("trident_connections_accepted_total").increment(1);
-            metrics::gauge!("trident_active_connections").set(active_clients.load(Ordering::SeqCst) as f64);
+            metrics::gauge!("trident_active_connections")
+                .set(active_clients.load(Ordering::SeqCst) as f64);
 
             // Per-client-IP accounting (see `proxy::client_stats`). Only
             // the IP is tracked, not the port, since the port is
@@ -339,11 +340,18 @@ where
         };
 
         let client_stream = if let Some(dl) = deadline {
-            tokio::time::timeout_at(dl, negotiate_client_tls(stream, deps.tls_acceptor.as_deref()))
-                .await
-                .map_err(|_| crate::proxy::error::ProxyError::Protocol(
-                    crate::protocol::ProtocolError::Malformed("startup timeout exceeded during TLS negotiation".into())
-                ))??
+            tokio::time::timeout_at(
+                dl,
+                negotiate_client_tls(stream, deps.tls_acceptor.as_deref()),
+            )
+            .await
+            .map_err(|_| {
+                crate::proxy::error::ProxyError::Protocol(
+                    crate::protocol::ProtocolError::Malformed(
+                        "startup timeout exceeded during TLS negotiation".into(),
+                    ),
+                )
+            })??
         } else {
             negotiate_client_tls(stream, deps.tls_acceptor.as_deref()).await?
         };
@@ -395,12 +403,15 @@ where
         // - Writes are buffered: multiple small responses (RowDescription +
         //   DataRow(s) + CommandComplete + ReadyForQuery) are coalesced
         //   into fewer TCP segments. Flushed at each ReadyForQuery boundary.
-        let buffered_stream = BufReader::with_capacity(
-            8 * 1024,
-            BufWriter::with_capacity(32 * 1024, client_stream),
-        );
+        let buffered_stream =
+            BufReader::with_capacity(8 * 1024, BufWriter::with_capacity(32 * 1024, client_stream));
         handler
-            .handle(buffered_stream, &mut startup_handler, session_id, default_consistency)
+            .handle(
+                buffered_stream,
+                &mut startup_handler,
+                session_id,
+                default_consistency,
+            )
             .await
     })
 }
@@ -430,9 +441,10 @@ async fn negotiate_client_tls(
     // bytes on the first peek despite a valid SSLRequest being in flight.
     let mut peek_buf = [0u8; 8];
     loop {
-        let n = stream.peek(&mut peek_buf).await.map_err(|e| {
-            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-        })?;
+        let n = stream
+            .peek(&mut peek_buf)
+            .await
+            .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
         if n == 0 {
             // EOF before any complete message — plain stream, let handler
             // deal with the closed connection.
@@ -460,19 +472,22 @@ async fn negotiate_client_tls(
     if length == 8 && code == GSSENC_REQUEST_CODE {
         // Consume the GSSENCRequest
         let mut discard = [0u8; 8];
-        stream.read_exact(&mut discard).await.map_err(|e| {
-            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-        })?;
+        stream
+            .read_exact(&mut discard)
+            .await
+            .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
         // Respond 'N' (GSSENC not supported)
-        stream.write_all(b"N").await.map_err(|e| {
-            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-        })?;
+        stream
+            .write_all(b"N")
+            .await
+            .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
 
         // Now peek again for the next request (SSLRequest or StartupMessage)
         loop {
-            let n = stream.peek(&mut peek_buf).await.map_err(|e| {
-                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-            })?;
+            let n = stream
+                .peek(&mut peek_buf)
+                .await
+                .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
             if n == 0 {
                 return Ok(ClientStream::Plain(stream));
             }
@@ -488,23 +503,27 @@ async fn negotiate_client_tls(
         if length == 8 && code == SSL_REQUEST_CODE {
             // Consume the SSLRequest
             let mut discard = [0u8; 8];
-            stream.read_exact(&mut discard).await.map_err(|e| {
-                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-            })?;
+            stream
+                .read_exact(&mut discard)
+                .await
+                .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
 
             if let Some(acceptor) = tls_acceptor {
-                stream.write_all(b"S").await.map_err(|e| {
-                    crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-                })?;
-                let tls_stream = acceptor.accept(stream).await.map_err(|e| {
-                    crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-                })?;
+                stream
+                    .write_all(b"S")
+                    .await
+                    .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
+                let tls_stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
                 metrics::counter!("trident_client_tls_connections_total").increment(1);
                 return Ok(ClientStream::Tls(Box::new(tls_stream)));
             } else {
-                stream.write_all(b"N").await.map_err(|e| {
-                    crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-                })?;
+                stream
+                    .write_all(b"N")
+                    .await
+                    .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
                 return Ok(ClientStream::Plain(stream));
             }
         }
@@ -515,27 +534,31 @@ async fn negotiate_client_tls(
     if length == 8 && code == SSL_REQUEST_CODE {
         // Consume the SSLRequest from the stream (we only peeked above)
         let mut discard = [0u8; 8];
-        stream.read_exact(&mut discard).await.map_err(|e| {
-            crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-        })?;
+        stream
+            .read_exact(&mut discard)
+            .await
+            .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
 
         if let Some(acceptor) = tls_acceptor {
             // Accept TLS
-            stream.write_all(b"S").await.map_err(|e| {
-                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-            })?;
+            stream
+                .write_all(b"S")
+                .await
+                .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
 
-            let tls_stream = acceptor.accept(stream).await.map_err(|e| {
-                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-            })?;
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
 
             metrics::counter!("trident_client_tls_connections_total").increment(1);
             Ok(ClientStream::Tls(Box::new(tls_stream)))
         } else {
             // No TLS configured: reject
-            stream.write_all(b"N").await.map_err(|e| {
-                crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e))
-            })?;
+            stream
+                .write_all(b"N")
+                .await
+                .map_err(|e| crate::proxy::error::ProxyError::Protocol(ProtocolError::Io(e)))?;
             Ok(ClientStream::Plain(stream))
         }
     } else {

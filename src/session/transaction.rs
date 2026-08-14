@@ -472,9 +472,7 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_begin_options(
-                "start   transaction read only, isolation level repeatable read;"
-            ),
+            parse_begin_options("start   transaction read only, isolation level repeatable read;"),
             Some(BeginOptions {
                 isolation: IsolationLevel::RepeatableRead,
                 read_only: true,

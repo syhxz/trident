@@ -643,16 +643,14 @@ impl AppConfig {
         // Warn loudly unless the proxy is listening on a local-only interface.
         // This is a warning rather than a hard error because VPC/security-group
         // protected environments may intentionally run without client TLS.
-        if self.proxy.client_auth == ClientAuthMode::Passthrough
-            && self.proxy.tls_cert.is_none()
-        {
-            let listen_host = self.proxy.listen_addr.rsplit_once(':')
+        if self.proxy.client_auth == ClientAuthMode::Passthrough && self.proxy.tls_cert.is_none() {
+            let listen_host = self
+                .proxy
+                .listen_addr
+                .rsplit_once(':')
                 .map(|(h, _)| h)
                 .unwrap_or(&self.proxy.listen_addr);
-            let is_local = matches!(
-                listen_host,
-                "127.0.0.1" | "::1" | "localhost"
-            );
+            let is_local = matches!(listen_host, "127.0.0.1" | "::1" | "localhost");
             if !is_local {
                 tracing::warn!(
                     "client_auth 'passthrough' is configured WITHOUT client-facing TLS on a \
@@ -692,7 +690,8 @@ impl AppConfig {
         if let Some(ref token) = self.admin.auth_token {
             if token.is_empty() {
                 return Err(ConfigError::Validation(
-                    "admin.auth_token must not be an empty string; omit the field to disable auth".to_string(),
+                    "admin.auth_token must not be an empty string; omit the field to disable auth"
+                        .to_string(),
                 ));
             }
         }

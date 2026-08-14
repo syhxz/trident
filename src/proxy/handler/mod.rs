@@ -13,19 +13,19 @@
 //! never brings down the rest of the proxy (Requirements 11.1, 11.2, 13.1,
 //! 13.4, 13.5).
 
-mod helpers;
 mod extended_query;
+mod helpers;
 mod simple_query;
 
 use helpers::{
-    known_node_ids, sanitize_application_name,
-    send_error_response, send_pg_error_response, send_ready_for_query, send_startup_success,
+    known_node_ids, sanitize_application_name, send_error_response, send_pg_error_response,
+    send_ready_for_query, send_startup_success,
 };
 // Re-exported for `mod tests` (via `use super::*`).
 #[cfg(test)]
 use helpers::{
-    aurora_consistency_sql, ensure_application_name, execute_internal_query,
-    pipeline_safe_sql, query_has_write_intent,
+    aurora_consistency_sql, ensure_application_name, execute_internal_query, pipeline_safe_sql,
+    query_has_write_intent,
 };
 
 use std::collections::HashMap;
@@ -40,9 +40,9 @@ use crate::parser::hint::HintParser;
 use crate::pool::conn::BackendConnection;
 use crate::pool::manager::PoolManager;
 use crate::pool::pool::ConnectionPool;
-use crate::protocol::message::{FrontendMessage, PgError};
 #[cfg(test)]
 use crate::protocol::message::{BackendMessage, TransactionStatus};
+use crate::protocol::message::{FrontendMessage, PgError};
 use crate::protocol::reader::{frontend_tag, parse_frontend_body, read_tagged_frame};
 use crate::protocol::startup::{read_startup_packet, StartupHandler, StartupPacket};
 #[cfg(test)]
@@ -181,13 +181,18 @@ struct OwnedConn {
 
 impl OwnedConn {
     fn new(conn: BackendConnection, pool: Option<Arc<dyn ConnectionPool>>) -> Self {
-        OwnedConn { inner: Some(conn), pool }
+        OwnedConn {
+            inner: Some(conn),
+            pool,
+        }
     }
 
     /// Extracts the connection, disarming the Drop guard. The caller is
     /// responsible for returning/discarding the connection to the pool.
     fn take(&mut self) -> BackendConnection {
-        self.inner.take().expect("OwnedConn::take called on empty slot")
+        self.inner
+            .take()
+            .expect("OwnedConn::take called on empty slot")
     }
 }
 
@@ -200,7 +205,9 @@ impl std::ops::Deref for OwnedConn {
 
 impl std::ops::DerefMut for OwnedConn {
     fn deref_mut(&mut self) -> &mut BackendConnection {
-        self.inner.as_mut().expect("OwnedConn deref_mut on empty slot")
+        self.inner
+            .as_mut()
+            .expect("OwnedConn deref_mut on empty slot")
     }
 }
 
@@ -367,14 +374,10 @@ impl ClientSession {
         node_id: &str,
         current_generation: Option<u64>,
     ) -> Option<HeldBackend> {
-        if self
-            .cached_idle_backend
-            .as_ref()
-            .is_some_and(|h| {
-                h.conn.node_id == node_id
-                    && current_generation.is_none_or(|gen| h.conn.generation >= gen)
-            })
-        {
+        if self.cached_idle_backend.as_ref().is_some_and(|h| {
+            h.conn.node_id == node_id
+                && current_generation.is_none_or(|gen| h.conn.generation >= gen)
+        }) {
             self.cached_idle_backend.take()
         } else {
             None
@@ -694,10 +697,7 @@ where
     /// `forward_extended_on_held_backend` error paths where the connection
     /// is owned via `session.held_backend`. Clears cancel registry and
     /// releases the pool slot.
-    fn discard_held_backend(
-        &self,
-        session: &mut ClientSession,
-    ) {
+    fn discard_held_backend(&self, session: &mut ClientSession) {
         self.cancel_registry.clear_active(&session.state.id);
         if let Some(mut held) = session.held_backend.take() {
             let pool = held
@@ -847,30 +847,35 @@ where
                                     // Infrastructure errors should not appear
                                     // as authentication failures to the client.
                                     let (code, msg) = match &pool_err {
-                                        crate::pool::pool::PoolError::Exhausted(_) => (
-                                            "53300",
-                                            "too many connections".to_string(),
-                                        ),
-                                        crate::pool::pool::PoolError::AcquireTimeout { .. } => (
-                                            "53300",
-                                            "connection pool acquire timeout".to_string(),
-                                        ),
-                                        crate::pool::pool::PoolError::ConnectTimeout { .. } => (
-                                            "08006",
-                                            "backend connection timeout".to_string(),
-                                        ),
+                                        crate::pool::pool::PoolError::Exhausted(_) => {
+                                            ("53300", "too many connections".to_string())
+                                        }
+                                        crate::pool::pool::PoolError::AcquireTimeout { .. } => {
+                                            ("53300", "connection pool acquire timeout".to_string())
+                                        }
+                                        crate::pool::pool::PoolError::ConnectTimeout { .. } => {
+                                            ("08006", "backend connection timeout".to_string())
+                                        }
                                         crate::pool::pool::PoolError::ConnectFailed(detail) => {
                                             // ConnectFailed wraps backend auth errors
                                             // (e.g. "password authentication failed")
                                             // as well as TCP errors. Check if it looks
                                             // like an auth error.
-                                            if detail.contains("28P01") || detail.contains("authentication failed") {
+                                            if detail.contains("28P01")
+                                                || detail.contains("authentication failed")
+                                            {
                                                 ("28P01", format!(
                                                     "password authentication failed for user \"{}\"",
                                                     creds.username
                                                 ))
                                             } else {
-                                                ("08006", format!("backend connection failed: {}", detail))
+                                                (
+                                                    "08006",
+                                                    format!(
+                                                        "backend connection failed: {}",
+                                                        detail
+                                                    ),
+                                                )
                                             }
                                         }
                                         _ => (
@@ -1142,7 +1147,10 @@ where
         // Post-connect verification: re-check that the session still has an
         // active query on this backend_pid. The TCP connect may have taken
         // time during which the connection was returned to the pool.
-        if !self.cancel_registry.verify_cancel_target(&session_id, real_backend_pid, generation) {
+        if !self
+            .cancel_registry
+            .verify_cancel_target(&session_id, real_backend_pid, generation)
+        {
             metrics::counter!("trident_cancel_requests_total", "outcome" => "stale").increment(1);
             tracing::debug!(
                 session_id = %session_id,
@@ -1276,7 +1284,8 @@ where
                             // ErrorResponse (which was relayed to the
                             // client), do NOT send a second proxy-generated
                             // error. Only send ReadyForQuery.
-                            let already_relayed = matches!(&e, ProxyError::BackendErrorAlreadyRelayed(_));
+                            let already_relayed =
+                                matches!(&e, ProxyError::BackendErrorAlreadyRelayed(_));
                             if !already_relayed {
                                 send_error_response(client_stream, &e).await?;
                             }
@@ -1386,9 +1395,7 @@ where
         }
         session.state.tx_state = TxState::Failed;
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1396,8 +1403,8 @@ mod tests {
     use crate::balancer::WeightedRoundRobin;
     use crate::config::{LsnTrackingConfig, LsnTrackingMode, PipelineLsnConfig, PoolMode};
     use crate::health::BackendNodeSnapshot;
-    use crate::parser::classifier::KeywordClassifier as Classifier_;
     use crate::parser::classifier::requires_writer;
+    use crate::parser::classifier::KeywordClassifier as Classifier_;
     use crate::parser::hint::RegexHintParser as HintParser_;
     use crate::parser::pattern::RegexPatternMatcher;
     use crate::pool::conn::{BackendConnection, MaybeTlsStream, PooledConnection};
@@ -3265,6 +3272,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_upgrade_subsequent_statements_use_held_writer() {
+        // Regression test for the "SET application_name ended with
+        // transaction status InTransaction, expected Idle" bug.
+        //
+        // After a Reader→Writer upgrade (e.g. BEGIN; SELECT; INSERT),
+        // subsequent statements in the same transaction must route through
+        // the `forward_on_held_backend` fast path. Previously,
+        // `need_upgrade` remained `true` after the upgrade, causing the
+        // next statement to re-enter the main routing pipeline with a
+        // hardcoded `ensure_application_name(..., Idle)` expectation on an
+        // InTransaction connection.
+        use tokio::io::duplex;
+
+        let (mut client_side, mut handler_side) = duplex(8192);
+        let router = make_router();
+        let pool_manager = make_split_pool_manager();
+        let lsn_tracker = InMemoryLsnTracker::new();
+        let cancel_registry = CancelRegistry::new();
+        let node_addresses = HashMap::new();
+        let handler = ConnectionHandler::new(
+            &router,
+            &pool_manager,
+            &lsn_tracker,
+            &cancel_registry,
+            &node_addresses,
+        );
+        let mut session = ClientSession::new("upgrade-followup", ConsistencyLevel::Eventual);
+
+        // Step 1: BEGIN (delayed, no backend)
+        let begin = handler.handle_simple_query(&mut handler_side, &mut session, "BEGIN");
+        let drain = async {
+            for _ in 0..2 {
+                crate::protocol::reader::read_backend_message(&mut client_side)
+                    .await
+                    .unwrap();
+            }
+        };
+        let (r, ()) = tokio::join!(begin, drain);
+        r.unwrap();
+        assert_eq!(session.state.tx_state, TxState::InTransaction);
+
+        // Step 2: SELECT routes to Reader
+        let select = handler.handle_simple_query(&mut handler_side, &mut session, "SELECT 1");
+        let drain = async {
+            for _ in 0..4 {
+                crate::protocol::reader::read_backend_message(&mut client_side)
+                    .await
+                    .unwrap();
+            }
+        };
+        let (r, ()) = tokio::join!(select, drain);
+        r.unwrap();
+        assert_eq!(
+            session.held_backend.as_ref().unwrap().conn.node_id,
+            "reader-1"
+        );
+        assert!(session.state.tx_split.as_ref().unwrap().on_reader);
+
+        // Step 3: UPDATE triggers upgrade to Writer
+        let update =
+            handler.handle_simple_query(&mut handler_side, &mut session, "UPDATE t SET x = 1");
+        let drain = async {
+            for _ in 0..2 {
+                crate::protocol::reader::read_backend_message(&mut client_side)
+                    .await
+                    .unwrap();
+            }
+        };
+        let (r, ()) = tokio::join!(update, drain);
+        r.unwrap();
+        assert_eq!(
+            session.held_backend.as_ref().unwrap().conn.node_id,
+            "primary"
+        );
+        let split = session.state.tx_split.as_ref().unwrap();
+        assert!(!split.on_reader, "after upgrade, must be on Writer");
+        assert!(!split.need_upgrade, "need_upgrade must be cleared after successful upgrade");
+
+        // Step 4: Another write — must succeed via forward_on_held_backend
+        // (this was the failing case before the fix)
+        let insert =
+            handler.handle_simple_query(&mut handler_side, &mut session, "INSERT INTO t VALUES(1)");
+        let drain = async {
+            for _ in 0..2 {
+                crate::protocol::reader::read_backend_message(&mut client_side)
+                    .await
+                    .unwrap();
+            }
+        };
+        let (r, ()) = tokio::join!(insert, drain);
+        r.unwrap();
+        assert_eq!(session.state.tx_state, TxState::InTransaction);
+        assert_eq!(
+            session.held_backend.as_ref().unwrap().conn.node_id,
+            "primary",
+            "subsequent statement must reuse the held Writer"
+        );
+
+        // Step 5: COMMIT
+        let commit = handler.handle_simple_query(&mut handler_side, &mut session, "COMMIT");
+        let drain = async {
+            for _ in 0..2 {
+                crate::protocol::reader::read_backend_message(&mut client_side)
+                    .await
+                    .unwrap();
+            }
+        };
+        let (r, ()) = tokio::join!(commit, drain);
+        r.unwrap();
+        assert_eq!(session.state.tx_state, TxState::Idle);
+        assert!(session.held_backend.is_none());
+    }
+
+    #[tokio::test]
     async fn pending_split_transaction_can_rollback_without_backend() {
         use tokio::io::duplex;
 
@@ -3834,10 +3955,7 @@ mod tests {
         body.extend_from_slice(b"my_portal\0");
         body.extend_from_slice(b"my_stmt\0");
         body.extend_from_slice(&[0, 0, 0, 0]); // param format codes etc.
-        let bind_frame = ExtendedFrame {
-            tag: b'B',
-            body,
-        };
+        let bind_frame = ExtendedFrame { tag: b'B', body };
         assert_eq!(bind_frame.bind_portal(), Some("my_portal"));
         assert_eq!(bind_frame.bind_statement(), Some("my_stmt"));
 
@@ -3845,10 +3963,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(b"my_portal\0");
         body.extend_from_slice(&0i32.to_be_bytes());
-        let exec_frame = ExtendedFrame {
-            tag: b'E',
-            body,
-        };
+        let exec_frame = ExtendedFrame { tag: b'E', body };
         assert_eq!(exec_frame.execute_portal(), Some("my_portal"));
     }
 
@@ -3858,10 +3973,7 @@ mod tests {
     fn extended_frame_unnamed_statement_and_portal() {
         // Bind("", "") — two null-terminated empty strings
         let body = vec![0u8, 0, 0, 0, 0, 0]; // \0 + \0 + padding
-        let bind_frame = ExtendedFrame {
-            tag: b'B',
-            body,
-        };
+        let bind_frame = ExtendedFrame { tag: b'B', body };
         assert_eq!(bind_frame.bind_portal(), Some(""));
         assert_eq!(bind_frame.bind_statement(), Some(""));
     }
@@ -3875,14 +3987,20 @@ mod tests {
         parse_body.extend_from_slice(b"set_stmt\0");
         parse_body.extend_from_slice(b"SET trident.consistency='global'\0");
         parse_body.extend_from_slice(&0i16.to_be_bytes()); // num params
-        let parse_frame = ExtendedFrame { tag: b'P', body: parse_body };
+        let parse_frame = ExtendedFrame {
+            tag: b'P',
+            body: parse_body,
+        };
 
         // Bind("p", "other_stmt") — binds portal "p" to statement "other_stmt"
         let mut bind_body = Vec::new();
         bind_body.extend_from_slice(b"p\0");
         bind_body.extend_from_slice(b"other_stmt\0");
         bind_body.extend_from_slice(&[0; 8]);
-        let bind_frame = ExtendedFrame { tag: b'B', body: bind_body };
+        let bind_frame = ExtendedFrame {
+            tag: b'B',
+            body: bind_body,
+        };
 
         let set_stmt_name = parse_frame.parse_name().unwrap();
         assert_eq!(set_stmt_name, "set_stmt");
@@ -3911,7 +4029,10 @@ mod tests {
         session.state.tx_state = TxState::Failed;
 
         // Simulate Parse("rb_stmt", "ROLLBACK") recording
-        session.state.prepared_stmts.insert("rb_stmt".to_string(), "ROLLBACK".to_string());
+        session
+            .state
+            .prepared_stmts
+            .insert("rb_stmt".to_string(), "ROLLBACK".to_string());
 
         // Verify lookup works
         let cached = session.state.prepared_stmts.get("rb_stmt").unwrap();
@@ -3926,7 +4047,7 @@ mod tests {
     #[test]
     fn bug6_force_writer_hint_does_not_imply_write() {
         use crate::parser::hint::{HintParser, RouteHint};
-        let hint_parser = HintParser_::default();
+        let hint_parser = HintParser_;
 
         // ForceWriter hint
         let sql = "/*+ ROUTE_TO_WRITER */ SELECT 1";
@@ -3977,7 +4098,10 @@ mod tests {
         for i in 0..10 {
             registry.mark_active("session-a", "writer", i, 999);
             let (_, _, _, _, gen) = registry.resolve_cancel_target(1, 2).unwrap();
-            assert!(gen >= last_gen, "generation must be monotonically increasing");
+            assert!(
+                gen >= last_gen,
+                "generation must be monotonically increasing"
+            );
             last_gen = gen;
             registry.clear_active("session-a");
         }
@@ -3993,8 +4117,15 @@ proxy:
   typo_field: true
 "#;
         let result: Result<crate::config::ProxyConfig, _> = serde_yaml::from_str(yaml);
-        assert!(result.is_err(), "deny_unknown_fields must reject unknown keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject unknown keys"
+        );
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown field"), "error should mention unknown field: {}", err);
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field: {}",
+            err
+        );
     }
 }
