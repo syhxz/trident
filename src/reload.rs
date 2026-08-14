@@ -122,7 +122,7 @@ pub async fn watch_sighup(
             None
         };
         match reload_from_file(&path, target.as_ref()).await {
-            Ok(()) => tracing::info!("routing configuration reloaded successfully"),
+            Ok(()) => tracing::info!(audit = "reload", source = "SIGHUP", config_path = %path, "routing configuration reloaded successfully"),
             Err(e) => {
                 tracing::warn!(error = %e, "routing configuration reload failed; keeping previous configuration")
             }

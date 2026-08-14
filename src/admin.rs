@@ -555,8 +555,18 @@ async fn reload_handler(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     // FIX (Bug 5a): Serialize with config PUT operations.
     let _config_guard = state.config_write_lock.lock().await;
 
+    let before = state.routing_config.load();
     match reload_from_file(path, target.as_ref()).await {
         Ok(()) => {
+            let after = state.routing_config.load();
+            tracing::info!(
+                audit = "reload",
+                source = "POST /api/reload",
+                config_path = %path,
+                old = ?before.as_ref(),
+                new = ?after.as_ref(),
+                "configuration reloaded from file via Admin API"
+            );
             // Note: target.apply() (called inside reload_from_file) already
             // updates the admin routing_config snapshot atomically under its
             // reload_lock. No additional store is needed here.
@@ -627,6 +637,12 @@ async fn set_custom_rule_handler(
     // FIX (reload race): Serialize with config PUT/reload to prevent
     // concurrent replace_all from overwriting this individual rule change.
     let _config_guard = state.config_write_lock.lock().await;
+    tracing::info!(
+        audit = "custom_rule_set",
+        name = %body.name, rule_type = ?body.rule_type, rw_mode = ?body.rw_mode,
+        source = "POST /api/custom-rules",
+        "custom routing rule added/updated"
+    );
     rules.set_rule(&body.name, body.rule_type, body.rw_mode);
     (
         StatusCode::OK,
@@ -644,6 +660,12 @@ async fn delete_custom_rule_handler(
     };
     // FIX (reload race): Serialize with config PUT/reload.
     let _config_guard = state.config_write_lock.lock().await;
+    tracing::info!(
+        audit = "custom_rule_delete",
+        name = %body.name, rule_type = ?body.rule_type,
+        source = "DELETE /api/custom-rules",
+        "custom routing rule removed"
+    );
     rules.remove_rule(&body.name, body.rule_type);
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
@@ -1203,6 +1225,72 @@ async fn config_put_handler(
 
     match target.apply(&new_routing) {
         Ok(()) => {
+            // --- Audit log: record what changed via Admin API PUT /api/config ---
+            let old = current.as_ref();
+            if old.default_consistency != new_routing.default_consistency {
+                tracing::info!(
+                    audit = "config_change", field = "default_consistency",
+                    old = ?old.default_consistency, new = ?new_routing.default_consistency,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if old.enable_transaction_split != new_routing.enable_transaction_split {
+                tracing::info!(
+                    audit = "config_change", field = "enable_transaction_split",
+                    old = old.enable_transaction_split, new = new_routing.enable_transaction_split,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if old.split_respects_consistency != new_routing.split_respects_consistency {
+                tracing::info!(
+                    audit = "config_change", field = "split_respects_consistency",
+                    old = old.split_respects_consistency, new = new_routing.split_respects_consistency,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if old.enable_hint_routing != new_routing.enable_hint_routing {
+                tracing::info!(
+                    audit = "config_change", field = "enable_hint_routing",
+                    old = old.enable_hint_routing, new = new_routing.enable_hint_routing,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if old.enable_cost_routing != new_routing.enable_cost_routing {
+                tracing::info!(
+                    audit = "config_change", field = "enable_cost_routing",
+                    old = old.enable_cost_routing, new = new_routing.enable_cost_routing,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if (old.cost_threshold - new_routing.cost_threshold).abs() > f64::EPSILON {
+                tracing::info!(
+                    audit = "config_change", field = "cost_threshold",
+                    old = old.cost_threshold, new = new_routing.cost_threshold,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if old.writer_readable != new_routing.writer_readable {
+                tracing::info!(
+                    audit = "config_change", field = "writer_readable",
+                    old = old.writer_readable, new = new_routing.writer_readable,
+                    source = "PUT /api/config",
+                    "routing config changed"
+                );
+            }
+            if let Some(ms) = pending_health_interval_ms {
+                tracing::info!(
+                    audit = "config_change", field = "health_check_interval_ms",
+                    new_ms = ms, source = "PUT /api/config",
+                    "health check interval changed"
+                );
+            }
+
             // Apply health interval only after routing config succeeds.
             if let Some(ms) = pending_health_interval_ms {
                 if let Some(ref setter) = state.set_check_interval_fn {

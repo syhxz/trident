@@ -144,7 +144,7 @@ pub struct RoutingContext<'a> {
 /// none of them affect the shape of any long-lived resource (TCP listener,
 /// connection pool, backend socket) -- they only change how the *next*
 /// routing decision is made.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RouterSettings {
     pub enable_transaction_split: bool,
     pub split_respects_consistency: bool,

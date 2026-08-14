@@ -70,6 +70,10 @@ impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
         // Serialize concurrent reloads so updates are not interleaved.
         let _guard = self.reload_lock.lock().unwrap_or_else(|e| e.into_inner());
 
+        // --- Audit: capture previous state for diff logging ---
+        let prev_settings = self.router.settings();
+        let prev_consistency = self.default_consistency.load();
+
         // Apply the pattern set first: if it fails to compile (should not
         // happen, since `AppConfig::validate` already checked it), leave
         // the patterns, custom rules, settings, and consistency all
@@ -94,6 +98,32 @@ impl trident::reload::RoutingReloadTarget for RouterReloadTarget {
 
         self.default_consistency
             .store(Arc::new(routing.default_consistency));
+
+        // --- Audit: log a summary of what actually changed ---
+        let new_settings = RouterSettings {
+            enable_transaction_split: routing.enable_transaction_split,
+            split_respects_consistency: routing.split_respects_consistency,
+            enable_hint_routing: routing.enable_hint_routing,
+            enable_cost_routing: routing.enable_cost_routing,
+            cost_threshold: routing.cost_threshold,
+            writer_readable: routing.writer_readable,
+        };
+        if prev_settings != new_settings || **prev_consistency != routing.default_consistency {
+            tracing::info!(
+                audit = "routing_apply",
+                old_consistency = ?*prev_consistency,
+                new_consistency = ?routing.default_consistency,
+                old_settings = ?prev_settings,
+                new_settings = ?new_settings,
+                custom_rules_count = routing.custom_rules.len(),
+                "routing configuration applied (diff detected)"
+            );
+        } else {
+            tracing::info!(
+                audit = "routing_apply",
+                "routing configuration applied (no effective change)"
+            );
+        }
 
         // Sync the admin console's config snapshot so /api/config shows
         // the reloaded values regardless of whether the reload was
