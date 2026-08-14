@@ -6,120 +6,284 @@
 <title>Trident Console</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
-:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#e2e8f0;--muted:#94a3b8;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--yellow:#eab308;--orange:#f97316}
+:root{
+  --bg:#0a0f1a;
+  --bg-elevated:#111827;
+  --card:#1a2332;
+  --card-hover:#1f2b3d;
+  --border:#2a3a4e;
+  --border-subtle:#1e2d3f;
+  --text:#f1f5f9;
+  --text-secondary:#cbd5e1;
+  --muted:#64748b;
+  --accent:#6366f1;
+  --accent-hover:#818cf8;
+  --accent-glow:rgba(99,102,241,0.15);
+  --green:#10b981;
+  --green-bg:rgba(16,185,129,0.1);
+  --red:#ef4444;
+  --red-bg:rgba(239,68,68,0.1);
+  --yellow:#f59e0b;
+  --yellow-bg:rgba(245,158,11,0.1);
+  --orange:#f97316;
+  --purple:#a78bfa;
+  --purple-bg:rgba(167,139,250,0.1);
+  --radius:12px;
+  --radius-sm:8px;
+  --radius-xs:6px;
+  --shadow:0 4px 24px rgba(0,0,0,0.3);
+  --shadow-sm:0 2px 8px rgba(0,0,0,0.2);
+  --transition:all 0.2s cubic-bezier(0.4,0,0.2,1);
+}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);display:flex;min-height:100vh}
+body{font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);display:flex;min-height:100vh;-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--muted)}
 
 /* Sidebar */
-.sidebar{width:220px;background:var(--card);border-right:1px solid var(--border);padding:1rem 0;display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto}
-.sidebar .logo{padding:0 1rem 1.5rem;font-size:1.25rem;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);margin-bottom:0.5rem}
-.sidebar .nav-group{padding:0.5rem 0}
-.sidebar .nav-group-title{padding:0.25rem 1rem;font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted)}
-.sidebar .nav-item{display:block;padding:0.5rem 1rem;cursor:pointer;transition:background 0.15s;font-size:0.875rem}
-.sidebar .nav-item:hover{background:rgba(59,130,246,0.1)}
-.sidebar .nav-item.active{background:rgba(59,130,246,0.15);color:var(--accent);border-left:3px solid var(--accent)}
+.sidebar{
+  width:240px;background:var(--bg-elevated);border-right:1px solid var(--border-subtle);
+  display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto;z-index:100;
+  transition:transform 0.3s ease;
+}
+.sidebar .logo{
+  padding:1.25rem 1.25rem 1rem;display:flex;align-items:center;gap:0.6rem;
+  border-bottom:1px solid var(--border-subtle);margin-bottom:0.75rem;
+}
+.sidebar .logo svg{width:28px;height:28px}
+.sidebar .logo span{font-size:1.2rem;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sidebar .nav-group{padding:0.4rem 0}
+.sidebar .nav-group-title{
+  padding:0.4rem 1.25rem;font-size:0.65rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);
+}
+.sidebar .nav-item{
+  display:flex;align-items:center;gap:0.6rem;
+  padding:0.55rem 1.25rem;cursor:pointer;transition:var(--transition);
+  font-size:0.85rem;color:var(--text-secondary);border-left:3px solid transparent;
+  margin:1px 0;
+}
+.sidebar .nav-item:hover{background:var(--accent-glow);color:var(--text)}
+.sidebar .nav-item.active{
+  background:var(--accent-glow);color:var(--accent);
+  border-left-color:var(--accent);font-weight:500;
+}
+.sidebar .nav-item svg{width:16px;height:16px;opacity:0.7;flex-shrink:0}
+.sidebar .nav-item.active svg{opacity:1}
 
 /* Main */
-.main{margin-left:220px;flex:1;padding:1.5rem;overflow-y:auto;min-height:100vh}
-.page{display:none}
+.main{margin-left:240px;flex:1;padding:2rem;overflow-y:auto;min-height:100vh;background:var(--bg)}
+.page{display:none;animation:fadeUp 0.25s ease}
 .page.active{display:block}
-.page-title{font-size:1.5rem;font-weight:600;margin-bottom:1.25rem}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem}
+.page-title{font-size:1.5rem;font-weight:700;letter-spacing:-0.02em}
+.page-subtitle{font-size:0.85rem;color:var(--muted);margin-top:0.25rem}
 
 /* Cards */
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem}
-.stat-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1rem}
-.stat-card .label{font-size:0.75rem;color:var(--muted);text-transform:uppercase;margin-bottom:0.25rem}
-.stat-card .value{font-size:1.75rem;font-weight:700}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0.875rem;margin-bottom:1.75rem}
+.stat-card{
+  background:var(--card);border:1px solid var(--border-subtle);border-radius:var(--radius);
+  padding:1.1rem 1.25rem;transition:var(--transition);position:relative;overflow:hidden;
+}
+.stat-card:hover{background:var(--card-hover);border-color:var(--border);transform:translateY(-1px);box-shadow:var(--shadow-sm)}
+.stat-card .label{font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:0.4rem;font-weight:500}
+.stat-card .value{font-size:1.6rem;font-weight:700;letter-spacing:-0.02em}
 .stat-card .value.green{color:var(--green)}
 .stat-card .value.red{color:var(--red)}
+.stat-card .value.accent{color:var(--accent)}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:var(--radius) var(--radius) 0 0;opacity:0;transition:opacity 0.2s}
+.stat-card:hover::before{opacity:1}
+.stat-card.card-green::before{background:var(--green)}
+.stat-card.card-red::before{background:var(--red)}
+.stat-card.card-accent::before{background:var(--accent)}
 
 /* Tables */
-.table-container{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
-table{width:100%;border-collapse:collapse;font-size:0.85rem}
-th,td{padding:0.6rem 0.75rem;text-align:left;border-bottom:1px solid var(--border)}
-th{background:rgba(0,0,0,0.2);font-weight:600;color:var(--muted);font-size:0.75rem;text-transform:uppercase}
+.table-container{
+  background:var(--card);border:1px solid var(--border-subtle);border-radius:var(--radius);
+  overflow:hidden;box-shadow:var(--shadow-sm);
+}
+table{width:100%;border-collapse:collapse;font-size:0.82rem}
+th,td{padding:0.7rem 1rem;text-align:left;border-bottom:1px solid var(--border-subtle)}
+th{background:rgba(0,0,0,0.25);font-weight:600;color:var(--muted);font-size:0.7rem;text-transform:uppercase;letter-spacing:0.04em}
 tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(99,102,241,0.03)}
 
 /* Status badges */
-.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:600}
-.badge-healthy{background:rgba(34,197,94,0.15);color:var(--green)}
-.badge-unhealthy{background:rgba(239,68,68,0.15);color:var(--red)}
-.badge-writer{background:rgba(239,68,68,0.15);color:var(--red)}
-.badge-reader{background:rgba(34,197,94,0.15);color:var(--green)}
-.badge-analytics{background:rgba(168,85,247,0.15);color:#a855f7}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:0.68rem;font-weight:600;letter-spacing:0.02em}
+.badge::before{content:'';width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.badge-healthy{background:var(--green-bg);color:var(--green)}.badge-healthy::before{background:var(--green)}
+.badge-unhealthy{background:var(--red-bg);color:var(--red)}.badge-unhealthy::before{background:var(--red)}
+.badge-writer{background:var(--red-bg);color:var(--red)}.badge-writer::before{background:var(--red)}
+.badge-reader{background:var(--green-bg);color:var(--green)}.badge-reader::before{background:var(--green)}
+.badge-analytics{background:var(--purple-bg);color:var(--purple)}.badge-analytics::before{background:var(--purple)}
 
 /* Charts */
-.chart-container{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:1.5rem}
-.chart-container canvas{max-height:250px}
+.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.75rem}
+.chart-container{
+  background:var(--card);border:1px solid var(--border-subtle);border-radius:var(--radius);
+  padding:1.25rem;box-shadow:var(--shadow-sm);
+}
+.chart-container h4{font-size:0.8rem;color:var(--muted);font-weight:500;margin-bottom:0.75rem;text-transform:uppercase;letter-spacing:0.03em}
+.chart-container canvas{max-height:220px}
 
-/* Config */
-.config-section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-bottom:1rem}
-.config-section h3{font-size:0.9rem;color:var(--accent);margin-bottom:0.75rem}
-.form-row{display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem;flex-wrap:wrap}
-.form-row label{font-size:0.8rem;color:var(--muted);min-width:160px}
-.form-row input,.form-row select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:0.4rem 0.6rem;border-radius:4px;font-size:0.85rem}
-.form-row input[type=checkbox]{width:auto}
-.btn{padding:0.5rem 1rem;border:none;border-radius:4px;cursor:pointer;font-size:0.85rem;font-weight:500;transition:opacity 0.15s}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{opacity:0.85}
-.btn-danger{background:var(--red);color:#fff}
-.btn-sm{padding:0.3rem 0.6rem;font-size:0.75rem}
-.btn-bar{margin-top:1rem;display:flex;gap:0.5rem}
-.toast{position:fixed;top:1rem;right:1rem;padding:0.75rem 1rem;border-radius:6px;font-size:0.85rem;z-index:9999;animation:fadeIn 0.2s}
+/* Config sections */
+.config-section{
+  background:var(--card);border:1px solid var(--border-subtle);border-radius:var(--radius);
+  padding:1.5rem;margin-bottom:1rem;box-shadow:var(--shadow-sm);
+}
+.config-section h3{font-size:0.9rem;color:var(--accent);margin-bottom:1rem;font-weight:600}
+.form-row{display:flex;align-items:center;gap:0.75rem;margin-bottom:0.65rem;flex-wrap:wrap}
+.form-row label{font-size:0.8rem;color:var(--text-secondary);min-width:180px;font-weight:500}
+.form-row input,.form-row select{
+  background:var(--bg);border:1px solid var(--border);color:var(--text);
+  padding:0.5rem 0.75rem;border-radius:var(--radius-xs);font-size:0.85rem;
+  transition:var(--transition);outline:none;
+}
+.form-row input:focus,.form-row select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.form-row input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:pointer}
+.form-row input:disabled,.form-row select:disabled{opacity:0.5;cursor:not-allowed}
+
+/* Buttons */
+.btn{
+  padding:0.55rem 1.1rem;border:none;border-radius:var(--radius-xs);cursor:pointer;
+  font-size:0.82rem;font-weight:600;transition:var(--transition);
+  display:inline-flex;align-items:center;gap:0.4rem;
+}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(99,102,241,0.25)}
+.btn-primary:hover{background:var(--accent-hover);transform:translateY(-1px);box-shadow:0 4px 12px rgba(99,102,241,0.35)}
+.btn-danger{background:var(--red);color:#fff;box-shadow:0 2px 8px rgba(239,68,68,0.2)}
+.btn-danger:hover{opacity:0.9;transform:translateY(-1px)}
+.btn-ghost{background:transparent;color:var(--text-secondary);border:1px solid var(--border)}
+.btn-ghost:hover{background:var(--card);color:var(--text)}
+.btn-sm{padding:0.35rem 0.7rem;font-size:0.72rem}
+.btn-bar{margin-top:1.25rem;display:flex;gap:0.75rem}
+.btn:active{transform:scale(0.97)}
+
+/* Toast */
+.toast{
+  position:fixed;top:1.25rem;right:1.25rem;padding:0.85rem 1.25rem;border-radius:var(--radius-sm);
+  font-size:0.85rem;font-weight:500;z-index:9999;animation:slideIn 0.3s cubic-bezier(0.4,0,0.2,1);
+  box-shadow:var(--shadow);display:flex;align-items:center;gap:0.5rem;
+}
 .toast-success{background:var(--green);color:#fff}
 .toast-error{background:var(--red);color:#fff}
-@keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
 
 /* Logs */
-.log-container{background:#000;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:"JetBrains Mono",monospace;font-size:0.78rem;height:calc(100vh - 180px);overflow-y:auto;line-height:1.5}
-.log-line{white-space:pre-wrap;word-break:break-all}
-.log-line .ts{color:var(--muted)}
+.log-container{
+  background:#050a12;border:1px solid var(--border-subtle);border-radius:var(--radius);
+  padding:1rem;font-family:'JetBrains Mono','Fira Code',monospace;font-size:0.75rem;
+  height:calc(100vh - 220px);overflow-y:auto;line-height:1.7;
+}
+.log-line{white-space:pre-wrap;word-break:break-all;padding:1px 0}
 .log-line .lvl-INFO{color:var(--green)}
 .log-line .lvl-WARN{color:var(--yellow)}
 .log-line .lvl-ERROR{color:var(--red)}
 .log-line .lvl-DEBUG{color:var(--muted)}
-.log-toolbar{display:flex;gap:0.5rem;margin-bottom:0.75rem;align-items:center}
-.log-toolbar select,.log-toolbar input{background:var(--card);border:1px solid var(--border);color:var(--text);padding:0.4rem;border-radius:4px;font-size:0.8rem}
-.log-toolbar input{flex:1}
+.log-toolbar{
+  display:flex;gap:0.6rem;margin-bottom:0.85rem;align-items:center;flex-wrap:wrap;
+}
+.log-toolbar select,.log-toolbar input{
+  background:var(--card);border:1px solid var(--border);color:var(--text);
+  padding:0.45rem 0.65rem;border-radius:var(--radius-xs);font-size:0.8rem;
+  outline:none;transition:var(--transition);
+}
+.log-toolbar input{flex:1;min-width:160px}
+.log-toolbar select:focus,.log-toolbar input:focus{border-color:var(--accent)}
 
-/* Rules table */
-.rules-bar{display:flex;gap:0.5rem;margin-bottom:0.75rem}
-.rules-bar input,.rules-bar select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:0.4rem;border-radius:4px;font-size:0.8rem}
+/* Rules */
+.rules-bar{display:flex;gap:0.6rem;margin-bottom:1rem;flex-wrap:wrap;align-items:center}
+.rules-bar input,.rules-bar select{
+  background:var(--bg);border:1px solid var(--border);color:var(--text);
+  padding:0.5rem 0.75rem;border-radius:var(--radius-xs);font-size:0.82rem;
+  outline:none;transition:var(--transition);
+}
+.rules-bar input:focus,.rules-bar select:focus{border-color:var(--accent)}
 
 /* Pagination */
-.pagination-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:0.75rem;font-size:0.8rem;color:var(--muted)}
-.pagination-bar div{display:flex;gap:0.25rem}
-.log-page-bar{display:flex;justify-content:space-between;align-items:center;margin-top:0.5rem}
+.pagination-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:0.85rem;font-size:0.8rem;color:var(--muted)}
+.pagination-bar div{display:flex;gap:0.4rem}
+.log-page-bar{display:flex;justify-content:space-between;align-items:center;margin-top:0.75rem}
+
+/* Empty state */
+.empty-state{text-align:center;padding:3rem 1rem;color:var(--muted);font-size:0.9rem}
+
+/* Responsive */
+@media(max-width:1024px){
+  .chart-grid{grid-template-columns:1fr}
+}
+@media(max-width:768px){
+  .sidebar{transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .main{margin-left:0;padding:1rem}
+  .cards{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+}
 </style>
 </head>
 <body>
 
 <nav class="sidebar">
-  <div class="logo">Trident</div>
-  <div class="nav-group">
-    <div class="nav-group-title">Monitor</div>
-    <div class="nav-item active" data-page="overview">Overview</div>
-    <div class="nav-item" data-page="clients">Clients</div>
-    <div class="nav-item" data-page="slow-queries">Slow Queries</div>
+  <div class="logo">
+    <svg viewBox="0 0 32 32" fill="none"><path d="M16 2L4 8v16l12 6 12-6V8L16 2z" fill="url(#grd)" opacity="0.15"/><path d="M16 4L6 9v14l10 5 10-5V9L16 4z" stroke="url(#grd)" stroke-width="1.5" fill="none"/><path d="M16 6l-7 3.5v11L16 24l7-3.5v-11L16 6z" fill="url(#grd)" opacity="0.3"/><path d="M16 10v8M12 12l4 2 4-2" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/><defs><linearGradient id="grd" x1="4" y1="2" x2="28" y2="30"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs></svg>
+    <span>Trident</span>
   </div>
   <div class="nav-group">
-    <div class="nav-group-title">Nodes</div>
-    <div class="nav-item" data-page="nodes">Backend Nodes</div>
+    <div class="nav-group-title">Monitor</div>
+    <div class="nav-item active" data-page="overview">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h4v6H2V2zm0 8h4v4H2v-4zm6-8h6v4H8V2zm0 6h6v6H8V8z"/></svg>
+      Overview
+    </div>
+    <div class="nav-item" data-page="clients">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 100-6 3 3 0 000 6zm-5 8a5 5 0 0110 0H3z"/></svg>
+      Clients
+    </div>
+    <div class="nav-item" data-page="slow-queries">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 2a.75.75 0 01.75.75v3.69l2.28 2.28a.75.75 0 11-1.06 1.06L7.47 8.28A.75.75 0 017.25 7.5V3.75A.75.75 0 018 3z"/></svg>
+      Slow Queries
+    </div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-group-title">Infrastructure</div>
+    <div class="nav-item" data-page="nodes">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 3h12v3H2V3zm0 5h12v3H2V8zm0 5h12v2H2v-2zM4 4.5a.5.5 0 100 1 .5.5 0 000-1zm0 5a.5.5 0 100 1 .5.5 0 000-1z"/></svg>
+      Backend Nodes
+    </div>
   </div>
   <div class="nav-group">
     <div class="nav-group-title">Configure</div>
-    <div class="nav-item" data-page="config-routing">Routing</div>
-    <div class="nav-item" data-page="config-rules">Custom Rules</div>
-    <div class="nav-item" data-page="config-pool">Connection Pool</div>
-    <div class="nav-item" data-page="config-lsn">LSN Mode</div>
+    <div class="nav-item" data-page="config-routing">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 4a2 2 0 012-2h2l2 2h4a2 2 0 012 2v1H2V4zm0 3h12v5a2 2 0 01-2 2H4a2 2 0 01-2-2V7z"/></svg>
+      Routing
+    </div>
+    <div class="nav-item" data-page="config-rules">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5l6 3v4c0 3.5-2.5 5.5-6 7-3.5-1.5-6-3.5-6-7v-4l6-3z"/></svg>
+      Custom Rules
+    </div>
+    <div class="nav-item" data-page="config-pool">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 2a1 1 0 00-1 1v10a1 1 0 001 1h10a1 1 0 001-1V3a1 1 0 00-1-1H3zm2 2h2v8H5V4zm4 3h2v5H9V7z"/></svg>
+      Connection Pool
+    </div>
+    <div class="nav-item" data-page="config-lsn">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 8a6.5 6.5 0 1113 0 6.5 6.5 0 01-13 0zM8 3a.75.75 0 01.75.75v3.69l2.28 2.28a.75.75 0 11-1.06 1.06L7.47 8.28A.75.75 0 017.25 7.5V3.75A.75.75 0 018 3z"/></svg>
+      LSN Mode
+    </div>
   </div>
   <div class="nav-group">
-    <div class="nav-group-title">Logs</div>
-    <div class="nav-item" data-page="logs">Live Logs</div>
+    <div class="nav-group-title">Diagnostics</div>
+    <div class="nav-item" data-page="logs">
+      <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 3h12v1H2V3zm0 3h12v1H2V6zm0 3h8v1H2V9zm0 3h10v1H2v-1z"/></svg>
+      Live Logs
+    </div>
   </div>
-  <div style="margin-top:auto;padding:0.75rem 1rem;border-top:1px solid var(--border)">
-    <button id="btn-logout" class="btn btn-danger btn-sm" style="width:100%;display:none">Logout</button>
+  <div style="margin-top:auto;padding:1rem 1.25rem;border-top:1px solid var(--border-subtle)">
+    <button id="btn-logout" class="btn btn-ghost btn-sm" style="width:100%;display:none;justify-content:center">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h5v1.5H3.5v9H7V14H2V2zm8.146 3.146l2.647 2.647H5.5v1.5h7.293l-2.647 2.647 1.061 1.06L15.207 9l-4-4-1.061 1.146z"/></svg>
+      Logout
+    </button>
   </div>
 </nav>
 
@@ -127,125 +291,133 @@ tr:last-child td{border-bottom:none}
 
 <!-- Overview -->
 <div class="page active" id="page-overview">
-  <h1 class="page-title">Overview</h1>
+  <div class="page-header">
+    <div><h1 class="page-title">Overview</h1><p class="page-subtitle">Real-time proxy health and throughput</p></div>
+  </div>
   <div class="cards" id="overview-cards"></div>
-  <div class="chart-container"><canvas id="chart-routing"></canvas></div>
-  <div class="chart-container"><canvas id="chart-latency"></canvas></div>
+  <div class="chart-grid">
+    <div class="chart-container"><h4>Query Distribution</h4><canvas id="chart-routing"></canvas></div>
+    <div class="chart-container"><h4>Throughput</h4><canvas id="chart-latency"></canvas></div>
+  </div>
 </div>
 
 <!-- Clients -->
 <div class="page" id="page-clients">
-  <h1 class="page-title">Clients</h1>
-  <div class="table-container"><table id="clients-table"><thead><tr><th>IP</th><th>Active</th><th>Total</th><th>Last Seen</th></tr></thead><tbody></tbody></table></div>
+  <div class="page-header"><div><h1 class="page-title">Clients</h1><p class="page-subtitle">Active client connections by IP</p></div></div>
+  <div class="table-container"><table id="clients-table"><thead><tr><th>IP Address</th><th>Active</th><th>Total</th><th>Last Seen</th></tr></thead><tbody></tbody></table></div>
 </div>
 
 <!-- Slow Queries -->
 <div class="page" id="page-slow-queries">
-  <h1 class="page-title">Slow Queries</h1>
+  <div class="page-header"><div><h1 class="page-title">Slow Queries</h1><p class="page-subtitle">Queries exceeding the configured threshold</p></div></div>
   <div class="pagination-bar">
     <span id="sq-info"></span>
     <div>
-      <button class="btn btn-sm btn-primary" id="sq-prev" disabled>Prev</button>
-      <button class="btn btn-sm btn-primary" id="sq-next">Next</button>
+      <button class="btn btn-ghost btn-sm" id="sq-prev" disabled>&larr; Prev</button>
+      <button class="btn btn-ghost btn-sm" id="sq-next">Next &rarr;</button>
     </div>
   </div>
   <div class="table-container"><table id="slow-queries-table"><thead><tr><th>Time</th><th>Duration</th><th>Target</th><th>SQL</th></tr></thead><tbody></tbody></table></div>
   <div class="pagination-bar" style="margin-top:0.75rem">
     <span id="sq-info2"></span>
     <div>
-      <button class="btn btn-sm btn-primary" id="sq-prev2" disabled>Prev</button>
-      <button class="btn btn-sm btn-primary" id="sq-next2">Next</button>
+      <button class="btn btn-ghost btn-sm" id="sq-prev2" disabled>&larr; Prev</button>
+      <button class="btn btn-ghost btn-sm" id="sq-next2">Next &rarr;</button>
     </div>
   </div>
 </div>
 
 <!-- Nodes -->
 <div class="page" id="page-nodes">
-  <h1 class="page-title">Backend Nodes</h1>
-  <div class="config-section" id="add-node-form" style="margin-bottom:1rem">
+  <div class="page-header"><div><h1 class="page-title">Backend Nodes</h1><p class="page-subtitle">Manage PostgreSQL backends</p></div></div>
+  <div class="config-section" id="add-node-form">
     <h3>Add Node</h3>
     <div class="form-row">
-      <label>Name</label><input id="node-name" placeholder="reader-3" style="width:120px">
-      <label>Host</label><input id="node-host" placeholder="10.0.1.13" style="width:200px">
-      <label>Port</label><input id="node-port" type="number" value="5432" style="width:70px">
+      <label>Name</label><input id="node-name" placeholder="reader-3" style="width:130px">
+      <label>Host</label><input id="node-host" placeholder="10.0.1.13" style="width:180px">
+      <label>Port</label><input id="node-port" type="number" value="5432" style="width:80px">
     </div>
     <div class="form-row">
       <label>Type</label>
       <select id="node-type"><option value="reader">Reader</option><option value="writer">Writer</option><option value="analytics">Analytics</option></select>
-      <label>Weight</label><input id="node-weight" type="number" value="5" style="width:60px">
-      <label>Database</label><input id="node-database" placeholder="postgres" style="width:120px">
+      <label>Weight</label><input id="node-weight" type="number" value="5" style="width:70px">
+      <label>Database</label><input id="node-database" placeholder="postgres" style="width:130px">
     </div>
     <div class="form-row">
-      <label>Username</label><input id="node-username" placeholder="proxy_user" style="width:120px">
+      <label>Username</label><input id="node-username" placeholder="proxy_user" style="width:130px">
       <label>Password</label><input id="node-password" type="password" placeholder="" style="width:140px">
       <label>SSL Mode</label>
       <select id="node-ssl"><option value="disable">disable</option><option value="prefer">prefer</option><option value="require">require</option></select>
       <button class="btn btn-primary btn-sm" id="btn-add-node" style="margin-left:1rem">Add Node</button>
     </div>
   </div>
-  <div class="cards" id="nodes-cards"></div>
-  <div class="table-container"><table id="nodes-table"><thead><tr><th>Node</th><th>Type</th><th>Health</th><th>Connections</th><th>Pool Max</th><th>Replication Lag</th><th>Replay LSN</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+  <div style="margin-top:1.25rem">
+    <div class="table-container"><table id="nodes-table"><thead><tr><th>Node</th><th>Type</th><th>Health</th><th>Connections</th><th>Pool Max</th><th>Replication Lag</th><th>Replay LSN</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+  </div>
 </div>
 
 <!-- Config: Routing -->
 <div class="page" id="page-config-routing">
-  <h1 class="page-title">Routing Configuration</h1>
+  <div class="page-header"><div><h1 class="page-title">Routing Configuration</h1><p class="page-subtitle">Runtime-adjustable routing parameters</p></div></div>
   <div class="config-section" id="routing-form"></div>
-  <div class="btn-bar"><button class="btn btn-primary" id="btn-save-routing">Apply (runtime-only)</button></div>
+  <div class="btn-bar"><button class="btn btn-primary" id="btn-save-routing">Apply (runtime-only)</button><button class="btn btn-ghost" onclick="fetchConfig()">Reset</button></div>
 </div>
 
 <!-- Config: Custom Rules -->
 <div class="page" id="page-config-rules">
-  <h1 class="page-title">Custom Routing Rules</h1>
+  <div class="page-header"><div><h1 class="page-title">Custom Routing Rules</h1><p class="page-subtitle">Per-table or per-function routing overrides</p></div></div>
   <div class="rules-bar">
     <input id="rule-name" placeholder="Name (e.g. sensitive_table)">
     <select id="rule-type"><option value="t">Table</option><option value="f">Function</option></select>
     <select id="rule-mode"><option value="w">Writer-only</option><option value="r">Reader-eligible</option></select>
-    <button class="btn btn-primary btn-sm" id="btn-add-rule">Add</button>
+    <button class="btn btn-primary btn-sm" id="btn-add-rule">Add Rule</button>
   </div>
   <div class="table-container"><table id="rules-table"><thead><tr><th>Name</th><th>Type</th><th>Mode</th><th>Action</th></tr></thead><tbody></tbody></table></div>
 </div>
 
-<!-- Config: LSN Mode -->
+<!-- Config: Connection Pool -->
 <div class="page" id="page-config-pool">
-  <h1 class="page-title">Connection Pool</h1>
+  <div class="page-header"><div><h1 class="page-title">Connection Pool</h1><p class="page-subtitle">Restart-only pool parameters</p></div></div>
   <div class="config-section" id="pool-info"></div>
 </div>
 
 <!-- Config: LSN Mode -->
 <div class="page" id="page-config-lsn">
-  <h1 class="page-title">LSN Tracking Mode</h1>
+  <div class="page-header"><div><h1 class="page-title">LSN Tracking Mode</h1><p class="page-subtitle">Consistency tracking configuration</p></div></div>
   <div class="config-section" id="lsn-info"></div>
 </div>
 
 <!-- Logs -->
 <div class="page" id="page-logs">
-  <h1 class="page-title">Live Logs</h1>
+  <div class="page-header"><div><h1 class="page-title">Live Logs</h1><p class="page-subtitle">Streaming proxy log output via WebSocket</p></div></div>
   <div class="log-toolbar">
     <select id="log-level-filter"><option value="">All Levels</option><option value="ERROR">ERROR</option><option value="WARN">WARN</option><option value="INFO">INFO</option><option value="DEBUG">DEBUG</option></select>
-    <input id="log-search" placeholder="Search...">
-    <label style="font-size:0.8rem;color:var(--muted);display:flex;align-items:center;gap:4px"><input type="checkbox" id="log-autoscroll" checked> Auto-scroll</label>
-    <span id="log-count" style="font-size:0.75rem;color:var(--muted)"></span>
-    <button class="btn btn-sm btn-primary" id="btn-clear-logs">Clear</button>
+    <input id="log-search" placeholder="Filter logs...">
+    <label style="font-size:0.8rem;color:var(--muted);display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="log-autoscroll" checked> Auto-scroll</label>
+    <span id="log-count" style="font-size:0.72rem;color:var(--muted)"></span>
+    <button class="btn btn-ghost btn-sm" id="btn-clear-logs">Clear</button>
   </div>
   <div class="log-container" id="log-output"></div>
   <div class="log-page-bar">
-    <button class="btn btn-sm btn-primary" id="log-older">Older</button>
-    <span id="log-page-info" style="font-size:0.75rem;color:var(--muted)"></span>
-    <button class="btn btn-sm btn-primary" id="log-newer">Newer</button>
+    <button class="btn btn-ghost btn-sm" id="log-older">&larr; Older</button>
+    <span id="log-page-info" style="font-size:0.72rem;color:var(--muted)"></span>
+    <button class="btn btn-ghost btn-sm" id="log-newer">Newer &rarr;</button>
   </div>
 </div>
 
 </div><!-- /main -->
 
 <!-- Auth Login Overlay -->
-<div id="auth-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:10000;display:flex;align-items:center;justify-content:center">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:2rem;width:360px;text-align:center">
-    <h2 style="color:var(--accent);margin-bottom:0.5rem">🔱 Trident Console</h2>
-    <p style="color:var(--muted);font-size:0.85rem;margin-bottom:1.5rem">Enter admin token to continue</p>
-    <input id="auth-token-input" type="password" placeholder="Bearer Token" style="width:100%;padding:0.6rem;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;font-size:0.9rem;margin-bottom:1rem">
-    <button id="auth-login-btn" class="btn btn-primary" style="width:100%;padding:0.6rem">Login</button>
-    <p id="auth-error" style="color:var(--red);font-size:0.8rem;margin-top:0.75rem;display:none">Invalid token</p>
+<div id="auth-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);backdrop-filter:blur(8px);z-index:10000;display:flex;align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2.5rem;width:380px;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,0.5)">
+    <div style="margin-bottom:1.5rem">
+      <svg width="48" height="48" viewBox="0 0 32 32" fill="none"><path d="M16 2L4 8v16l12 6 12-6V8L16 2z" fill="url(#grd2)" opacity="0.2"/><path d="M16 4L6 9v14l10 5 10-5V9L16 4z" stroke="url(#grd2)" stroke-width="1.5" fill="none"/><path d="M16 10v8M12 12l4 2 4-2" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/><defs><linearGradient id="grd2" x1="4" y1="2" x2="28" y2="30"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs></svg>
+    </div>
+    <h2 style="color:var(--text);font-size:1.25rem;margin-bottom:0.4rem;font-weight:700">Trident Console</h2>
+    <p style="color:var(--muted);font-size:0.85rem;margin-bottom:1.75rem">Enter admin token to continue</p>
+    <input id="auth-token-input" type="password" placeholder="Bearer Token" style="width:100%;padding:0.7rem 1rem;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:var(--radius-sm);font-size:0.9rem;margin-bottom:1rem;outline:none;transition:var(--transition)" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+    <button id="auth-login-btn" class="btn btn-primary" style="width:100%;padding:0.7rem;font-size:0.9rem;justify-content:center">Login</button>
+    <p id="auth-error" style="color:var(--red);font-size:0.8rem;margin-top:0.85rem;display:none">Invalid token</p>
   </div>
 </div>
 
@@ -285,21 +457,16 @@ function toast(msg, type='success') {
   el.className = 'toast toast-' + type;
   el.textContent = msg;
   document.body.appendChild(el);
-  setTimeout(() => el.remove(), 3000);
+  setTimeout(() => { el.style.opacity='0'; el.style.transform='translateX(20px)'; setTimeout(()=>el.remove(), 300); }, 3000);
 }
 
-// Fetch helpers
 // --- Auth ---
 const AUTH_KEY = 'trident_admin_token';
 let authToken = localStorage.getItem(AUTH_KEY) || '';
 const authOverlay = document.getElementById('auth-overlay');
 
-function showLogin() {
-  authOverlay.style.display = 'flex';
-}
-function hideLogin() {
-  authOverlay.style.display = 'none';
-}
+function showLogin() { authOverlay.style.display = 'flex'; }
+function hideLogin() { authOverlay.style.display = 'none'; }
 
 document.getElementById('auth-login-btn').addEventListener('click', tryLogin);
 document.getElementById('auth-token-input').addEventListener('keydown', e => {
@@ -318,7 +485,6 @@ async function tryLogin() {
       errorEl.textContent = 'Invalid token';
       return;
     }
-    // Success (200) or no auth required
     authToken = token;
     if (token) localStorage.setItem(AUTH_KEY, token);
     else localStorage.removeItem(AUTH_KEY);
@@ -331,7 +497,6 @@ async function tryLogin() {
   }
 }
 
-// Check if auth is needed on page load
 async function checkAuth() {
   try {
     const res = await fetch(API + '/api/overview', {
@@ -344,18 +509,15 @@ async function checkAuth() {
       document.getElementById('btn-logout').style.display = 'none';
     } else {
       hideLogin();
-      // Show logout button only when token auth is active
-      if (authToken) document.getElementById('btn-logout').style.display = 'block';
+      if (authToken) document.getElementById('btn-logout').style.display = 'flex';
       startPolling();
     }
   } catch(e) {
-    // Server unreachable — just start anyway
     hideLogin();
     startPolling();
   }
 }
 
-// Logout
 document.getElementById('btn-logout').addEventListener('click', () => {
   authToken = '';
   localStorage.removeItem(AUTH_KEY);
@@ -367,19 +529,12 @@ async function api(path, opts = {}) {
   const headers = {...(opts.headers || {})};
   if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
   const res = await fetch(API + path, {...opts, headers});
-  if (res.status === 401) {
-    showLogin();
-    throw new Error('unauthorized');
-  }
+  if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 // Overview
-// Queries are shown as a real-time rate (QPS), not cumulative totals: the
-// backend counters are monotonic Prometheus counters, so the rate is the
-// delta between two polls divided by the elapsed time. The first poll has
-// no baseline and shows "–"; a quick follow-up poll fills it in.
 let prevOverview = null;
 function rateFmt(v){ return (v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(1)) + '/s'; }
 async function fetchOverview() {
@@ -387,14 +542,11 @@ async function fetchOverview() {
     const data = await api('/api/overview');
     const now = Date.now();
     let qpsW = '–', qpsR = '–', qpsA = '–';
-    // The routing chart shows the same real-time distribution when a
-    // baseline exists; only the very first paint falls back to cumulative.
     let chartData = [data.routing_writer, data.routing_reader, data.routing_analytics];
     const hadBaseline = !!prevOverview;
     if (prevOverview) {
       const dt = (now - prevOverview.t) / 1000;
       if (dt > 0.2) {
-        // Math.max guards against counter resets on proxy restart.
         const dW = Math.max(0, data.routing_writer - prevOverview.w) / dt;
         const dR = Math.max(0, data.routing_reader - prevOverview.r) / dt;
         const dA = Math.max(0, data.routing_analytics - prevOverview.a) / dt;
@@ -405,18 +557,16 @@ async function fetchOverview() {
     prevOverview = { t: now, w: data.routing_writer, r: data.routing_reader, a: data.routing_analytics };
     const cards = document.getElementById('overview-cards');
     cards.innerHTML = `
-      <div class="stat-card"><div class="label">Active Connections</div><div class="value">${data.active_connections}</div></div>
+      <div class="stat-card card-accent"><div class="label">Active Connections</div><div class="value accent">${data.active_connections}</div></div>
       <div class="stat-card"><div class="label">Total Accepted</div><div class="value">${fmt(data.total_accepted)}</div></div>
-      <div class="stat-card"><div class="label">Queries/s (Writer)</div><div class="value">${qpsW}</div></div>
-      <div class="stat-card"><div class="label">Queries/s (Reader)</div><div class="value">${qpsR}</div></div>
-      <div class="stat-card"><div class="label">Queries/s (Analytics)</div><div class="value">${qpsA}</div></div>
-      <div class="stat-card"><div class="label">Slow Queries (1m)</div><div class="value ${data.slow_queries_1m > 0 ? 'red' : ''}">${fmt(data.slow_queries_1m)}</div></div>
-      <div class="stat-card"><div class="label">Pool Exhausted</div><div class="value ${data.pool_exhausted > 0 ? 'red' : ''}">${fmt(data.pool_exhausted)}</div></div>
-      <div class="stat-card"><div class="label">Health Status</div><div class="value ${data.healthy ? 'green' : 'red'}">${data.healthy ? 'Healthy' : 'Unhealthy'}</div></div>
+      <div class="stat-card card-red"><div class="label">Writer QPS</div><div class="value">${qpsW}</div></div>
+      <div class="stat-card card-green"><div class="label">Reader QPS</div><div class="value">${qpsR}</div></div>
+      <div class="stat-card"><div class="label">Analytics QPS</div><div class="value">${qpsA}</div></div>
+      <div class="stat-card ${data.slow_queries_1m > 0 ? 'card-red' : ''}"><div class="label">Slow Queries (1m)</div><div class="value ${data.slow_queries_1m > 0 ? 'red' : ''}">${fmt(data.slow_queries_1m)}</div></div>
+      <div class="stat-card ${data.pool_exhausted > 0 ? 'card-red' : ''}"><div class="label">Pool Exhausted</div><div class="value ${data.pool_exhausted > 0 ? 'red' : ''}">${fmt(data.pool_exhausted)}</div></div>
+      <div class="stat-card ${data.healthy ? 'card-green' : 'card-red'}"><div class="label">Health Status</div><div class="value ${data.healthy ? 'green' : 'red'}">${data.healthy ? '● Healthy' : '● Unhealthy'}</div></div>
     `;
     updateRoutingChart(chartData);
-    // No baseline on the first paint: poll once more shortly so the QPS
-    // cards show real numbers without waiting a full refresh cycle.
     if (!hadBaseline) setTimeout(fetchOverview, 1000);
   } catch(e) { console.error('overview error', e); }
 }
@@ -428,9 +578,12 @@ function updateRoutingChart(values) {
     type: 'doughnut',
     data: {
       labels: ['Writer', 'Reader', 'Analytics'],
-      datasets: [{ data: values, backgroundColor: ['#ef4444','#22c55e','#a855f7'] }]
+      datasets: [{ data: values, backgroundColor: ['#ef4444','#10b981','#a78bfa'], borderWidth: 0, hoverOffset: 6 }]
     },
-    options: { responsive: true, plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8' } } } }
+    options: {
+      responsive: true, cutout: '65%',
+      plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', padding: 16, usePointStyle: true, pointStyle: 'circle' } } }
+    }
   });
 }
 
@@ -439,20 +592,21 @@ async function fetchClients() {
   try {
     const data = await api('/client-stats');
     const tbody = document.querySelector('#clients-table tbody');
-    tbody.innerHTML = data.map(c => `<tr><td>${c.ip}</td><td>${c.active_connections}</td><td>${c.total_connections}</td><td>${new Date(c.last_seen_unix_secs * 1000).toLocaleString()}</td></tr>`).join('');
+    if (!data.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No active clients</td></tr>'; return; }
+    tbody.innerHTML = data.map(c => `<tr><td><code style="font-size:0.8rem">${c.ip}</code></td><td>${c.active_connections}</td><td>${c.total_connections}</td><td>${new Date(c.last_seen_unix_secs * 1000).toLocaleString()}</td></tr>`).join('');
   } catch(e) { console.error(e); }
 }
 
-// Slow Queries (paginated)
+// Slow Queries
 let sqPage = 1;
 const SQ_PER_PAGE = 50;
-
 async function fetchSlowQueries() {
   try {
     const data = await api(`/api/slow-queries?page=${sqPage}&per_page=${SQ_PER_PAGE}`);
     const tbody = document.querySelector('#slow-queries-table tbody');
-    tbody.innerHTML = data.items.map(q => `<tr><td style="white-space:nowrap">${new Date(q.time_unix_secs * 1000).toLocaleString()}</td><td>${q.duration_ms}ms</td><td><span class="badge badge-${q.target}">${q.target}</span></td><td style="max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(q.sql)}">${esc(q.sql)}</td></tr>`).join('');
-    const info = `Showing ${(data.page-1)*data.per_page+1}-${Math.min(data.page*data.per_page, data.total)} of ${data.total}`;
+    if (!data.items.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No slow queries recorded</td></tr>'; return; }
+    tbody.innerHTML = data.items.map(q => `<tr><td style="white-space:nowrap">${new Date(q.time_unix_secs * 1000).toLocaleString()}</td><td><strong>${q.duration_ms}ms</strong></td><td><span class="badge badge-${q.target}">${q.target}</span></td><td style="max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(q.sql)}">${esc(q.sql)}</td></tr>`).join('');
+    const info = `Showing ${(data.page-1)*data.per_page+1}–${Math.min(data.page*data.per_page, data.total)} of ${data.total}`;
     document.getElementById('sq-info').textContent = info;
     document.getElementById('sq-info2').textContent = info;
     document.getElementById('sq-prev').disabled = data.page <= 1;
@@ -466,7 +620,6 @@ document.getElementById('sq-prev2').addEventListener('click', () => { sqPage = M
 document.getElementById('sq-next').addEventListener('click', () => { sqPage++; fetchSlowQueries(); });
 document.getElementById('sq-next2').addEventListener('click', () => { sqPage++; fetchSlowQueries(); });
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-
 function fmt(n){if(n>=1e9)return(n/1e9).toFixed(1)+"G";if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e4)return(n/1e3).toFixed(1)+"K";return n.toLocaleString()}
 
 // Nodes
@@ -475,16 +628,15 @@ async function fetchNodes() {
     const data = await api('/api/nodes');
     const tbody = document.querySelector('#nodes-table tbody');
     tbody.innerHTML = data.nodes.map(n => `<tr>
-      <td>${esc(n.node_id)}</td>
+      <td><strong>${esc(n.node_id)}</strong></td>
       <td><span class="badge badge-${esc(n.node_type)}">${esc(n.node_type)}</span></td>
       <td><span class="badge badge-${n.healthy?'healthy':'unhealthy'}">${n.healthy?'Healthy':'Unhealthy'}</span></td>
       <td>${n.active_connections}</td>
       <td>${data.max_pool_size}</td>
-      <td>${n.replication_lag_ms !== null ? n.replication_lag_ms + 'ms' : '-'}</td>
-      <td>${n.replay_lsn > 0 ? '0x'+n.replay_lsn.toString(16).toUpperCase() : '-'}</td>
+      <td>${n.replication_lag_ms !== null ? n.replication_lag_ms + 'ms' : '–'}</td>
+      <td>${n.replay_lsn > 0 ? '<code>0x'+n.replay_lsn.toString(16).toUpperCase()+'</code>' : '–'}</td>
       <td><button class="btn btn-danger btn-sm" data-node="${esc(n.node_id)}">Remove</button></td>
     </tr>`).join('');
-    // Bind remove buttons via event delegation (avoids inline onclick XSS)
     tbody.querySelectorAll('[data-node]').forEach(btn => {
       btn.addEventListener('click', () => removeNode(btn.dataset.node));
     });
@@ -502,51 +654,26 @@ document.getElementById('btn-add-node').addEventListener('click', async () => {
   const username = document.getElementById('node-username').value.trim();
   const password = document.getElementById('node-password').value;
   const ssl_mode = document.getElementById('node-ssl').value;
-
-  if (!name || !host || !database || !username) {
-    toast('Name, Host, Database and Username are required', 'error');
-    return;
-  }
-
+  if (!name || !host || !database || !username) { toast('Name, Host, Database and Username are required', 'error'); return; }
   try {
     const hdrs = {'content-type': 'application/json'};
     if (authToken) hdrs['Authorization'] = 'Bearer ' + authToken;
-    const res = await fetch('/api/nodes', {
-      method: 'POST',
-      headers: hdrs,
-      body: JSON.stringify({name, host, port, type: node_type, weight, database, username, password: password || undefined, ssl_mode})
-    });
+    const res = await fetch('/api/nodes', { method: 'POST', headers: hdrs, body: JSON.stringify({name, host, port, type: node_type, weight, database, username, password: password || undefined, ssl_mode}) });
     const data = await res.json();
-    if (res.ok) {
-      toast(`Node '${name}' added successfully`);
-      document.getElementById('node-name').value = '';
-      document.getElementById('node-host').value = '';
-      document.getElementById('node-password').value = '';
-      fetchNodes();
-    } else {
-      toast(data.message || 'Failed to add node', 'error');
-    }
+    if (res.ok) { toast(`Node '${name}' added`); document.getElementById('node-name').value = ''; document.getElementById('node-host').value = ''; document.getElementById('node-password').value = ''; fetchNodes(); }
+    else { toast(data.message || 'Failed to add node', 'error'); }
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 });
 
-// Remove Node
 async function removeNode(nodeId) {
   if (!confirm(`Remove node '${nodeId}'? Active connections will be drained.`)) return;
   try {
     const hdrs = {'content-type': 'application/json'};
     if (authToken) hdrs['Authorization'] = 'Bearer ' + authToken;
-    const res = await fetch('/api/nodes', {
-      method: 'DELETE',
-      headers: hdrs,
-      body: JSON.stringify({name: nodeId})
-    });
+    const res = await fetch('/api/nodes', { method: 'DELETE', headers: hdrs, body: JSON.stringify({name: nodeId}) });
     const data = await res.json();
-    if (res.ok) {
-      toast(`Node '${nodeId}' removed`);
-      fetchNodes();
-    } else {
-      toast(data.message || 'Failed to remove node', 'error');
-    }
+    if (res.ok) { toast(`Node '${nodeId}' removed`); fetchNodes(); }
+    else { toast(data.message || 'Failed to remove node', 'error'); }
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 
@@ -564,7 +691,7 @@ async function fetchConfig() {
       ${cfgRow('cost_threshold', 'number', data.cost_threshold)}
       ${cfgRow('writer_readable', 'checkbox', data.writer_readable)}
       ${cfgRow('max_replication_lag_ms', 'number', data.max_replication_lag_ms, null, true)}
-      <p style="color:var(--muted);font-size:0.75rem;margin-top:0.75rem">Changes apply to the running process only and are not written back to the config file. A config-file reload (SIGHUP / POST /reload) or restart reverts them. max_replication_lag_ms is restart-only.</p>
+      <p style="color:var(--muted);font-size:0.75rem;margin-top:1rem;line-height:1.6">⚠️ Changes apply to the running process only and are not written back to the config file. A config-file reload (SIGHUP / POST /reload) or restart reverts them. <code>max_replication_lag_ms</code> is restart-only.</p>
     `;
   } catch(e) { console.error(e); }
 }
@@ -573,7 +700,7 @@ function cfgRow(name, type, value, options, readonly) {
   const dis = readonly ? 'disabled' : '';
   if (type === 'checkbox') return `<div class="form-row">${label}<input type="checkbox" id="cfg-${name}" ${value?'checked':''} ${dis}></div>`;
   if (type === 'select') return `<div class="form-row">${label}<select id="cfg-${name}" ${dis}>${options.map(o=>`<option ${o===value?'selected':''}>${o}</option>`).join('')}</select></div>`;
-  return `<div class="form-row">${label}<input type="number" id="cfg-${name}" value="${value}" ${dis}></div>`;
+  return `<div class="form-row">${label}<input type="number" id="cfg-${name}" value="${value}" step="any" ${dis}></div>`;
 }
 document.getElementById('btn-save-routing').addEventListener('click', async () => {
   const body = {
@@ -588,23 +715,19 @@ document.getElementById('btn-save-routing').addEventListener('click', async () =
   };
   try {
     await api('/api/config', { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    toast('Applied (runtime-only; not written to config file)');
+    toast('Applied (runtime-only)');
     fetchConfig();
   } catch(e) { toast('Failed: ' + e.message, 'error'); }
 });
 
 // Config: Rules
-function escapeHtml(s) {
-  const div = document.createElement('div');
-  div.textContent = s;
-  return div.innerHTML;
-}
+function escapeHtml(s) { const div = document.createElement('div'); div.textContent = s; return div.innerHTML; }
 async function fetchRules() {
   try {
     const data = await api('/custom-rules');
     const tbody = document.querySelector('#rules-table tbody');
-    tbody.innerHTML = data.map(r => `<tr><td>${escapeHtml(r._name)}</td><td>${r._type==='t'?'Table':'Function'}</td><td>${r.rw_mode==='w'?'Writer-only':'Reader-eligible'}</td><td><button class="btn btn-danger btn-sm" data-rule-name="${escapeHtml(r._name)}" data-rule-type="${escapeHtml(r._type)}">Delete</button></td></tr>`).join('');
-    // Bind delete handlers via event delegation (avoids inline onclick with unescaped data)
+    if (!data.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty-state">No custom rules configured</td></tr>'; return; }
+    tbody.innerHTML = data.map(r => `<tr><td><strong>${escapeHtml(r._name)}</strong></td><td>${r._type==='t'?'Table':'Function'}</td><td><span class="badge badge-${r.rw_mode==='w'?'writer':'reader'}">${r.rw_mode==='w'?'Writer-only':'Reader-eligible'}</span></td><td><button class="btn btn-danger btn-sm" data-rule-name="${escapeHtml(r._name)}" data-rule-type="${escapeHtml(r._type)}">Delete</button></td></tr>`).join('');
     tbody.querySelectorAll('button[data-rule-name]').forEach(btn => {
       btn.addEventListener('click', () => deleteRule(btn.dataset.ruleName, btn.dataset.ruleType));
     });
@@ -634,12 +757,12 @@ async function fetchLsnMode() {
     const data = await api('/api/config');
     const el = document.getElementById('lsn-info');
     el.innerHTML = `<h3>Current LSN Tracking Mode</h3>
-      <p style="margin:0.5rem 0;font-size:1.25rem;font-weight:600;color:var(--accent)">${data.lsn_mode || 'auto'}</p>
-      <p style="color:var(--muted);font-size:0.85rem;margin-top:0.5rem">This setting is restart-only. Changes require restarting the Trident process.</p>
-      <div style="margin-top:1rem;padding:0.75rem;background:var(--bg);border-radius:4px;font-size:0.8rem">
-        <p><strong>pipeline.internal_query_timeout_ms:</strong> ${data.pipeline_internal_query_timeout_ms || 100}</p>
-        <p><strong>pipeline.lazy_fallback:</strong> ${data.pipeline_lazy_fallback ?? true}</p>
-        <p><strong>extension.guc_name:</strong> ${data.extension_guc_name || 'lsn_tracker.last_lsn'}</p>
+      <p style="margin:0.75rem 0;font-size:1.4rem;font-weight:700;color:var(--accent)">${data.lsn_mode || 'auto'}</p>
+      <p style="color:var(--muted);font-size:0.82rem;margin-top:0.75rem;line-height:1.5">This setting is restart-only. Changes require restarting the Trident process.</p>
+      <div style="margin-top:1.25rem;padding:1rem;background:var(--bg);border-radius:var(--radius-sm);font-size:0.82rem;display:grid;gap:0.5rem">
+        <div><span style="color:var(--muted)">pipeline.internal_query_timeout_ms:</span> <strong>${data.pipeline_internal_query_timeout_ms || 100}</strong></div>
+        <div><span style="color:var(--muted)">pipeline.lazy_fallback:</span> <strong>${data.pipeline_lazy_fallback ?? true}</strong></div>
+        <div><span style="color:var(--muted)">extension.guc_name:</span> <strong>${data.extension_guc_name || 'lsn_tracker.last_lsn'}</strong></div>
       </div>`;
   } catch(e) { console.error(e); }
 }
@@ -650,24 +773,22 @@ async function fetchPoolConfig() {
     const data = await api('/api/config');
     const el = document.getElementById('pool-info');
     el.innerHTML = `<h3>Connection Pool Settings</h3>
-      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:1rem">These settings are restart-only. Changes require restarting the Trident process.</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
-        <div class="stat-card"><div class="label">Mode</div><div class="value" style="font-size:1.1rem">${data.pool_mode}</div></div>
-        <div class="stat-card"><div class="label">Max Pool Size (per node)</div><div class="value" style="font-size:1.1rem">${data.pool_max_pool_size}</div></div>
-        <div class="stat-card"><div class="label">Min Pool Size (per node)</div><div class="value" style="font-size:1.1rem">${data.pool_min_pool_size}</div></div>
-        <div class="stat-card"><div class="label">Connection Timeout</div><div class="value" style="font-size:1.1rem">${data.pool_connection_timeout}</div></div>
-        <div class="stat-card"><div class="label">Max Idle Time</div><div class="value" style="font-size:1.1rem">${data.pool_max_idle_time}</div></div>
-        <div class="stat-card"><div class="label">Max Lifetime</div><div class="value" style="font-size:1.1rem">${data.pool_max_lifetime}</div></div>
+      <p style="color:var(--muted);font-size:0.82rem;margin-bottom:1.25rem;line-height:1.5">These settings are restart-only. Changes require restarting the Trident process.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:0.875rem">
+        <div class="stat-card"><div class="label">Mode</div><div class="value" style="font-size:1rem;color:var(--accent)">${data.pool_mode}</div></div>
+        <div class="stat-card"><div class="label">Max Pool Size</div><div class="value" style="font-size:1rem">${data.pool_max_pool_size}</div></div>
+        <div class="stat-card"><div class="label">Min Pool Size</div><div class="value" style="font-size:1rem">${data.pool_min_pool_size}</div></div>
+        <div class="stat-card"><div class="label">Connection Timeout</div><div class="value" style="font-size:1rem">${data.pool_connection_timeout}</div></div>
+        <div class="stat-card"><div class="label">Max Idle Time</div><div class="value" style="font-size:1rem">${data.pool_max_idle_time}</div></div>
+        <div class="stat-card"><div class="label">Max Lifetime</div><div class="value" style="font-size:1rem">${data.pool_max_lifetime}</div></div>
       </div>`;
   } catch(e) { console.error(e); }
 }
 
-// Logs (WebSocket with paged view)
+// Logs (WebSocket)
 function connectLogs() {
   if (logWs && logWs.readyState <= 1) return;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  // Pass auth token via query parameter since browsers cannot set custom
-  // headers on WebSocket connections.
   const tokenParam = authToken ? '?token=' + encodeURIComponent(authToken) : '';
   logWs = new WebSocket(proto + '//' + location.host + '/ws/logs' + tokenParam);
   logWs.onmessage = (ev) => {
@@ -694,12 +815,10 @@ function renderLogs() {
     if (search && !l.toLowerCase().includes(search)) return false;
     return true;
   });
-
   const total = filtered.length;
   logViewEnd = Math.min(logViewEnd || total, total);
   logViewStart = Math.max(0, logViewEnd - LOG_PAGE_SIZE);
   const page = filtered.slice(logViewStart, logViewEnd);
-
   const container = document.getElementById('log-output');
   container.innerHTML = page.map(l => {
     let lvl = 'INFO';
@@ -708,15 +827,11 @@ function renderLogs() {
     else if (l.includes('DEBUG')) lvl = 'DEBUG';
     return `<div class="log-line"><span class="lvl-${lvl}">${esc(l)}</span></div>`;
   }).join('');
-
-  document.getElementById('log-count').textContent = `${total} lines total`;
-  document.getElementById('log-page-info').textContent = `Showing ${logViewStart+1}-${logViewEnd} of ${total}`;
+  document.getElementById('log-count').textContent = `${total} lines`;
+  document.getElementById('log-page-info').textContent = total > 0 ? `${logViewStart+1}–${logViewEnd} of ${total}` : '';
   document.getElementById('log-older').disabled = logViewStart <= 0;
   document.getElementById('log-newer').disabled = logViewEnd >= total;
-
-  if (document.getElementById('log-autoscroll').checked) {
-    container.scrollTop = container.scrollHeight;
-  }
+  if (document.getElementById('log-autoscroll').checked) container.scrollTop = container.scrollHeight;
 }
 
 document.getElementById('log-older').addEventListener('click', () => {
@@ -734,7 +849,7 @@ document.getElementById('log-level-filter').addEventListener('change', () => { l
 document.getElementById('log-search').addEventListener('input', () => { logViewEnd = 0; renderLogs(); });
 document.getElementById('btn-clear-logs').addEventListener('click', () => { logBuffer.length = 0; logViewStart = 0; logViewEnd = 0; renderLogs(); });
 
-// Auto-refresh and initial load — gated by auth check
+// Polling
 let pollingStarted = false;
 function startPolling() {
   if (pollingStarted) return;
@@ -746,7 +861,6 @@ function startPolling() {
   fetchOverview();
 }
 
-// Entry point: check auth then start
 checkAuth();
 </script>
 </body>
