@@ -19,6 +19,24 @@ pub enum NodeType {
     Writer,
     Reader,
     Analytics,
+    /// Automatic role detection: Trident determines whether this node is
+    /// currently a Writer or Reader by probing `pg_is_in_recovery()` (or
+    /// consulting an external authority like Patroni/repmgr). The effective
+    /// role is dynamically updated on failover without config changes or
+    /// restarts.
+    Auto,
+}
+
+impl NodeType {
+    /// Returns true if this is a statically-assigned role (not `Auto`).
+    pub fn is_static(self) -> bool {
+        !matches!(self, NodeType::Auto)
+    }
+
+    /// Returns true if this is `Auto` (dynamic role detection enabled).
+    pub fn is_auto(self) -> bool {
+        matches!(self, NodeType::Auto)
+    }
 }
 
 /// Backend SSL/TLS mode for connections from Trident to PostgreSQL nodes.
@@ -263,6 +281,49 @@ pub struct NodeConfig {
     pub ssl_mode: SslMode,
 }
 
+/// External authority source for role detection when `type: auto` nodes
+/// are configured. If omitted, Trident uses the built-in probe mode
+/// (`pg_is_in_recovery()`). Only one source may be specified.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSourceConfig {
+    /// Patroni REST API endpoints (e.g. `["http://10.0.1.10:8008"]`).
+    /// When present, Trident queries Patroni for the authoritative leader.
+    #[serde(default)]
+    pub patroni: Option<Vec<String>>,
+    /// repmgr metadata mode. When present (even as empty `{}`), Trident
+    /// queries the `repmgr.nodes` table via existing node connections.
+    #[serde(default)]
+    pub repmgr: Option<serde_json::Value>,
+}
+
+impl RoleSourceConfig {
+    /// Infers the detection mode from the configured fields.
+    pub fn mode(&self) -> RoleDetectionMode {
+        match (&self.patroni, &self.repmgr) {
+            (Some(_), None) => RoleDetectionMode::Patroni,
+            (None, Some(_)) => RoleDetectionMode::Repmgr,
+            _ => RoleDetectionMode::Probe,
+        }
+    }
+
+    /// Returns true if both patroni and repmgr are specified (invalid).
+    pub fn is_conflicting(&self) -> bool {
+        self.patroni.is_some() && self.repmgr.is_some()
+    }
+}
+
+/// The effective detection mode, inferred from `RoleSourceConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleDetectionMode {
+    /// Built-in `pg_is_in_recovery()` probe (default, zero config).
+    Probe,
+    /// Patroni REST API as authority.
+    Patroni,
+    /// repmgr metadata tables as authority.
+    Repmgr,
+}
+
 /// Routing-related configuration
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -285,6 +346,10 @@ pub struct RoutingConfig {
     /// meanings (`_name`/`_type`/`rw_mode`).
     #[serde(default)]
     pub custom_rules: Vec<crate::router::custom_rules::CustomRuleEntry>,
+    /// Optional external role authority for `type: auto` nodes. Omit
+    /// entirely for probe mode (built-in `pg_is_in_recovery()` detection).
+    #[serde(default)]
+    pub role_source: Option<RoleSourceConfig>,
 }
 
 /// Connection pool configuration
@@ -476,7 +541,7 @@ pub enum ConfigError {
     #[error("failed to parse YAML config: {0}")]
     Parse(#[from] serde_yaml::Error),
 
-    #[error("no writer node found: at least one node with type 'writer' is required")]
+    #[error("no writer or auto node found: at least one node with type 'writer' or 'auto' is required")]
     MissingWriterNode,
 
     #[error("duplicate node name found: '{0}'")]
@@ -538,9 +603,32 @@ impl AppConfig {
     /// Validates the configuration; see the "Validation rules" section in
     /// design.md.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // At least one Writer node must be present.
-        if !self.nodes.iter().any(|n| n.node_type == NodeType::Writer) {
+        // At least one Writer or Auto node must be present. This relaxes
+        // the previous "at least one Writer" rule to accommodate `type: auto`
+        // nodes that will be dynamically assigned their effective role.
+        let has_writer = self.nodes.iter().any(|n| n.node_type == NodeType::Writer);
+        let has_auto = self.nodes.iter().any(|n| n.node_type == NodeType::Auto);
+        if !has_writer && !has_auto {
             return Err(ConfigError::MissingWriterNode);
+        }
+
+        // Validate role_source: patroni and repmgr are mutually exclusive.
+        if let Some(ref role_source) = self.routing.role_source {
+            if role_source.is_conflicting() {
+                return Err(ConfigError::Validation(
+                    "role_source: 'patroni' and 'repmgr' are mutually exclusive; \
+                     specify only one"
+                        .to_string(),
+                ));
+            }
+            // Patroni endpoints must not be empty when specified.
+            if let Some(ref endpoints) = role_source.patroni {
+                if endpoints.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "role_source.patroni must contain at least one endpoint URL".to_string(),
+                    ));
+                }
+            }
         }
 
         // Node names must be unique.
@@ -835,6 +923,7 @@ pub(crate) mod tests {
                 writer_readable: true,
                 max_replication_lag_ms: 1000,
                 custom_rules: Vec::new(),
+                role_source: None,
             },
             pool: PoolConfig {
                 mode: PoolMode::Transaction,
@@ -1281,6 +1370,108 @@ pub(crate) mod tests {
             cfg3.validate(),
             Err(ConfigError::MissingWriterNode)
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Auto-role configuration tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn auto_node_alone_satisfies_writer_requirement() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![sample_node("auto1", NodeType::Auto)];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_and_static_nodes_mixed_is_valid() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![
+            sample_node("primary", NodeType::Writer),
+            sample_node("auto1", NodeType::Auto),
+        ];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn only_reader_and_analytics_without_writer_or_auto_fails() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![
+            sample_node("r1", NodeType::Reader),
+            sample_node("a1", NodeType::Analytics),
+        ];
+        assert!(matches!(cfg.validate(), Err(ConfigError::MissingWriterNode)));
+    }
+
+    #[test]
+    fn role_source_patroni_and_repmgr_mutually_exclusive() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![sample_node("auto1", NodeType::Auto)];
+        cfg.routing.role_source = Some(RoleSourceConfig {
+            patroni: Some(vec!["http://10.0.1.10:8008".to_string()]),
+            repmgr: Some(serde_json::Value::Object(Default::default())),
+        });
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn role_source_patroni_empty_endpoints_is_invalid() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![sample_node("auto1", NodeType::Auto)];
+        cfg.routing.role_source = Some(RoleSourceConfig {
+            patroni: Some(vec![]),
+            repmgr: None,
+        });
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn role_source_patroni_valid() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![sample_node("auto1", NodeType::Auto)];
+        cfg.routing.role_source = Some(RoleSourceConfig {
+            patroni: Some(vec!["http://10.0.1.10:8008".to_string()]),
+            repmgr: None,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn role_source_repmgr_valid() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![sample_node("auto1", NodeType::Auto)];
+        cfg.routing.role_source = Some(RoleSourceConfig {
+            patroni: None,
+            repmgr: Some(serde_json::Value::Object(Default::default())),
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn role_source_none_defaults_to_probe_mode() {
+        let mut cfg = valid_config();
+        cfg.nodes = vec![sample_node("auto1", NodeType::Auto)];
+        cfg.routing.role_source = None;
+        assert!(cfg.validate().is_ok());
+        // Verify mode inference
+        let source = RoleSourceConfig::default();
+        assert_eq!(source.mode(), RoleDetectionMode::Probe);
+    }
+
+    #[test]
+    fn auto_node_type_parsed_from_yaml() {
+        let yaml = minimal_yaml(
+            "    password: secret\n",
+            "127.0.0.1",
+            5432,
+            "mydb",
+            "proxy_user",
+        );
+        let yaml_with_auto = yaml.replace("type: writer", "type: auto");
+        let config: Result<AppConfig, _> = serde_yaml::from_str(&yaml_with_auto);
+        assert!(config.is_ok());
+        let cfg = config.unwrap();
+        assert_eq!(cfg.nodes[0].node_type, NodeType::Auto);
     }
 
     #[test]

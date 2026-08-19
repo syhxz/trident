@@ -78,6 +78,7 @@ where
             Some(NodeType::Writer) => "writer",
             Some(NodeType::Reader) => "reader",
             Some(NodeType::Analytics) => "analytics",
+            Some(NodeType::Auto) => "auto",
             None => "unknown",
         };
         metrics::histogram!("trident_query_duration_ms", "target" => target_label)
@@ -852,6 +853,7 @@ where
                     NodeType::Writer => "writer",
                     NodeType::Reader => "reader",
                     NodeType::Analytics => "analytics",
+                    NodeType::Auto => "auto",
                 }
             )
             .increment(1);
@@ -974,6 +976,7 @@ where
                 NodeType::Writer => "writer",
                 NodeType::Reader => "reader",
                 NodeType::Analytics => "analytics",
+                NodeType::Auto => "auto",
             }
         )
         .increment(1);
@@ -989,7 +992,9 @@ where
                 .find(|node| node.node_type == NodeType::Writer && node.healthy)
                 .map(|node| node.node_id.clone())
                 .unwrap_or_default(),
-            NodeType::Reader | NodeType::Analytics => decision.node_id.clone().unwrap_or_default(),
+            NodeType::Reader | NodeType::Analytics | NodeType::Auto => {
+                decision.node_id.clone().unwrap_or_default()
+            }
         };
 
         if target_node_id.is_empty() {
@@ -1096,16 +1101,88 @@ where
             match target_pool.acquire(&session.state.id).await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    if matches!(e, crate::pool::pool::PoolError::Exhausted(_)) {
-                        metrics::counter!("trident_pool_exhausted_total", "node_id" => target_node_id.clone())
-                            .increment(1);
-                    }
-                    if split_reader_rolled_back {
-                        session.state.tx_state = TxState::Failed;
+                    // --- Read-only retry (Requirement 8.7) ---
+                    // If this is a read-only, non-transactional query targeting
+                    // a Reader, and the acquire failed (the Reader may have just
+                    // gone down within the detection window), try ONE other
+                    // healthy Reader before giving up.
+                    let can_retry = decision.target == NodeType::Reader
+                        && !decision.requires_split_upgrade
+                        && session.state.tx_state == TxState::Idle
+                        && !split_reader_rolled_back
+                        && !query_has_write_intent(sql);
+
+                    if can_retry {
+                        // Find another healthy Reader that is NOT the failed node.
+                        let alt_reader = all_nodes
+                            .iter()
+                            .find(|n| {
+                                n.node_type == NodeType::Reader
+                                    && n.healthy
+                                    && n.node_id != target_node_id
+                            });
+
+                        if let Some(alt_node) = alt_reader {
+                            if let Some(alt_pool) = self.resolve_pool(&alt_node.node_id, session) {
+                                match alt_pool.acquire(&session.state.id).await {
+                                    Ok(conn) => {
+                                        tracing::debug!(
+                                            original_node = %target_node_id,
+                                            retry_node = %alt_node.node_id,
+                                            "read-only retry: acquired from alternate Reader"
+                                        );
+                                        metrics::counter!(
+                                            "trident_read_retry_total",
+                                            "result" => "success"
+                                        )
+                                        .increment(1);
+                                        conn
+                                    }
+                                    Err(_retry_err) => {
+                                        // Retry also failed — return original error.
+                                        metrics::counter!(
+                                            "trident_read_retry_total",
+                                            "result" => "failure"
+                                        )
+                                        .increment(1);
+                                        if matches!(e, crate::pool::pool::PoolError::Exhausted(_)) {
+                                            metrics::counter!("trident_pool_exhausted_total", "node_id" => target_node_id.clone())
+                                                .increment(1);
+                                        }
+                                        session.state.tx_split = tx_split_before_routing.clone();
+                                        return Err(ProxyError::Pool(e));
+                                    }
+                                }
+                            } else {
+                                // Alt pool doesn't exist — return original error.
+                                if matches!(e, crate::pool::pool::PoolError::Exhausted(_)) {
+                                    metrics::counter!("trident_pool_exhausted_total", "node_id" => target_node_id.clone())
+                                        .increment(1);
+                                }
+                                session.state.tx_split = tx_split_before_routing.clone();
+                                return Err(ProxyError::Pool(e));
+                            }
+                        } else {
+                            // No alternative Reader available.
+                            if matches!(e, crate::pool::pool::PoolError::Exhausted(_)) {
+                                metrics::counter!("trident_pool_exhausted_total", "node_id" => target_node_id.clone())
+                                    .increment(1);
+                            }
+                            session.state.tx_split = tx_split_before_routing.clone();
+                            return Err(ProxyError::Pool(e));
+                        }
                     } else {
-                        session.state.tx_split = tx_split_before_routing.clone();
+                        if matches!(e, crate::pool::pool::PoolError::Exhausted(_)) {
+                            metrics::counter!("trident_pool_exhausted_total", "node_id" => target_node_id.clone())
+                                .increment(1);
+                        }
+                        if split_reader_rolled_back {
+                            session.state.tx_state = TxState::Failed;
+                        } else {
+                            session.state.tx_split = tx_split_before_routing.clone();
+                        }
+                        return Err(ProxyError::Pool(e));
                     }
-                    return Err(ProxyError::Pool(e));
                 }
             }
         };

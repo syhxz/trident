@@ -77,6 +77,30 @@ nodes:
     username: proxy_user
     password: "${TRIDENT_ANALYTICS1_PASSWORD}"
 
+  # --- Auto-role detection (failover-aware) ---
+  # Use `type: auto` when nodes participate in a repmgr/Patroni cluster
+  # and the primary can change. Trident detects whether each node is
+  # currently primary or standby via pg_is_in_recovery() and routes
+  # accordingly. No config change or restart needed on failover.
+  #
+  # Example (uncomment to use instead of static writer/reader above):
+  # - name: node1
+  #   host: 10.0.1.10
+  #   port: 5432
+  #   type: auto
+  #   weight: 1
+  #   database: mydb
+  #   username: proxy_user
+  #   password: "${NODE1_PASSWORD}"
+  # - name: node2
+  #   host: 10.0.1.11
+  #   port: 5432
+  #   type: auto
+  #   weight: 1
+  #   database: mydb
+  #   username: proxy_user
+  #   password: "${NODE2_PASSWORD}"
+
 routing:
   default_consistency: session
   load_balance_strategy: weighted_round_robin
@@ -114,6 +138,17 @@ routing:
   #   - _name: my_reporting_func
   #     _type: f
   #     rw_mode: r
+
+  # --- External role authority (optional, for type: auto nodes) ---
+  # Omit this entire block for probe mode (default: uses pg_is_in_recovery()).
+  # Specify exactly one sub-key to use an external authority:
+  #
+  # role_source:
+  #   patroni: ["http://10.0.1.10:8008", "http://10.0.1.11:8008"]
+  #
+  # Or for repmgr (uses existing node connections, no extra params):
+  # role_source:
+  #   repmgr: {}
 
 lsn_tracking:
   # Restart-only: changes under lsn_tracking are not applied by hot reload.

@@ -83,6 +83,7 @@ impl HealthCheckResult {
     /// - Writer: must NOT be in recovery (`is_in_recovery == false`)
     /// - Reader: must be in recovery (`is_in_recovery == true`)
     /// - Analytics: no additional role constraint
+    /// - Auto: no role constraint (role is determined dynamically)
     ///
     /// If `is_in_recovery` could not be obtained (e.g. the query failed),
     /// this falls back to the basic `is_success()` check — connectivity
@@ -92,6 +93,9 @@ impl HealthCheckResult {
             return false;
         }
         match (node_type, self.is_in_recovery) {
+            // Auto nodes: connectivity is sufficient; role detection is
+            // handled separately by the auto-role state machine.
+            (NodeType::Auto, _) => true,
             // Writer must NOT be a standby — require explicit confirmation
             (NodeType::Writer, Some(true)) => false,
             // Writer with unknown recovery state: fail-closed to prevent
@@ -172,6 +176,11 @@ impl HealthStateMachine {
 
     pub fn healthy(&self) -> bool {
         self.healthy
+    }
+
+    /// Returns the configured threshold for state transitions.
+    pub fn threshold(&self) -> u32 {
+        self.threshold
     }
 
     /// Feeds in one check result (success/failure), updating internal
@@ -275,35 +284,76 @@ impl HealthProbe for WireProtocolHealthProbe {
             result.is_in_recovery = Some(in_recovery);
         }
 
-        if node_type == NodeType::Writer {
-            if self.aurora_native {
-                if let Ok(Some(lsn)) = query_aurora_durable_lsn(&mut stream).await {
-                    result.current_wal_lsn = Some(lsn);
-                }
-                // Aurora manages failover internally; timeline_id is not
-                // meaningful. We leave writer_timeline_id as None — the
-                // epoch logic will never trigger a reset for Aurora.
-            } else {
-                if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
-                    result.current_wal_lsn = Some(lsn);
-                }
-                // Query timeline_id for failover detection on standard PG.
-                if let Ok(tl) = query_timeline_id(&mut stream).await {
-                    result.writer_timeline_id = tl;
+        // For Auto nodes, collect both Writer and Reader metrics based on
+        // the observed recovery state. This allows the health checker to
+        // have full data regardless of which role the node currently holds.
+        match node_type {
+            NodeType::Auto => {
+                // Auto: gather data based on observed state.
+                match result.is_in_recovery {
+                    Some(false) => {
+                        // Appears to be primary: collect WAL LSN + timeline.
+                        if self.aurora_native {
+                            if let Ok(Some(lsn)) = query_aurora_durable_lsn(&mut stream).await {
+                                result.current_wal_lsn = Some(lsn);
+                            }
+                        } else {
+                            if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
+                                result.current_wal_lsn = Some(lsn);
+                            }
+                            if let Ok(tl) = query_timeline_id(&mut stream).await {
+                                result.writer_timeline_id = tl;
+                            }
+                        }
+                    }
+                    Some(true) => {
+                        // Appears to be standby: collect replay LSN + lag.
+                        if self.aurora_native {
+                            if let Ok((lsn, lag)) = query_aurora_reader_status(&mut stream).await {
+                                result.replay_lsn = lsn;
+                                result.replication_lag_ms = lag;
+                            }
+                        } else {
+                            if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
+                                result.replay_lsn = Some(lsn);
+                            }
+                            if let Ok(Some(lag)) = query_replication_lag_ms(&mut stream).await {
+                                result.replication_lag_ms = Some(lag);
+                            }
+                        }
+                    }
+                    None => {
+                        // Could not determine state — leave all as None.
+                    }
                 }
             }
-        } else if node_type == NodeType::Reader {
-            if self.aurora_native {
-                if let Ok((lsn, lag)) = query_aurora_reader_status(&mut stream).await {
-                    result.replay_lsn = lsn;
-                    result.replication_lag_ms = lag;
+            NodeType::Writer => {
+                if self.aurora_native {
+                    if let Ok(Some(lsn)) = query_aurora_durable_lsn(&mut stream).await {
+                        result.current_wal_lsn = Some(lsn);
+                    }
+                } else {
+                    if let Ok(Some(lsn)) = query_current_wal_lsn(&mut stream).await {
+                        result.current_wal_lsn = Some(lsn);
+                    }
+                    if let Ok(tl) = query_timeline_id(&mut stream).await {
+                        result.writer_timeline_id = tl;
+                    }
                 }
-            } else {
-                if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
-                    result.replay_lsn = Some(lsn);
-                }
-                if let Ok(Some(lag)) = query_replication_lag_ms(&mut stream).await {
-                    result.replication_lag_ms = Some(lag);
+            }
+            NodeType::Reader | NodeType::Analytics => {
+                if self.aurora_native {
+                    if let Ok((lsn, lag)) = query_aurora_reader_status(&mut stream).await {
+                        result.replay_lsn = lsn;
+                        result.replication_lag_ms = lag;
+                    }
+                } else {
+                    if let Ok(Some(lsn)) = query_replay_lsn(&mut stream).await {
+                        result.replay_lsn = Some(lsn);
+                    }
+                    if let Ok(Some(lag)) = query_replication_lag_ms(&mut stream).await {
+                        result.replication_lag_ms = Some(lag);
+                    }
                 }
             }
         }
@@ -314,7 +364,7 @@ impl HealthProbe for WireProtocolHealthProbe {
 
 /// Performs SSL negotiation on a health probe connection, mirroring the
 /// logic in `pool::conn::establish_connection` for consistency.
-async fn upgrade_probe_stream(
+pub(crate) async fn upgrade_probe_stream(
     mut tcp_stream: TcpStream,
     target: &ProbeTarget,
 ) -> Result<MaybeTlsStream, ()> {
@@ -394,7 +444,7 @@ async fn upgrade_probe_stream(
     }
 }
 
-async fn perform_startup<S: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn perform_startup<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
     target: &ProbeTarget,
 ) -> Result<(), ()> {
@@ -615,6 +665,10 @@ pub fn parse_lsn(text: &str) -> Option<u64> {
 #[derive(Debug, Clone)]
 struct TrackedNode {
     node_type: NodeType,
+    /// The effective runtime role used for routing. For static nodes this
+    /// always equals `node_type`. For `Auto` nodes it is dynamically
+    /// determined by probing (Writer or Reader).
+    effective_role: NodeType,
     weight: u32,
     state: HealthStateMachine,
     last_replay_lsn: u64,
@@ -629,6 +683,13 @@ struct TrackedNode {
     /// Used to detect genuine failover (timeline changes). `None` means
     /// timeline has never been observed for this node.
     last_timeline_id: Option<u32>,
+    /// Role-flip debounce: counts consecutive observations of a role
+    /// different from `effective_role`. A flip is committed only after
+    /// this reaches the health threshold (reusing `max_retries`).
+    role_flip_counter: u32,
+    /// The candidate role observed during debounce (the role we're
+    /// considering flipping to). `None` when no flip is in progress.
+    role_flip_candidate: Option<NodeType>,
 }
 
 /// Health checker: manages the health state and LSN/lag snapshots of a
@@ -690,10 +751,18 @@ impl<P: HealthProbe> HealthChecker<P> {
         let mut nodes = HashMap::new();
         for (node_id, node_type, weight, probe) in node_probes {
             probes.insert(node_id.clone(), Arc::new(probe));
+            let effective_role = if node_type == NodeType::Auto {
+                // Auto nodes start as Reader (fail-safe: won't route
+                // writes until confirmed as primary).
+                NodeType::Reader
+            } else {
+                node_type
+            };
             nodes.insert(
                 node_id,
                 TrackedNode {
                     node_type,
+                    effective_role,
                     weight,
                     state: HealthStateMachine::with_threshold(true, threshold),
                     last_replay_lsn: 0,
@@ -701,6 +770,8 @@ impl<P: HealthProbe> HealthChecker<P> {
                     last_replication_lag_ms: None,
                     generation: 1,
                     last_timeline_id: None,
+                    role_flip_counter: 0,
+                    role_flip_candidate: None,
                 },
             );
         }
@@ -708,7 +779,7 @@ impl<P: HealthProbe> HealthChecker<P> {
             .iter()
             .map(|(node_id, node)| BackendNodeSnapshot {
                 node_id: node_id.clone(),
-                node_type: node.node_type,
+                node_type: node.effective_role,
                 healthy: node.state.healthy(),
                 replay_lsn: 0,
                 active_connections: 0,
@@ -768,8 +839,23 @@ impl<P: HealthProbe> HealthChecker<P> {
             nodes.get(node_id).map(|n| n.node_type)
         };
 
-        // Use role-aware success check when we know the node type
+        // For Auto nodes, use the effective_role for role-aware health check,
+        // but also detect role changes from pg_is_in_recovery().
+        let _effective_role = {
+            let nodes = self.nodes.lock();
+            nodes.get(node_id).map(|n| n.effective_role)
+        };
+
+        // Use role-aware success check when we know the node type.
+        // For Auto nodes, success only requires connectivity (not role match),
+        // because the role may legitimately change during failover.
         let success = match node_type {
+            Some(NodeType::Auto) => {
+                // For auto nodes: basic connectivity check only.
+                // Role mismatch is handled separately via role detection,
+                // not by marking the node unhealthy.
+                result.is_success()
+            }
             Some(nt) => result.is_success_for_role(nt),
             None => result.is_success(),
         };
@@ -812,6 +898,70 @@ impl<P: HealthProbe> HealthChecker<P> {
                     "backend node health state changed"
                 );
             }
+
+            // --- Auto role detection with debounce ---
+            if node.node_type == NodeType::Auto && success {
+                if let Some(is_in_recovery) = result.is_in_recovery {
+                    let observed_role = if is_in_recovery {
+                        NodeType::Reader
+                    } else {
+                        NodeType::Writer
+                    };
+
+                    if observed_role != node.effective_role {
+                        // Observed role differs from current effective role.
+                        // Apply debounce: require consecutive matching observations.
+                        if node.role_flip_candidate == Some(observed_role) {
+                            node.role_flip_counter += 1;
+                        } else {
+                            // New candidate or changed candidate: reset counter.
+                            node.role_flip_candidate = Some(observed_role);
+                            node.role_flip_counter = 1;
+                        }
+
+                        if node.role_flip_counter >= node.state.threshold() {
+                            // Debounce threshold met: commit the role flip.
+                            let old_role = node.effective_role;
+                            node.effective_role = observed_role;
+                            node.role_flip_counter = 0;
+                            node.role_flip_candidate = None;
+
+                            tracing::info!(
+                                node_id,
+                                old_role = ?old_role,
+                                new_role = ?observed_role,
+                                source = "probe",
+                                timeline_id = ?node.last_timeline_id,
+                                "auto node effective role flipped"
+                            );
+                            metrics::counter!(
+                                "trident_role_flips_total",
+                                "node_id" => node_id.to_string(),
+                                "from" => format!("{:?}", old_role),
+                                "to" => format!("{:?}", observed_role)
+                            )
+                            .increment(1);
+                        }
+                    } else {
+                        // Observation matches current effective role: reset debounce.
+                        node.role_flip_counter = 0;
+                        node.role_flip_candidate = None;
+                    }
+                } else {
+                    // Could not determine pg_is_in_recovery() for an auto node.
+                    // Fail-closed: mark unhealthy (cannot route without knowing role).
+                    if node.state.healthy() {
+                        node.state.observe(false);
+                        node.state.observe(false);
+                        node.state.observe(false);
+                        tracing::warn!(
+                            node_id,
+                            "auto node: pg_is_in_recovery() unavailable, marking unhealthy (fail-closed)"
+                        );
+                    }
+                }
+            }
+
             if let Some(lsn) = result.replay_lsn {
                 node.last_replay_lsn = lsn;
             }
@@ -827,7 +977,13 @@ impl<P: HealthProbe> HealthChecker<P> {
                 // Only advance when the probe is successful AND confirmed
                 // as a Writer (role-aware check passed). A failed probe or
                 // role-mismatched node should not influence the watermark.
-                if success && node.node_type == NodeType::Writer {
+                // For auto nodes, use effective_role.
+                let is_writer = match node.node_type {
+                    NodeType::Auto => node.effective_role == NodeType::Writer,
+                    NodeType::Writer => true,
+                    _ => false,
+                };
+                if success && is_writer {
                     if let Some(ref tracker) = self.lsn_tracker {
                         // Timeline switch detection: if the Writer's
                         // timeline_id changed, a genuine failover occurred.
@@ -949,66 +1105,153 @@ impl<P: HealthProbe> HealthChecker<P> {
     }
 
     /// Rebuilds the cached snapshot from the current node state.
+    /// For `Auto` nodes, applies multi-writer ambiguity detection and
+    /// timeline-based arbitration before publishing the snapshot.
     fn refresh_cached_snapshot(&self) {
         let nodes = self.nodes.lock();
 
+        // --- Multi-writer ambiguity detection for Auto nodes ---
+        // Collect all auto nodes currently determined as Writer.
+        let auto_writers: Vec<(&String, &TrackedNode)> = nodes
+            .iter()
+            .filter(|(_, n)| n.node_type == NodeType::Auto && n.effective_role == NodeType::Writer && n.state.healthy())
+            .collect();
+
+        // Timeline-based arbitration: if multiple auto-writers exist,
+        // select the one with the highest timeline_id as the true primary.
+        // If timelines are equal (symmetric split-brain), ALL are marked
+        // unhealthy (fail-closed).
+        let disqualified_writers: std::collections::HashSet<&str> = if auto_writers.len() >= 2 {
+            let max_timeline = auto_writers
+                .iter()
+                .filter_map(|(_, n)| n.last_timeline_id)
+                .max();
+
+            match max_timeline {
+                Some(max_tl) => {
+                    let winners: Vec<_> = auto_writers
+                        .iter()
+                        .filter(|(_, n)| n.last_timeline_id == Some(max_tl))
+                        .collect();
+
+                    if winners.len() == 1 {
+                        // Timeline arbitration succeeds: one winner, rest are disqualified.
+                        let winner_id = winners[0].0.as_str();
+                        tracing::info!(
+                            winner = winner_id,
+                            timeline = max_tl,
+                            candidates = auto_writers.len(),
+                            "timeline arbitration: selected unique primary from multiple auto-writers"
+                        );
+                        auto_writers
+                            .iter()
+                            .filter(|(id, _)| id.as_str() != winner_id)
+                            .map(|(id, _)| id.as_str())
+                            .collect()
+                    } else {
+                        // Symmetric split-brain: same timeline on multiple nodes.
+                        // Fail-closed: disqualify ALL auto-writers.
+                        tracing::error!(
+                            timeline = max_tl,
+                            candidates = winners.len(),
+                            "AMBIGUOUS: multiple auto-writers share the same timeline_id — \
+                             fail-closed, rejecting all writes"
+                        );
+                        metrics::gauge!("trident_role_ambiguous").set(1.0);
+                        metrics::counter!("trident_writes_rejected_ambiguous_total").increment(1);
+                        auto_writers
+                            .iter()
+                            .map(|(id, _)| id.as_str())
+                            .collect()
+                    }
+                }
+                None => {
+                    // No timeline info available for any candidate: cannot
+                    // safely pick one. Fail-closed.
+                    tracing::error!(
+                        candidates = auto_writers.len(),
+                        "AMBIGUOUS: multiple auto-writers with no timeline info — \
+                         fail-closed, rejecting all writes"
+                    );
+                    metrics::gauge!("trident_role_ambiguous").set(1.0);
+                    metrics::counter!("trident_writes_rejected_ambiguous_total").increment(1);
+                    auto_writers
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect()
+                }
+            }
+        } else {
+            // 0 or 1 auto-writer: no ambiguity. Clear the gauge if it was previously set.
+            metrics::gauge!("trident_role_ambiguous").set(0.0);
+            std::collections::HashSet::new()
+        };
+
+        // Check for zero-writer condition among auto nodes (failover gap).
+        let has_any_auto = nodes.values().any(|n| n.node_type == NodeType::Auto);
+        let has_static_writer = nodes.values().any(|n| n.node_type == NodeType::Writer && n.state.healthy());
+        if has_any_auto && auto_writers.is_empty() && !has_static_writer {
+            // No writer available from auto nodes (failover in progress).
+            tracing::warn!(
+                "auto-role: no primary detected among auto nodes (failover gap); \
+                 write requests will be rejected with 57P03"
+            );
+            metrics::gauge!("trident_role_ambiguous").set(1.0);
+        }
+
         // Collect the maximum writer WAL LSN across all writer nodes.
         let writer_wal_lsn: u64 = nodes
-            .values()
-            .filter(|n| n.node_type == NodeType::Writer)
-            .map(|n| n.last_current_wal_lsn)
+            .iter()
+            .filter(|(node_id, n)| {
+                let is_writer = match n.node_type {
+                    NodeType::Writer => true,
+                    NodeType::Auto => n.effective_role == NodeType::Writer,
+                    _ => false,
+                };
+                is_writer && !disqualified_writers.contains(node_id.as_str())
+            })
+            .map(|(_, n)| n.last_current_wal_lsn)
             .max()
             .unwrap_or(0);
 
         let snap: Vec<BackendNodeSnapshot> = nodes
             .iter()
             .map(|(node_id, node)| {
+                // Use effective_role for routing decisions.
+                let effective_type = node.effective_role;
+
+                // Disqualified auto-writers are marked unhealthy.
+                let disqualified = disqualified_writers.contains(node_id.as_str());
+
                 // Compute LSN-based lag for Reader nodes. If the writer
                 // LSN is known (non-zero) and the reader has reported a
                 // replay LSN, use the byte difference. This is immune to
                 // the "idle writer" false-positive that plagues the
                 // timestamp-based approach.
-                let effective_lag_ms = if node.node_type == NodeType::Reader {
+                let effective_lag_ms = if effective_type == NodeType::Reader {
                     if writer_wal_lsn > 0 && node.last_replay_lsn > 0 {
                         let lsn_diff = writer_wal_lsn.saturating_sub(node.last_replay_lsn);
                         if lsn_diff == 0 {
-                            // LSN fully caught up — the reader has replayed
-                            // every WAL byte the writer produced. Override
-                            // any stale timestamp-based lag value.
                             Some(0)
                         } else {
-                            // LSN gap > 0: the reader is behind by `lsn_diff`
-                            // bytes. Use the timestamp-based lag directly if
-                            // available — it gives the time dimension that
-                            // max_replication_lag_ms is configured in.
-                            //
-                            // No heuristic suppression: even a small LSN gap
-                            // with a moderate timestamp lag represents real
-                            // delay. The only false-positive case (idle writer
-                            // inflating timestamp lag) is detectable by
-                            // lsn_diff == 0, which is already handled above.
-                            // If lsn_diff > 0, the reader genuinely has
-                            // un-replayed WAL, so the timestamp reflects a
-                            // real delay.
                             node.last_replication_lag_ms
                         }
                     } else {
-                        // No writer LSN data yet — fall back to timestamp
                         node.last_replication_lag_ms
                     }
                 } else {
                     None
                 };
 
-                let excluded_by_lag = node.node_type == NodeType::Reader
+                let excluded_by_lag = effective_type == NodeType::Reader
                     && is_excluded_by_replication_lag(
                         effective_lag_ms,
                         self.max_replication_lag_ms,
                     );
                 BackendNodeSnapshot {
                     node_id: node_id.clone(),
-                    node_type: node.node_type,
-                    healthy: node.state.healthy() && !excluded_by_lag,
+                    node_type: effective_type,
+                    healthy: node.state.healthy() && !excluded_by_lag && !disqualified,
                     replay_lsn: node.last_replay_lsn,
                     active_connections: 0,
                     weight: node.weight,
@@ -1108,10 +1351,16 @@ impl<P: HealthProbe> HealthChecker<P> {
         let gen = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let effective_role = if node_type == NodeType::Auto {
+            NodeType::Reader
+        } else {
+            node_type
+        };
         nodes.insert(
             node_id.clone(),
             TrackedNode {
                 node_type,
+                effective_role,
                 weight,
                 state: HealthStateMachine::with_threshold(false, self.health_threshold),
                 last_replay_lsn: 0,
@@ -1119,6 +1368,8 @@ impl<P: HealthProbe> HealthChecker<P> {
                 last_replication_lag_ms: None,
                 generation: gen,
                 last_timeline_id: None,
+                role_flip_counter: 0,
+                role_flip_candidate: None,
             },
         );
         probes.insert(node_id.clone(), Arc::new(probe));
@@ -1310,12 +1561,24 @@ mod tests {
 
     // Mock probe used to test HealthChecker orchestration without real I/O.
     struct MockProbe {
-        result: HealthCheckResult,
+        result: parking_lot::Mutex<HealthCheckResult>,
+    }
+
+    impl MockProbe {
+        fn new(result: HealthCheckResult) -> Self {
+            MockProbe {
+                result: parking_lot::Mutex::new(result),
+            }
+        }
+
+        fn set_result(&self, result: HealthCheckResult) {
+            *self.result.lock() = result;
+        }
     }
 
     impl HealthProbe for MockProbe {
         async fn probe(&self, _node_type: NodeType) -> HealthCheckResult {
-            self.result.clone()
+            self.result.lock().clone()
         }
     }
 
@@ -1336,9 +1599,7 @@ mod tests {
                 "reader-1".to_string(),
                 NodeType::Reader,
                 5,
-                MockProbe {
-                    result: healthy_result,
-                },
+                MockProbe::new(healthy_result),
             )],
             1000,
             Duration::from_secs(1),
@@ -1371,9 +1632,7 @@ mod tests {
                 "reader-1".to_string(),
                 NodeType::Reader,
                 5,
-                MockProbe {
-                    result: laggy_result,
-                },
+                MockProbe::new(laggy_result),
             )],
             1000, // max_replication_lag_ms
             Duration::from_secs(1),
@@ -1392,9 +1651,7 @@ mod tests {
                 "writer".to_string(),
                 NodeType::Writer,
                 1,
-                MockProbe {
-                    result: failing_result,
-                },
+                MockProbe::new(failing_result),
             )],
             1000,
             Duration::from_secs(1),
@@ -1500,9 +1757,7 @@ mod tests {
                 "writer".to_string(),
                 NodeType::Writer,
                 1,
-                MockProbe {
-                    result: probe_result,
-                },
+                MockProbe::new(probe_result),
             )],
             1000,
             Duration::from_secs(1),
@@ -1565,9 +1820,7 @@ mod tests {
                 "writer".into(),
                 NodeType::Writer,
                 1,
-                MockProbe {
-                    result: probe_result,
-                },
+                MockProbe::new(probe_result),
             )],
             1000,
             Duration::from_secs(1),
@@ -1629,9 +1882,7 @@ mod tests {
                 "writer".into(),
                 NodeType::Writer,
                 1,
-                MockProbe {
-                    result: probe_result,
-                },
+                MockProbe::new(probe_result),
             )],
             1000,
             Duration::from_secs(1),
@@ -1700,9 +1951,7 @@ mod tests {
                 "writer".into(),
                 NodeType::Writer,
                 1,
-                MockProbe {
-                    result: probe_result,
-                },
+                MockProbe::new(probe_result),
             )],
             1000,
             Duration::from_secs(1),
@@ -1759,17 +2008,13 @@ mod tests {
                     "node-a".into(),
                     NodeType::Writer,
                     1,
-                    MockProbe {
-                        result: healthy.clone(),
-                    },
+                    MockProbe::new(healthy.clone()),
                 ),
                 (
                     "node-b".into(),
                     NodeType::Reader,
                     1,
-                    MockProbe {
-                        result: healthy.clone(),
-                    },
+                    MockProbe::new(healthy.clone()),
                 ),
             ],
             1000,
@@ -1785,7 +2030,7 @@ mod tests {
             "node-b".into(),
             NodeType::Reader,
             1,
-            MockProbe { result: healthy }
+            MockProbe::new(healthy)
         ));
 
         // Get the new generation by inspecting internal state
@@ -1820,15 +2065,13 @@ mod tests {
                     "writer".into(),
                     NodeType::Writer,
                     1,
-                    MockProbe {
-                        result: healthy.clone(),
-                    },
+                    MockProbe::new(healthy.clone()),
                 ),
                 (
                     "reader".into(),
                     NodeType::Reader,
                     1,
-                    MockProbe { result: healthy },
+                    MockProbe::new(healthy),
                 ),
             ],
             5000, // max_replication_lag_ms = 5s
@@ -1873,15 +2116,13 @@ mod tests {
                     "writer".into(),
                     NodeType::Writer,
                     1,
-                    MockProbe {
-                        result: healthy.clone(),
-                    },
+                    MockProbe::new(healthy.clone()),
                 ),
                 (
                     "reader".into(),
                     NodeType::Reader,
                     1,
-                    MockProbe { result: healthy },
+                    MockProbe::new(healthy ),
                 ),
             ],
             5000,
@@ -1903,5 +2144,270 @@ mod tests {
         // lsn_diff == 0 → lag must be 0, timestamp is stale
         assert_eq!(reader.replication_lag_ms, Some(0));
         assert!(reader.healthy);
+    }
+
+    // =================================================================
+    // Auto-role detection tests
+    // =================================================================
+
+    #[tokio::test]
+    async fn auto_node_starts_as_reader_and_detects_writer() {
+        let probe = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false), // primary
+            current_wal_lsn: Some(100),
+            writer_timeline_id: Some(1),
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![("auto1".to_string(), NodeType::Auto, 1, probe)],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        // Initial state: auto node starts as Reader.
+        let snap = checker.snapshot();
+        assert_eq!(snap[0].node_type, NodeType::Reader);
+
+        // After 3 consecutive probes showing primary, it should flip to Writer.
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+        let snap = checker.snapshot();
+        assert_eq!(snap[0].node_type, NodeType::Writer);
+        assert!(snap[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn auto_node_debounces_role_flip() {
+        let probe = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false), // primary
+            current_wal_lsn: Some(100),
+            writer_timeline_id: Some(1),
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![("auto1".to_string(), NodeType::Auto, 1, probe)],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        // After only 2 probes (below threshold of 3), should still be Reader.
+        for _ in 0..2 {
+            checker.check_all_and_update().await;
+        }
+        let snap = checker.snapshot();
+        assert_eq!(snap[0].node_type, NodeType::Reader);
+    }
+
+    #[tokio::test]
+    async fn auto_node_writer_demotion_on_failover() {
+        // Start with a node that appears as primary.
+        let probe = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(100),
+            writer_timeline_id: Some(1),
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![("auto1".to_string(), NodeType::Auto, 1, probe)],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        // Promote to Writer.
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+        let snap = checker.snapshot();
+        assert_eq!(snap[0].node_type, NodeType::Writer);
+
+        // Now simulate failover: node becomes standby.
+        {
+            let probes = checker.probes.read();
+            let probe = probes.get("auto1").unwrap();
+            probe.set_result(HealthCheckResult {
+                tcp_reachable: true,
+                select_1_ok: true,
+                is_in_recovery: Some(true), // now standby
+                replay_lsn: Some(100),
+                replication_lag_ms: Some(0),
+                ..Default::default()
+            });
+        }
+
+        // After 3 consecutive standby observations, should flip to Reader.
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+        let snap = checker.snapshot();
+        assert_eq!(snap[0].node_type, NodeType::Reader);
+        assert!(snap[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn auto_node_fail_closed_when_recovery_unknown() {
+        let probe = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: None, // unknown
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![("auto1".to_string(), NodeType::Auto, 1, probe)],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        // After probing with unknown recovery state, node should be unhealthy.
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+        let snap = checker.snapshot();
+        assert!(!snap[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn multi_auto_writer_timeline_arbitration() {
+        let probe1 = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(100),
+            writer_timeline_id: Some(1), // old timeline
+            ..Default::default()
+        });
+        let probe2 = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(200),
+            writer_timeline_id: Some(2), // new timeline (promoted)
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![
+                ("old_primary".to_string(), NodeType::Auto, 1, probe1),
+                ("new_primary".to_string(), NodeType::Auto, 1, probe2),
+            ],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        // Both nodes should flip to Writer after debounce.
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+
+        let snap = checker.snapshot();
+        // new_primary (timeline 2) should be the winner.
+        let new_primary = snap.iter().find(|n| n.node_id == "new_primary").unwrap();
+        assert_eq!(new_primary.node_type, NodeType::Writer);
+        assert!(new_primary.healthy);
+
+        // old_primary (timeline 1) should be disqualified (unhealthy).
+        let old_primary = snap.iter().find(|n| n.node_id == "old_primary").unwrap();
+        assert!(!old_primary.healthy);
+    }
+
+    #[tokio::test]
+    async fn multi_auto_writer_same_timeline_fail_closed() {
+        let probe1 = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(100),
+            writer_timeline_id: Some(1),
+            ..Default::default()
+        });
+        let probe2 = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(200),
+            writer_timeline_id: Some(1), // same timeline = symmetric split-brain
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![
+                ("node1".to_string(), NodeType::Auto, 1, probe1),
+                ("node2".to_string(), NodeType::Auto, 1, probe2),
+            ],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+
+        // Both should be disqualified (fail-closed on symmetric brain-split).
+        let snap = checker.snapshot();
+        let node1 = snap.iter().find(|n| n.node_id == "node1").unwrap();
+        let node2 = snap.iter().find(|n| n.node_id == "node2").unwrap();
+        assert!(!node1.healthy);
+        assert!(!node2.healthy);
+    }
+
+    #[tokio::test]
+    async fn mixed_static_and_auto_nodes() {
+        let static_writer_probe = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(false),
+            current_wal_lsn: Some(1000),
+            writer_timeline_id: Some(1),
+            ..Default::default()
+        });
+        let auto_probe = MockProbe::new(HealthCheckResult {
+            tcp_reachable: true,
+            select_1_ok: true,
+            is_in_recovery: Some(true), // standby
+            replay_lsn: Some(900),
+            replication_lag_ms: Some(50),
+            ..Default::default()
+        });
+
+        let checker = HealthChecker::with_max_retries(
+            vec![
+                ("static_writer".to_string(), NodeType::Writer, 1, static_writer_probe),
+                ("auto_reader".to_string(), NodeType::Auto, 1, auto_probe),
+            ],
+            1000,
+            Duration::from_secs(2),
+            3,
+        );
+
+        for _ in 0..3 {
+            checker.check_all_and_update().await;
+        }
+
+        let snap = checker.snapshot();
+        // Static writer remains as Writer.
+        let sw = snap.iter().find(|n| n.node_id == "static_writer").unwrap();
+        assert_eq!(sw.node_type, NodeType::Writer);
+        assert!(sw.healthy);
+
+        // Auto node detected as Reader (in recovery).
+        let ar = snap.iter().find(|n| n.node_id == "auto_reader").unwrap();
+        assert_eq!(ar.node_type, NodeType::Reader);
+        assert!(ar.healthy);
     }
 }

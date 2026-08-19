@@ -45,6 +45,7 @@ rustls-native-certs = "0.8"
 parking_lot = "0.12"
 subtle = "2"
 getrandom = "0.2"
+reqwest = { version = "=0.12.15", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 proptest = "1"

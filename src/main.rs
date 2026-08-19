@@ -721,7 +721,13 @@ async fn run(
                 .iter()
                 .find(|n| n.node_type == trident::config::NodeType::Writer)
         })
-        .expect("at least one reader or writer node must be configured");
+        .or_else(|| {
+            config
+                .nodes
+                .iter()
+                .find(|n| n.node_type == trident::config::NodeType::Auto)
+        })
+        .expect("at least one reader, writer, or auto node must be configured");
     let explain_target = ConnectTarget {
         host: explain_node.host.clone(),
         port: explain_node.port,
@@ -1012,6 +1018,17 @@ async fn run(
                 Some(Box::new(move |username: &str| {
                     pool_manager_for_drain.drain_user_pools(username)
                 })),
+                // refresh_fn: triggers immediate health check cycle
+                {
+                    let hc = health_checker.clone();
+                    Some(std::sync::Arc::new(move || {
+                        let hc = hc.clone();
+                        Box::pin(async move {
+                            hc.check_all_and_update().await;
+                            hc.snapshot()
+                        }) as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<trident::health::BackendNodeSnapshot>> + Send>>
+                    }) as trident::admin::RefreshFn)
+                },
             )
             .await
             {

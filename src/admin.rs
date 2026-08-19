@@ -76,6 +76,12 @@ use crate::router::custom_rules::{CustomRoutingRules, RuleTargetKind};
 /// Takes a username and returns the number of pools drained.
 pub type DrainUserFn = Box<dyn Fn(&str) -> usize + Send + Sync>;
 
+/// Type alias for the topology refresh callback. Triggers an immediate
+/// health-check cycle (probes all nodes, updates effective roles and
+/// snapshot). Returns the refreshed node snapshot.
+pub type RefreshFn =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<BackendNodeSnapshot>> + Send>> + Send + Sync>;
+
 /// Trait for dynamically adding/removing backend nodes at runtime.
 /// Implemented by the wiring layer in `main.rs` that coordinates the
 /// HealthChecker, PoolManager, and node_addresses map.
@@ -308,6 +314,9 @@ struct AdminState {
     /// Shared with `watch_sighup` so SIGHUP reloads also serialize against
     /// Admin PUT operations.
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Trigger an immediate health-check cycle and return the refreshed
+    /// node snapshot. Used by `POST /api/resync`.
+    refresh_fn: Option<RefreshFn>,
     /// Drains all per-user pools for a given username. Used for credential
     /// revocation (P1). `None` if passthrough mode is not configured.
     drain_user_fn: Option<DrainUserFn>,
@@ -430,6 +439,7 @@ fn build_router(
     get_check_interval_fn: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     drain_user_fn: Option<DrainUserFn>,
+    refresh_fn: Option<RefreshFn>,
 ) -> Router {
     let state = Arc::new(AdminState {
         prometheus_handle,
@@ -453,6 +463,7 @@ fn build_router(
         get_check_interval_fn,
         config_write_lock,
         drain_user_fn,
+        refresh_fn,
     });
 
     // Public routes: always accessible (Prometheus scraper, k8s probes, console UI)
@@ -484,6 +495,7 @@ fn build_router(
             get(config_get_handler).put(config_put_handler),
         )
         .route("/api/drain-user", post(drain_user_handler))
+        .route("/api/resync", post(resync_handler))
         .route("/ws/logs", get(ws_logs_handler));
 
     if state.auth_token.as_deref().is_some_and(|t| !t.is_empty()) {
@@ -853,10 +865,11 @@ async fn add_node_handler(
         "writer" => NodeType::Writer,
         "reader" => NodeType::Reader,
         "analytics" => NodeType::Analytics,
+        "auto" => NodeType::Auto,
         other => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"status": "error", "message": format!("invalid node type: '{other}'. Must be writer, reader, or analytics")})),
+                Json(serde_json::json!({"status": "error", "message": format!("invalid node type: '{other}'. Must be writer, reader, analytics, or auto")})),
             ).into_response();
         }
     };
@@ -1008,6 +1021,48 @@ async fn drain_user_handler(
             "status": "ok",
             "username": body.username,
             "pools_drained": drained
+        })),
+    )
+        .into_response()
+}
+
+/// Triggers an immediate health-check cycle on all backend nodes, bypassing
+/// the normal `check_interval` timer. Useful after a manual failover or
+/// switchover to force Trident to detect the new topology immediately
+/// instead of waiting up to `max_retries × check_interval` seconds.
+///
+/// Returns the refreshed node snapshot (same format as `GET /api/nodes`).
+async fn resync_handler(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    let Some(ref refresh_fn) = state.refresh_fn else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": "topology refresh not available"
+            })),
+        )
+            .into_response();
+    };
+
+    let snapshot = refresh_fn().await;
+    let nodes: Vec<_> = snapshot
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "node_id": n.node_id,
+                "type": format!("{:?}", n.node_type).to_lowercase(),
+                "healthy": n.healthy,
+                "replication_lag_ms": n.replication_lag_ms,
+            })
+        })
+        .collect();
+
+    tracing::info!(nodes = nodes.len(), "topology resync triggered via API");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "nodes": nodes
         })),
     )
         .into_response()
@@ -1432,6 +1487,7 @@ pub async fn run(
     check_interval_getter: Option<Box<dyn Fn() -> Duration + Send + Sync>>,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     drain_user_fn: Option<DrainUserFn>,
+    refresh_fn: Option<RefreshFn>,
 ) -> Result<(), AdminError> {
     let app = build_router(
         prometheus_handle,
@@ -1455,6 +1511,7 @@ pub async fn run(
         check_interval_getter,
         config_write_lock,
         drain_user_fn,
+        refresh_fn,
     );
 
     let local_addr = listener.local_addr().map_err(|source| AdminError::Bind {
@@ -1552,6 +1609,7 @@ mod tests {
             writer_readable: true,
             max_replication_lag_ms: 1000,
             custom_rules: vec![],
+            role_source: None,
         };
         let routing_config = Arc::new(arc_swap::ArcSwap::new(Arc::new(routing)));
         let lsn_tracking = LsnTrackingConfig::default();
@@ -1587,6 +1645,7 @@ mod tests {
             None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
             None,                                  // drain_user_fn
+            None,                                  // refresh_fn
         )
     }
 
@@ -1717,6 +1776,7 @@ mod tests {
             None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
             None,                                  // drain_user_fn
+            None,                                  // refresh_fn
         );
 
         let response = app
@@ -1763,6 +1823,7 @@ mod tests {
             None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
             None,                                  // drain_user_fn
+            None,                                  // refresh_fn
         );
 
         let response = app
@@ -1811,6 +1872,7 @@ mod tests {
             None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
             None,                                  // drain_user_fn
+            None,                                  // refresh_fn
         )
     }
 
@@ -1970,6 +2032,7 @@ mod tests {
             None,                                  // check_interval_getter
             Arc::new(tokio::sync::Mutex::new(())), // config_write_lock
             None,                                  // drain_user_fn
+            None,                                  // refresh_fn
         )
     }
 
