@@ -3,6 +3,7 @@ name = "trident"
 version = "0.1.0"
 edition = "2021"
 description = "PostgreSQL 智能读写分离代理"
+license = "AGPL-3.0-only"
 
 [lib]
 name = "trident"
